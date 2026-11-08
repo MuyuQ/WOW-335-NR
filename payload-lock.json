@@ -1,0 +1,185 @@
+{
+  "schema": 1,
+  "aio_version": "2.2.4",
+  "reshade_version": "6.8.0",
+  "game_sha256": "4c459de64d38b5795becc6c01a03ba00d34686598fae707c442446722617868a",
+  "original_d3d9_sha256": "cc556331fc3388989749620bceead4c2da95c3932ed38cf5cc24f3f0a878866e",
+  "members": [
+    {
+      "target": "d3d9.dll",
+      "source_kind": "stage",
+      "source": "d3d9.dll",
+      "sha256": "da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8",
+      "replaces_original": true
+    },
+    {
+      "target": "dlss5-aio-x86.cfg",
+      "source_kind": "template",
+      "source": "dlss5-aio-x86.cfg",
+      "sha256": "0414b3f9962c00fb6e1e1ef63a7917841e81dbb533738541918d3638e65af2fd",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/ADD_REQUIRED_64BIT_FILES_HERE.txt",
+      "source_kind": "stage",
+      "source": "host64/ADD_REQUIRED_64BIT_FILES_HERE.txt",
+      "sha256": "b08c4f89f33fab62700d8562845ddc515570e77844afa5366a9cd69d0436f723",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/AIO DLSS5 32-bit Wrapper.exe",
+      "source_kind": "stage",
+      "source": "host64/AIO DLSS5 32-bit Wrapper.exe",
+      "sha256": "e05a0aef9595849e2910d408cdfadf60c79a26addccba6dfe79c96b424bdef8b",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/dxgi.dll",
+      "source_kind": "stage",
+      "source": "host64/dxgi.dll",
+      "sha256": "0cee63f9c9f13f3ac909c5b4903f4dbb4b719a7ab3b4f13b0deaf83c814b94f7",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/nvngx.dll",
+      "source_kind": "stage",
+      "source": "host64/nvngx.dll",
+      "sha256": "540247e4ae8c68bcf4ed3b70393d8904a522c75cd46a3b801bfbd8800ef106e4",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/nvngx_dlss.dll",
+      "source_kind": "stage",
+      "source": "host64/nvngx_dlss.dll",
+      "sha256": "ac63fb6201426c0441b5108def2295042cbfc9fd3bd51380c10e4c9ff370a40b",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/nvngx_dlssnr.dll",
+      "source_kind": "stage",
+      "source": "host64/nvngx_dlssnr.dll",
+      "sha256": "cdfa6c1ec784867182164c7836f324f087b5c9f374d0c9fe46f54999feabf3ed",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/reshade-shaders/Shaders/DLSS5_AIO_Feed.fx",
+      "source_kind": "stage",
+      "source": "host64/reshade-shaders/Shaders/DLSS5_AIO_Feed.fx",
+      "sha256": "0710e17eeafa1933af18489bfb7d7a1d71bd6204d65d337474f835749fd6de58",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/reshade-shaders/Shaders/StandaloneBoundary.fx",
+      "source_kind": "stage",
+      "source": "host64/reshade-shaders/Shaders/StandaloneBoundary.fx",
+      "sha256": "e261760a83f1bdd407dda106ed61b7a7165acaf56915b7993216348dadb3d824",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/ReShade.ini",
+      "source_kind": "template",
+      "source": "host64-ReShade.ini",
+      "sha256": "2c34dcce17ebe4ee89b2441ffd2c6f0307abb415385f16ed8070ec1a79b564d3",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/ReShadePreset.ini",
+      "source_kind": "stage",
+      "source": "host64/ReShadePreset.ini",
+      "sha256": "f090ba9b0af1b3ddae924c5f3de46e3485da346c09df0af74cfaa05809d20abc",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/standalone-dlssnr.addon64",
+      "source_kind": "stage",
+      "source": "host64/standalone-dlssnr.addon64",
+      "sha256": "01927b8f054ff915ee073e67bfcae2f6026416b28f40bfd5672f35e39daae5b4",
+      "replaces_original": false
+    },
+    {
+      "target": "licenses/DLSS5-Feeder-LICENSE.txt",
+      "source_kind": "stage",
+      "source": "licenses/DLSS5-Feeder-LICENSE.txt",
+      "sha256": "1ce240e402901fb81eb82a60a6bafd2fb913cd5746860b0a4ec52a5acb49ced7",
+      "replaces_original": false
+    },
+    {
+      "target": "licenses/DLSS5-ReShade-AIO-LICENSE.txt",
+      "source_kind": "stage",
+      "source": "licenses/DLSS5-ReShade-AIO-LICENSE.txt",
+      "sha256": "1eb85fc97224598dad1852b5d6483bbcf0aa8608790dcc657a5a2a761ae9c8c6",
+      "replaces_original": false
+    },
+    {
+      "target": "licenses/DLSS5-ReShade-AIO-NOTICE.txt",
+      "source_kind": "stage",
+      "source": "licenses/DLSS5-ReShade-AIO-NOTICE.txt",
+      "sha256": "f590ff9fde20abe5de87804f5dd8797f3f61a96eabe9c88bf3e724fc32fabee3",
+      "replaces_original": false
+    },
+    {
+      "target": "licenses/THIRD_PARTY_NOTICES.md",
+      "source_kind": "stage",
+      "source": "licenses/THIRD_PARTY_NOTICES.md",
+      "sha256": "c3bcbb186d4b6a2b9c32aeea8f1d9c0d8a82b273d6b727e04b6d9fb5cee010e7",
+      "replaces_original": false
+    },
+    {
+      "target": "README_FIRST.txt",
+      "source_kind": "stage",
+      "source": "README_FIRST.txt",
+      "sha256": "c9572a7172c7e9cb5c57b9f7a217c827a65484d98882f0885a5a842cad5be26b",
+      "replaces_original": false
+    },
+    {
+      "target": "reshade-shaders/Shaders/DLSS5_Feed.fx",
+      "source_kind": "stage",
+      "source": "reshade-shaders/Shaders/DLSS5_Feed.fx",
+      "sha256": "df16ed3431d2f6de16200c2e21564d9ffa595ecf51f38a5b946f22d5098f1dcc",
+      "replaces_original": false
+    },
+    {
+      "target": "reshade-shaders/Shaders/DLSS5_Feed_D3D9.fx",
+      "source_kind": "stage",
+      "source": "reshade-shaders/Shaders/DLSS5_Feed_D3D9.fx",
+      "sha256": "183a8eafe7cc0453b80b316a637aec64ac832392d777e355b15e9c06845a8677",
+      "replaces_original": false
+    },
+    {
+      "target": "reshade-shaders/Shaders/DLSS5_Feed_impl.fxh",
+      "source_kind": "stage",
+      "source": "reshade-shaders/Shaders/DLSS5_Feed_impl.fxh",
+      "sha256": "f268d4dadf0d4cd98573a42b20a024f821b0e085d0944c9ec67c48a7ac6a8b5f",
+      "replaces_original": false
+    },
+    {
+      "target": "reshade-shaders/Shaders/ReShade.fxh",
+      "source_kind": "stage",
+      "source": "reshade-shaders/Shaders/ReShade.fxh",
+      "sha256": "6dabfbbaf968c3871905d2ea17f96572ff7b1cec01310b5d0e5252b66b30174f",
+      "replaces_original": false
+    },
+    {
+      "target": "ReShade.ini",
+      "source_kind": "template",
+      "source": "game-ReShade.ini",
+      "sha256": "f2b6033ed5a39f049e2cc355628f4266464c046687ecc903c7f2f96037e45d48",
+      "replaces_original": false
+    },
+    {
+      "target": "standalone-dlssnr.addon32",
+      "source_kind": "stage",
+      "source": "standalone-dlssnr.addon32",
+      "sha256": "45429cdb4cd97c42e1dbb615f98b27f3a2575a4540727949e8a82d42e15b2f47",
+      "replaces_original": false
+    },
+    {
+      "target": "host64/nvngx_dlssg.dll",
+      "source_kind": "veyra-2.1.3-release-dlssg-lite",
+      "source": "nvngx_dlssg.dll",
+      "sha256": "cadee1aa6db3907babdc3285da2aebc4553d92b89c38ba3eae8abd8bba1bea72",
+      "replaces_original": false,
+      "note": "NVIDIA 310.9.16.0 dlssg runtime (matches NR snippet version); personal local use only, not redistributable"
+    }
+  ]
+}

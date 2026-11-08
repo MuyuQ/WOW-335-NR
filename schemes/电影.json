@@ -1,0 +1,14 @@
+{
+ "schema": 1,
+ "name": "电影",
+ "description": "模型 2 + 色调增强，待验收",
+ "created_utc": "2026-11-07T00:00:00Z",
+ "values": {
+  "neuralRendering": true,
+  "model": 2,
+  "intensity": 1.0,
+  "localTone": 1.5,
+  "localStructure": 1.2,
+  "skinStructure": -1.0
+ }
+}

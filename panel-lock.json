@@ -1,0 +1,8 @@
+{
+ "schema": 1,
+ "files": {
+  "dlss5-panel.exe": "5abd0c2f85d568feea840dff8183ffbd20a659d7d5335d62440bcb4b6dbefc38",
+  "panel.cpp": "18937caa54efa624a9951392153d7f7447a8b09b1c909d3887c129968528ab23",
+  "imgui_version": "1.92.5 (vendored)"
+ }
+}

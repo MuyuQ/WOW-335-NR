@@ -1,0 +1,8 @@
+{
+ "schema": 1,
+ "files": {
+  "window_watch.exe": "ea655d6a577909074cf98ef166fe01202a0179066520e0731ed3b215db29b485",
+  "window_watch.cpp": "74b037b6f8061f6193ca2f67b166cc66189eb79a4598c5c2244c5b35beca970b",
+  "window_layer.hpp": "3c76287da3ce305ad1f7e667c9dd3cbf4f5a70a3aef7cf791c23fd1927816c25"
+ }
+}

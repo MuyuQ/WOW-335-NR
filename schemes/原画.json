@@ -1,0 +1,14 @@
+{
+ "schema": 1,
+ "name": "原画",
+ "description": "对照基准：不使用神经渲染",
+ "created_utc": "2026-11-07T00:00:00Z",
+ "values": {
+  "neuralRendering": false,
+  "model": 1,
+  "intensity": 1.0,
+  "localTone": 1.0,
+  "localStructure": 1.0,
+  "skinStructure": -1.0
+ }
+}
