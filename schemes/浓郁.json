@@ -1,0 +1,14 @@
+{
+ "schema": 1,
+ "name": "浓郁",
+ "description": "浓郁：强重绘风格，色调偏电影感",
+ "created_utc": "2026-11-09T00:00:00Z",
+ "values": {
+  "neuralRendering": true,
+  "model": 1,
+  "intensity": 0.6,
+  "localTone": 1.3,
+  "localStructure": 0.5,
+  "skinStructure": -1.0
+ }
+}

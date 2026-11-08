@@ -30,7 +30,7 @@
       "target": "host64/AIO DLSS5 32-bit Wrapper.exe",
       "source_kind": "stage",
       "source": "host64/AIO DLSS5 32-bit Wrapper.exe",
-      "sha256": "e05a0aef9595849e2910d408cdfadf60c79a26addccba6dfe79c96b424bdef8b",
+      "sha256": "12cfe99057039979c39bd6f012d25b4c675f98429caad8688b31741ab2bc5123",
       "replaces_original": false
     },
     {
@@ -44,7 +44,7 @@
       "target": "host64/nvngx.dll",
       "source_kind": "stage",
       "source": "host64/nvngx.dll",
-      "sha256": "540247e4ae8c68bcf4ed3b70393d8904a522c75cd46a3b801bfbd8800ef106e4",
+      "sha256": "42599b54153c55f0d67385dd5b0b4435678222755448b4cbfb192c769ac6cd80",
       "replaces_original": false
     },
     {
@@ -79,7 +79,7 @@
       "target": "host64/ReShade.ini",
       "source_kind": "template",
       "source": "host64-ReShade.ini",
-      "sha256": "2c34dcce17ebe4ee89b2441ffd2c6f0307abb415385f16ed8070ec1a79b564d3",
+      "sha256": "796f02ad9c636b6a44f1f118f0a41c04bc934b4a9b2f1706bdd2d70a0cfc408c",
       "replaces_original": false
     },
     {
@@ -93,7 +93,7 @@
       "target": "host64/standalone-dlssnr.addon64",
       "source_kind": "stage",
       "source": "host64/standalone-dlssnr.addon64",
-      "sha256": "01927b8f054ff915ee073e67bfcae2f6026416b28f40bfd5672f35e39daae5b4",
+      "sha256": "11bc70236e5fac36390c1fbbba54690c27e245f5ab0e60828e37be210f4d75d6",
       "replaces_original": false
     },
     {
@@ -170,12 +170,12 @@
       "target": "standalone-dlssnr.addon32",
       "source_kind": "stage",
       "source": "standalone-dlssnr.addon32",
-      "sha256": "45429cdb4cd97c42e1dbb615f98b27f3a2575a4540727949e8a82d42e15b2f47",
+      "sha256": "fb61b4abf94767ebecc5bca879d5097e19699f0c8eb99e880278d72a9934e8d7",
       "replaces_original": false
     },
     {
       "target": "host64/nvngx_dlssg.dll",
-      "source_kind": "veyra-2.1.3-release-dlssg-lite",
+      "source_kind": "runtime",
       "source": "nvngx_dlssg.dll",
       "sha256": "cadee1aa6db3907babdc3285da2aebc4553d92b89c38ba3eae8abd8bba1bea72",
       "replaces_original": false,

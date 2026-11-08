@@ -68,11 +68,15 @@ def main():
         parser.error("AIO archive identity differs from the lock")
     lock = json.loads((MODULE / "payload-lock.json").read_text(encoding="utf-8"))
     members = [item for item in lock["members"] if item["source_kind"] == "stage"]
-    if lock["schema"] != 1 or len(members) != 21:
+    # 成员数量不设硬编码：改为覆盖性校验——每个 stage 成员必须来自压缩包或 EXTRA，
+    # 且每个 EXTRA 输入必须对应一个 stage 成员（20261109 去 21 计数）。
+    if lock["schema"] != 1 or not members:
         parser.error("unsupported component lock")
     for member in members:
         safe_member(member["source"])
     expected = {item["source"]: item["sha256"] for item in members}
+    if any(rel not in expected for rel in EXTRA):
+        parser.error("EXTRA inputs do not map to stage members in the lock")
     for relative, key in EXTRA.items():
         if relative not in expected or sha(paths[key]) != expected[relative]:
             parser.error(f"{key} identity differs from the lock")

@@ -96,7 +96,9 @@ static UINT g_proxy_rtv_stride;
 static UINT g_proxy_srv_stride;
 static DXGI_FORMAT g_proxy_present_format;
 static HANDLE g_proxy_fence_event;
-static UINT64 g_proxy_fence_value;
+// zh: 20261109 原子化批次一：呈现线程写入、游戏线程读取的裸标志改为原子
+// （与文件里其余计数器的原子风格统一；x64 上原为值竞争/形式 UB）。
+static std::atomic<UINT64> g_proxy_fence_value{0};
 static bool g_proxy_allow_tearing;
 static HANDLE g_proxy_frame_latency_waitable;
 static HANDLE g_proxy_present_event;
@@ -116,20 +118,20 @@ static std::atomic<unsigned int> g_proxy_present_request_state{0};
 static std::atomic<unsigned long long> g_proxy_present_coalesced{0};
 static std::atomic<unsigned long long> g_proxy_present_timeouts{0};
 static std::atomic<unsigned long long> g_proxy_display_backpressure_drops{0};
-static bool g_proxy_failed;
+static std::atomic<bool> g_proxy_failed{false};
 static std::atomic<bool> g_proxy_initializing{false};
 static std::atomic<unsigned int> g_proxy_initialization_deferrals{0};
 static bool g_early_proxy_initialization;
 static bool g_early_proxy_attempted;
 static bool g_proxy_initialized_early;
-static bool g_proxy_early_pending_activation;
+static std::atomic<bool> g_proxy_early_pending_activation{false};
 static bool g_early_proxy_restart_required;
 static bool g_proxy_window_start_hidden;
 static std::atomic<bool> g_proxy_hidden{false};
 static std::atomic<bool> g_proxy_transition_hold{false};
 static std::atomic<unsigned int> g_proxy_activation_frames{0};
 static constexpr unsigned int kProxyActivationStableFrames = 3;
-static bool g_show_neural_output = true;
+static std::atomic<bool> g_show_neural_output{true};
 static bool g_pending_proxy_frame;
 static bool g_composite_reshade_output = true;
 static std::atomic<unsigned long long> g_post_reshade_frames{0};
@@ -209,8 +211,8 @@ static Microsoft::WRL::ComPtr<ID3D12QueryHeap> g_guide_telemetry_query_heap;
 static Microsoft::WRL::ComPtr<ID3D12Resource> g_guide_telemetry_readback;
 static Microsoft::WRL::ComPtr<ID3D12Fence> g_guide_telemetry_fence;
 static UINT64 g_guide_telemetry_frequency;
-static UINT64 g_guide_telemetry_fence_value;
-static bool g_guide_telemetry_pending;
+static std::atomic<UINT64> g_guide_telemetry_fence_value{0};
+static std::atomic<bool> g_guide_telemetry_pending{false};
 static std::atomic<bool> g_guide_gpu_telemetry_available{false};
 static std::atomic<unsigned int> g_gpu_vort_us{0};
 static std::atomic<unsigned int> g_gpu_feed_us{0};
@@ -329,12 +331,12 @@ static std::atomic<int> g_external_nr_pass_count_request{0};
 static std::atomic<unsigned int> g_fg_mfg_count{1};          // 生效插值帧数（1=现役 2×）
 // zh: 能力上限乐观默认 3（4×）；MultiFrameCountMax 属能力参数、常规参数堆拿不到，
 // zh: 运行时拒绝高索引评估时由 ClampFgMfgMaxAfterFailure 逐级收窄。
-static unsigned int g_fg_mfg_max = 3;
+static std::atomic<unsigned int> g_fg_mfg_max{3};
 static std::atomic<int> g_external_fg_mfg_request{-1};       // live-params 请求（-1=无请求）
 
 static unsigned int EffectiveFgMfgCount()
 {
-    return std::min(g_fg_mfg_count.load(std::memory_order_acquire), g_fg_mfg_max);
+    return std::min(g_fg_mfg_count.load(std::memory_order_acquire), g_fg_mfg_max.load(std::memory_order_relaxed));
 }
 
 // zh: 引擎以 NGX 结果拒绝某索引的插值评估时，把能力上限收窄到该索引之下；
@@ -644,13 +646,13 @@ static bool g_nr_enabled = true;
 static unsigned int g_nr_pass_count = 1;
 static bool g_nr_second_pass_failed = false;
 static bool g_nr_third_pass_failed = false;
-static bool g_framegen_enabled = true;
-static bool g_framegen_failed = false;
+static std::atomic<bool> g_framegen_enabled{true};
+static std::atomic<bool> g_framegen_failed{false};
 static std::atomic<bool> g_feature_recreate_requested{false};
 static bool g_need_history_reset = true;
 static bool g_depth_reversed = true;
-static bool g_neural_failed = false;
-static bool g_neural_ready = false;
+static std::atomic<bool> g_neural_failed{false};
+static std::atomic<bool> g_neural_ready{false};
 static bool g_mask_available = false;
 static bool g_nr_mask_available = false;
 static bool g_using_external_guides = false;
@@ -755,8 +757,9 @@ struct PipelineFrameSlot
     int staged_capture_slot_index = -1;
     Microsoft::WRL::ComPtr<ID3D12QueryHeap> telemetry_query_heap;
     Microsoft::WRL::ComPtr<ID3D12Resource> telemetry_readback;
-    UINT64 telemetry_fence_value = 0;
-    bool telemetry_pending = false;
+    // zh: 槽位遥测标志由 owning 线程写入、BeginNeuralCommands 跨槽消费，改原子。
+    std::atomic<UINT64> telemetry_fence_value{0};
+    std::atomic<bool> telemetry_pending{false};
 };
 static PipelineFrameSlot g_pipeline_slots[kPipelineFrameSlotCount];
 static constexpr UINT kLegacyCaptureSlotCount = 3;
@@ -3499,7 +3502,24 @@ static bool CreateFeatures()
 
 static bool RecreateFeatures()
 {
-    if (!g_neural_ready || !g_sr_feature) return false;
+    // zh: 20261109 热切换可恢复性。旧版两个静默死局：
+    //  a) SR 释放成功、后续 NR 释放失败 → Fail() 后返回，g_sr_feature 已空，
+    //     入口守卫永远挡住重试，g_feature_recreate_requested 永远挂着；
+    //  b) 全部释放后 CreateFeatures 失败 → 请求同样挂着，每帧空转。
+    // 现版契约：GPU 等待类瞬态失败保留请求下一帧重试；一旦进入真正的释放阶段
+    // 即视为"提交"，先清请求（杜绝重试风暴）；个别释放失败不再整条管线陪葬，
+    // 改为尽力清完剩余特性后完整重建一次（失败的旧特性只泄漏一个句柄）；
+    // 重建也失败才终态化（Fail 语义 + 明确状态），用户可再拨一次开关重试。
+    if (!g_neural_ready || !g_sr_feature)
+    {
+        if (g_neural_failed || (g_neural_ready && !g_sr_feature))
+        {
+            g_feature_recreate_requested = false;
+            SetStatus("pipeline switch unavailable: neural pipeline not ready; toggle the setting to retry");
+            Log("pipeline switch requested but no live pipeline remains; request cleared");
+        }
+        return false;   // 初始化未完成时保留请求，就绪后自动应用
+    }
     if (!WaitForNeuralGpu(0, false, "pipeline switch GPU fence"))
         return false;
     if (!AsyncFgGpuIdle())
@@ -3509,7 +3529,10 @@ static bool RecreateFeatures()
                 g_async_fg_fence_value, g_neural_dispatch_wake_event);
         return false;
     }
+    g_feature_recreate_requested = false;   // 提交点：此后的硬失败不再自动重试
     DWORD exception = 0;
+    const char *release_failure = nullptr;
+    unsigned int release_failure_code = 0;
     if (g_fg_feature)
     {
         const NVSDK_NGX_Result fg_result = SafeRelease(g_fg_via_core ? g_core_release : g_fg_release, g_fg_feature, &exception);
@@ -3523,20 +3546,18 @@ static bool RecreateFeatures()
     NVSDK_NGX_Result sr_result = SafeRelease(g_sr_release, g_sr_feature, &exception);
     if (exception || NVSDK_NGX_FAILED(sr_result))
     {
-        Fail(exception ? "DLSS SR release exception" : "DLSS SR release",
-            exception ? exception : static_cast<unsigned int>(sr_result));
-        return false;
+        release_failure = exception ? "DLSS SR release exception" : "DLSS SR release";
+        release_failure_code = exception ? exception : static_cast<unsigned int>(sr_result);
     }
     g_sr_feature = nullptr;
     if (g_nr_third_feature)
     {
         NVSDK_NGX_Result third_result = SafeRelease(
             g_nr_release, g_nr_third_feature, &exception);
-        if (exception || NVSDK_NGX_FAILED(third_result))
+        if ((exception || NVSDK_NGX_FAILED(third_result)) && !release_failure)
         {
-            Fail(exception ? "third NR release exception" : "third NR release",
-                exception ? exception : static_cast<unsigned int>(third_result));
-            return false;
+            release_failure = exception ? "third NR release exception" : "third NR release";
+            release_failure_code = exception ? exception : static_cast<unsigned int>(third_result);
         }
         g_nr_third_feature = nullptr;
     }
@@ -3544,22 +3565,20 @@ static bool RecreateFeatures()
     {
         NVSDK_NGX_Result second_result = SafeRelease(
             g_nr_release, g_nr_second_feature, &exception);
-        if (exception || NVSDK_NGX_FAILED(second_result))
+        if ((exception || NVSDK_NGX_FAILED(second_result)) && !release_failure)
         {
-            Fail(exception ? "second NR release exception" : "second NR release",
-                exception ? exception : static_cast<unsigned int>(second_result));
-            return false;
+            release_failure = exception ? "second NR release exception" : "second NR release";
+            release_failure_code = exception ? exception : static_cast<unsigned int>(second_result);
         }
         g_nr_second_feature = nullptr;
     }
     if (g_nr_feature)
     {
         NVSDK_NGX_Result nr_result = SafeRelease(g_nr_release, g_nr_feature, &exception);
-        if (exception || NVSDK_NGX_FAILED(nr_result))
+        if ((exception || NVSDK_NGX_FAILED(nr_result)) && !release_failure)
         {
-            Fail(exception ? "NR release exception" : "NR release",
-                exception ? exception : static_cast<unsigned int>(nr_result));
-            return false;
+            release_failure = exception ? "NR release exception" : "NR release";
+            release_failure_code = exception ? exception : static_cast<unsigned int>(nr_result);
         }
         g_nr_feature = nullptr;
     }
@@ -3567,13 +3586,22 @@ static bool RecreateFeatures()
         g_nr_second_stage.Reset();
     if (g_nr_pass_count < 3 || !g_nr_enabled)
         g_nr_third_stage.Reset();
+    if (release_failure)
+        Log("live switch: %s failed (0x%08X); continuing to a fresh build (the failed handle may leak)",
+            release_failure, release_failure_code);
     Log("released live features for pipeline change: NR=%s passes_requested=%u old_model=%d requested_model=%d",
         g_nr_enabled ? "enabled" : "disabled",
         g_nr_pass_count, g_active_nr_model, g_nr_model);
     g_fg_frames = 0;
     g_need_history_reset = true;
     g_last_neural_source_sequence = 0;
-    if (!CreateFeatures()) return false;
+    if (!CreateFeatures())
+    {
+        SetStatus("pipeline switch failed (%s 0x%08X); raw output until restart",
+                  release_failure ? release_failure : "feature creation",
+                  release_failure ? release_failure_code : 0u);
+        return false;
+    }
     Log("live pipeline switch complete: NR=%s passes_active=%u active_model=%d",
         g_nr_feature ? "enabled" : "disabled",
         g_nr_third_feature ? 3u : (g_nr_second_feature ? 2u : (g_nr_feature ? 1u : 0u)),
@@ -4041,7 +4069,7 @@ static bool RetireResolutionDependentResources(UINT next_width, UINT next_height
     if (g_proxy_fence && g_proxy_fence_value != 0 && g_proxy_fence->GetCompletedValue() < g_proxy_fence_value)
     {
         Log("resolution reconfiguration deferred: proxy GPU work is still active (completed=%llu submitted=%llu)",
-            g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
+            g_proxy_fence->GetCompletedValue(), g_proxy_fence_value.load(std::memory_order_relaxed));
         return false;
     }
     if (!WaitForNeuralGpu(0, false, "resolution transition GPU fence"))
@@ -6469,7 +6497,7 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
         if (skipped <= 8 || skipped % 600 == 0)
             Log("neural frame skipped: all buffered pipeline slots are genuinely occupied (skip=%llu neural=%llu/%llu proxy=%llu/%llu)",
                 skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value,
-                g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0, g_proxy_fence_value);
+                g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0, g_proxy_fence_value.load(std::memory_order_relaxed));
         return false;
     }
     const UINT slot_index = static_cast<UINT>(pipeline_slot_index);
@@ -10923,7 +10951,7 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
             const unsigned long long timeouts = ++g_proxy_present_timeouts;
             if (timeouts <= 8 || timeouts % 120 == 0)
                 Log("async proxy command ring exhausted without blocking (timeout=%llu completed=%llu submitted=%llu)",
-                    timeouts, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value);
+                    timeouts, g_proxy_fence->GetCompletedValue(), g_proxy_fence_value.load(std::memory_order_relaxed));
             return false;
         }
         const UINT command_slot = static_cast<UINT>(command_slot_index);
@@ -11307,7 +11335,7 @@ static DWORD WINAPI ProxyPresentationThread(void *)
             else
             {
                 presented = PresentPipelineFrameOnWorker(static_cast<UINT>(slot_index));
-                slot.proxy_fence_value.store(g_proxy_fence_value, std::memory_order_release);
+                slot.proxy_fence_value.store(g_proxy_fence_value.load(std::memory_order_relaxed), std::memory_order_release);
                 slot.state.store(PipelineSlotPresenting, std::memory_order_release);
             }
             if (!presented)
@@ -13462,25 +13490,29 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
     ImGui::TextDisabled("Off by default; enable only as a per-frame SR-history diagnostic.");
-    if (ImGui::Checkbox(dlss5_aio_menu::Label("FrameGeneration", "Experimental DLSS Frame Generation (2x)"), &g_framegen_enabled))
+    bool fg_checkbox = g_framegen_enabled.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox(dlss5_aio_menu::Label("FrameGeneration", "Experimental DLSS Frame Generation (2x)"), &fg_checkbox))
     {
-        reshade::set_config_value(nullptr, section, "FrameGeneration", g_framegen_enabled ? "1" : "0");
+        g_framegen_enabled = fg_checkbox;
+        reshade::set_config_value(nullptr, section, "FrameGeneration", fg_checkbox ? "1" : "0");
         g_fg_frames = 0;
         g_need_history_reset = true;
         if (g_neural_ready) g_feature_recreate_requested = true;
-        Log("experimental DLSS-G changed to %s", g_framegen_enabled ? "enabled" : "disabled");
+        Log("experimental DLSS-G changed to %s", fg_checkbox ? "enabled" : "disabled");
     }
     if (g_native_streamline_present_hook)
         ImGui::TextDisabled("Native Streamline is loaded. Addon FG is not blocked; disable the game's built-in Frame Generation.");
     else
         ImGui::TextDisabled(g_framegen_failed ? "DLSS-G unavailable/failed; real-frame fallback is active." :
             "Presents one generated frame followed by one real frame; F10 original bypasses FG.");
-    if (ImGui::Checkbox("Present processed output (F10)", &g_show_neural_output))
+    bool show_output_checkbox = g_show_neural_output.load(std::memory_order_relaxed);
+    if (ImGui::Checkbox("Present processed output (F10)", &show_output_checkbox))
     {
+        g_show_neural_output = show_output_checkbox;
         g_need_history_reset = true;
         ResetQueuePressureObservation(true);
         Log("overlay presentation A/B changed to %s",
-            g_show_neural_output ? "processed native output" : "point-stretched raw pre-ReShade game frame");
+            show_output_checkbox ? "processed native output" : "point-stretched raw pre-ReShade game frame");
     }
     if (ImGui::Checkbox(dlss5_aio_menu::Label("CompositeReshade", "Composite ReShade menu while open"), &g_composite_reshade_output))
         reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");

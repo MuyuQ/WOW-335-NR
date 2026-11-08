@@ -22,12 +22,30 @@ from telemetry_reader import open_host
 from resource_probe import gpu_devices, memory, x86_address_space
 
 PROJECT = Path(__file__).resolve().parents[3]
+MODULE = Path(__file__).resolve().parents[1]
 SCRATCH = (PROJECT / "_scratch" / "dlss5-aio").resolve(strict=True)
-GAME_SHA = "4c459de64d38b5795becc6c01a03ba00d34686598fae707c442446722617868a"
-HOST_SHA = "e05a0aef9595849e2910d408cdfadf60c79a26addccba6dfe79c96b424bdef8b"
+# 组件身份唯一事实源是仓库根的 payload-lock.json（20261109 去重：此前此处与
+# payload-lock.json、window_watch.cpp 三处硬编码同一批哈希，改锁必漏）。
+# PresentMon 尚无锁条目，保持本地常量。
 PM_SHA = "b2a706bc6ad475749e3b7e3409263aa1e6906d45bdcf993f6dbc0f660188f1af"
-DXVK_SHA = "cc556331fc3388989749620bceead4c2da95c3932ed38cf5cc24f3f0a878866e"
-RESHADE_SHA = "da430e0a9c6eecefa0d1b27d05e16c426fb5d04e808b194d914eaac4b31bc0f8"
+
+
+def _lock_identities():
+    lock = json.loads((MODULE / "payload-lock.json").read_text(encoding="utf-8"))
+    members = {item["target"]: item["sha256"] for item in lock["members"]}
+    return {
+        "GAME_SHA": lock["game_sha256"],
+        "DXVK_SHA": lock["original_d3d9_sha256"],
+        "RESHADE_SHA": members["d3d9.dll"],
+        "HOST_SHA": members["host64/AIO DLSS5 32-bit Wrapper.exe"],
+    }
+
+
+_lock_ids = _lock_identities()
+GAME_SHA = _lock_ids["GAME_SHA"]
+DXVK_SHA = _lock_ids["DXVK_SHA"]
+RESHADE_SHA = _lock_ids["RESHADE_SHA"]
+HOST_SHA = _lock_ids["HOST_SHA"]
 PROCESS_QUERY = r"""$ErrorActionPreference='Stop'
 [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
 $rows = @(Get-CimInstance Win32_Process -Filter "Name='wow.exe' OR Name='AIO DLSS5 32-bit Wrapper.exe'" |

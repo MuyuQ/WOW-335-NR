@@ -78,11 +78,12 @@ function Move-AtomicReplace([string]$Source, [string]$Target) {
 
 function Get-Dlss5Lock {
     $lock = [IO.File]::ReadAllText($script:LockFile, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-    if ($lock.schema -ne 1 -or @($lock.members).Count -ne 24) { throw '组件清单格式不受支持。' }
+    # zh: 成员数量不设硬编码——数量随锁内容走，结构性校验在此处完成（20261109 修复 dlssg runtime 类别加入后整体失效）。
+    if ($lock.schema -ne 1 -or @($lock.members).Count -lt 1) { throw '组件清单格式不受支持。' }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($member in $lock.members) {
         if (-not $seen.Add([string]$member.target)) { throw '组件清单中有重复目标。' }
-        if ($member.sha256 -notmatch '^[0-9a-f]{64}$' -or $member.source_kind -notin @('stage', 'template')) {
+        if ($member.sha256 -notmatch '^[0-9a-f]{64}$' -or $member.source_kind -notin @('stage', 'template', 'runtime')) {
             throw '组件清单包含无效身份。'
         }
         $first = ([string]$member.target -split '[/\\]')[0]
@@ -128,7 +129,7 @@ function Get-Dlss5InstallPreview {
     if (Test-Within $script:OperationsRoot $clientFull) { throw '备份目录不能位于客户端内。' }
     $items = @()
     foreach ($member in $lock.members) {
-        $root = if ($member.source_kind -eq 'stage') { $stageFull } else { Join-Path $script:ModuleRoot 'templates' }
+        $root = if ($member.source_kind -in @('stage', 'runtime')) { $stageFull } else { Join-Path $script:ModuleRoot 'templates' }
         $source = Get-MemberPath $root ([string]$member.source)
         $target = Get-MemberPath $clientFull ([string]$member.target)
         $issue = $null
@@ -537,8 +538,8 @@ function Set-Dlss5Settings {
     param([Parameter(Mandatory)][string]$Client, [Parameter(Mandatory)][bool]$NeuralRendering,
           [Parameter(Mandatory)][double]$Intensity, [Parameter(Mandatory)][int]$Model,
           [Parameter(Mandatory)][bool]$DetachedPresentation, [Parameter(Mandatory)][bool]$OpticalFlow)
-    if ([double]::IsNaN($Intensity) -or [double]::IsInfinity($Intensity) -or $Intensity -lt 0 -or $Intensity -gt 2) {
-        throw 'NR 强度必须在 0 到 2 之间。'
+    if ([double]::IsNaN($Intensity) -or [double]::IsInfinity($Intensity) -or $Intensity -lt 0 -or $Intensity -gt 1) {
+        throw 'NR 强度必须在 0 到 1 之间。'
     }
     if ($Model -lt 1 -or $Model -gt 3) { throw 'NR 模型必须为 1、2 或 3。' }
     Assert-ProcessesStopped
@@ -649,7 +650,8 @@ function Get-Dlss5Status {
         'd3d9.dll' = 'x86'; 'standalone-dlssnr.addon32' = 'x86';
         'host64/AIO DLSS5 32-bit Wrapper.exe' = 'x64'; 'host64/dxgi.dll' = 'x64';
         'host64/standalone-dlssnr.addon64' = 'x64'; 'host64/nvngx.dll' = 'x64';
-        'host64/nvngx_dlss.dll' = 'x64'; 'host64/nvngx_dlssnr.dll' = 'x64'
+        'host64/nvngx_dlss.dll' = 'x64'; 'host64/nvngx_dlssnr.dll' = 'x64';
+        'host64/nvngx_dlssg.dll' = 'x64'
     }
     foreach ($member in $lock.members) {
         $path = Get-MemberPath $clientFull ([string]$member.target)
@@ -776,6 +778,9 @@ function Start-Dlss5WindowWatch {
 }
 
 $script:AdvancedKeys = @('Model','Intensity','LocalTone','LocalStructure','SkinStructure')
+# zh: 参数刻度边界——与 native/tiers.hpp（唯一事实源）、schemes/*.json、模板一致（20261109 收敛）。
+$script:NrIntensityMax = 1.0   # 强度/结构 0–1（1.0=满）
+$script:NrToneMax = 2.0        # 色调 0–2（1.0=中性）
 $script:SchemesRoot = [IO.Path]::GetFullPath((Join-Path $script:ModuleRoot 'schemes'))
 $script:UserSchemesRoot = [IO.Path]::GetFullPath((Join-Path $script:ScratchRoot 'dlss5-aio/user-schemes'))
 
@@ -810,10 +815,12 @@ function Set-Dlss5AdvancedSettings {
           [Nullable[bool]]$DetachedPresentation = $null,
           [Nullable[bool]]$OpticalFlow = $null)
     if ($Model -lt 1 -or $Model -gt 3) { throw '模型必须为 1、2 或 3。' }
-    foreach ($pair in @(@('强度',$Intensity),@('色调结构',$LocalTone),@('结构强度',$LocalStructure))) {
-        $v = [double]$pair[1]
-        if ([double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0 -or $v -gt 2) {
-            throw ($pair[0] + ' 必须在 0 到 2 之间。')
+    foreach ($bound in @(@('强度',$Intensity,$script:NrIntensityMax),
+                         @('色调结构',$LocalTone,$script:NrToneMax),
+                         @('结构强度',$LocalStructure,$script:NrIntensityMax))) {
+        $v = [double]$bound[1]
+        if ([double]::IsNaN($v) -or [double]::IsInfinity($v) -or $v -lt 0 -or $v -gt $bound[2]) {
+            throw ($bound[0] + (' 必须在 0 到 {0} 之间。' -f $bound[2]))
         }
     }
     if ($SkinStructure -lt -1 -or $SkinStructure -gt 1) { throw '皮肤结构必须在 -1 到 1 之间。' }

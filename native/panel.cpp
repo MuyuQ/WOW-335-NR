@@ -22,6 +22,7 @@
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
+#include "tiers.hpp"
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace fs = std::filesystem;
@@ -93,14 +94,12 @@ static bool g_tier_locked = true;   // zh: 出厂档=锁定配方（微调禁用
 static Params g_custom;          // 自定义档位：最近一次应用的参数组合
 static bool g_custom_valid = false;
 
-// zh: 档位=强度阶梯。刻度对齐 033/引擎契约：强度与结构 0–1（1.0=满），
-// 色调 0–2（1.0=中性）、皮肤 -1~1（0=中性）。
-// 社区参考（Igor's Lab）：强度 20–35%、结构 10–25%——三档间距刻意拉开。
+// zh: 档位表来自 tiers.hpp（与控制台/PowerShell 共用的唯一事实源）。
 static const struct { const char *name; Params p; } kSchemes[] = {
-    { "原画", { false, 1, 1.0f,  1.0f, 1.0f,  -1.0f } },
-    { "轻量", { true,  1, 0.20f, 1.0f, 0.10f, -1.0f } },
-    { "均衡", { true,  1, 0.35f, 1.0f, 0.25f, -1.0f } },
-    { "浓郁", { true,  1, 0.60f, 1.3f,  0.50f, -1.0f } },
+    { kNrTiers[0].name, { kNrTiers[0].nr,  kNrTiers[0].model, kNrTiers[0].intensity, kNrTiers[0].tone, kNrTiers[0].structure, kNrTiers[0].skin } },
+    { kNrTiers[1].name, { kNrTiers[1].nr,  kNrTiers[1].model, kNrTiers[1].intensity, kNrTiers[1].tone, kNrTiers[1].structure, kNrTiers[1].skin } },
+    { kNrTiers[2].name, { kNrTiers[2].nr,  kNrTiers[2].model, kNrTiers[2].intensity, kNrTiers[2].tone, kNrTiers[2].structure, kNrTiers[2].skin } },
+    { kNrTiers[3].name, { kNrTiers[3].nr,  kNrTiers[3].model, kNrTiers[3].intensity, kNrTiers[3].tone, kNrTiers[3].structure, kNrTiers[3].skin } },
 };
 
 // zh: 模型即 DLSSNR.Style 0–2（引擎三套有效网络；Hint.Render.Preset 在本运行时
@@ -115,13 +114,13 @@ static const char *kModelDesc[3] = {
 
 static void ClampParams(Params &p)
 {
-    // zh: 强度/结构按引擎真实范围 0–1（033 schema bounds；upstream 的 0–2 菜单范围偏宽）
+    // zh: 边界取自 tiers.hpp（033 schema bounds；与控制台/PowerShell 共用）
     p.model = std::clamp(p.model, 1, 3);
     p.fg_multiplier = std::clamp(p.fg_multiplier, 2, 4);
-    p.intensity = std::clamp(p.intensity, 0.0f, 1.0f);
-    p.tone = std::clamp(p.tone, 0.0f, 2.0f);
-    p.structure = std::clamp(p.structure, 0.0f, 1.0f);
-    p.skin = std::clamp(p.skin, -1.0f, 1.0f);
+    p.intensity = std::clamp(p.intensity, kNrIntensityMin, kNrIntensityMax);
+    p.tone = std::clamp(p.tone, kNrToneMin, kNrToneMax);
+    p.structure = std::clamp(p.structure, kNrStructureMin, kNrStructureMax);
+    p.skin = std::clamp(p.skin, kNrSkinMin, kNrSkinMax);
 }
 
 static std::string ParamsToJson(const Params &p)
@@ -228,13 +227,13 @@ static void ReadIniParams(Params &p)
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "Model", "", value, sizeof value, ini) && value[0])
         p.model = std::clamp(atoi(value), 1, 3);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "Intensity", "", value, sizeof value, ini) && value[0])
-        p.intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+        p.intensity = std::clamp(static_cast<float>(atof(value)), kNrIntensityMin, kNrIntensityMax);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "LocalTone", "", value, sizeof value, ini) && value[0])
-        p.tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+        p.tone = std::clamp(static_cast<float>(atof(value)), kNrToneMin, kNrToneMax);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "LocalStructure", "", value, sizeof value, ini) && value[0])
-        p.structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+        p.structure = std::clamp(static_cast<float>(atof(value)), kNrStructureMin, kNrStructureMax);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "SkinStructure", "", value, sizeof value, ini) && value[0])
-        p.skin = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
+        p.skin = std::clamp(static_cast<float>(atof(value)), kNrSkinMin, kNrSkinMax);
 }
 
 // ===== 遥测（共享内存直读，偏移与 performance/telemetry_reader.py 一致） =====
@@ -955,6 +954,7 @@ int wmain(int argc, wchar_t **argv)
     CustomPath = (game.parent_path() / L"host64" / L"custom-tier.json").wstring();
     ReadIniParams(g_params);
     LoadCustomTier();
+    g_tier_locked = false;   // zh: 不匹配任何出厂档=自定义，解锁微调（旧版只会保持锁定）
     for (const auto &s : kSchemes)
         if (g_params.MatchesTier(s.p)) { g_tier_locked = true; break; }
 

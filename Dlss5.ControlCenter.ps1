@@ -73,14 +73,14 @@ $model = [Windows.Forms.ComboBox]::new(); $model.DropDownStyle = 'DropDownList';
 $null = $model.Items.Add('模型 1'); $null = $model.Items.Add('模型 2（待验收）'); $null = $model.Items.Add('模型 3（待验收）')
 $model.SelectedIndex = 0
 $intensityLabel = [Windows.Forms.Label]::new(); $intensityLabel.Text = 'NR 强度'; $intensityLabel.AutoSize = $true
-$intensity = [Windows.Forms.NumericUpDown]::new(); $intensity.Minimum = 0; $intensity.Maximum = 2
+$intensity = [Windows.Forms.NumericUpDown]::new(); $intensity.Minimum = 0; $intensity.Maximum = 1
 $intensity.DecimalPlaces = 2; $intensity.Increment = [decimal]0.05; $intensity.Value = 1; $intensity.Width = 70
 $detached = [Windows.Forms.CheckBox]::new(); $detached.Text = '独立输出候选（同时启动鼠标助手）'; $detached.AutoSize = $true
 $flow = [Windows.Forms.CheckBox]::new(); $flow.Text = 'Optical Flow（试验）'; $flow.AutoSize = $true
 $toneLabel = [Windows.Forms.Label]::new(); $toneLabel.Text = '色调结构'; $toneLabel.AutoSize = $true
 $tone = [Windows.Forms.NumericUpDown]::new(); $tone.Minimum = 0; $tone.Maximum = 2; $tone.DecimalPlaces = 2; $tone.Increment = [decimal]0.05; $tone.Value = 1; $tone.Width = 70
 $structureLabel = [Windows.Forms.Label]::new(); $structureLabel.Text = '结构强度'; $structureLabel.AutoSize = $true
-$structure = [Windows.Forms.NumericUpDown]::new(); $structure.Minimum = 0; $structure.Maximum = 2; $structure.DecimalPlaces = 2; $structure.Increment = [decimal]0.05; $structure.Value = 1; $structure.Width = 70
+$structure = [Windows.Forms.NumericUpDown]::new(); $structure.Minimum = 0; $structure.Maximum = 1; $structure.DecimalPlaces = 2; $structure.Increment = [decimal]0.05; $structure.Value = 1; $structure.Width = 70
 $skinLabel = [Windows.Forms.Label]::new(); $skinLabel.Text = '皮肤结构'; $skinLabel.AutoSize = $true
 $skin = [Windows.Forms.NumericUpDown]::new(); $skin.Minimum = -1; $skin.Maximum = 1; $skin.DecimalPlaces = 2; $skin.Increment = [decimal]0.1; $skin.Value = -1; $skin.Width = 70
 $advNote = [Windows.Forms.Label]::new(); $advNote.Text = '—— 档位与微调（改后需重启游戏；游戏内 Home → Add-ons 可实时微调）——'; $advNote.AutoSize = $true; $advNote.ForeColor = [Drawing.Color]::SteelBlue
@@ -184,10 +184,10 @@ $check.Add_Click({ Invoke-Ui {
     if ($status.Config.Model -in @('1', '2', '3')) { $model.SelectedIndex = [int]$status.Config.Model - 1 }
     if ($null -ne $status.Config.NvidiaOpticalFlowMotion) { $flow.Checked = $status.Config.NvidiaOpticalFlowMotion -eq '1' }
     if ($null -ne $status.Config.DetachedPresentation) { $detached.Checked = $status.Config.DetachedPresentation -eq '1' }
-    $parsed = [double]0
+        $parsed = [double]0
     if ($null -ne $status.Config.Intensity -and [double]::TryParse($status.Config.Intensity,
         [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and
-        $parsed -ge 0 -and $parsed -le 2) { $intensity.Value = [decimal]$parsed }
+        $parsed -ge 0 -and $parsed -le 1) { $intensity.Value = [decimal]$parsed }
     Update-Operations
 } })
 
@@ -288,7 +288,7 @@ function Read-AdvancedIntoUi {
     if ($null -ne $a.NeuralRendering) { $nr.Checked = $a.NeuralRendering -ne '0' }
     if ($a.Model -in @('1','2','3')) { $model.SelectedIndex = [int]$a.Model - 1 }
     $parsed = [double]0
-    foreach ($pair in @(@($intensity,$a.Intensity,0,2),@($tone,$a.LocalTone,0,2),@($structure,$a.LocalStructure,0,2),@($skin,$a.SkinStructure,-1,1))) {
+    foreach ($pair in @(@($intensity,$a.Intensity,0,1),@($tone,$a.LocalTone,0,2),@($structure,$a.LocalStructure,0,1),@($skin,$a.SkinStructure,-1,1))) {
         $box = $pair[0]; $raw = [string]$pair[1]
         if ($raw -and [double]::TryParse($raw, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed)) {
             $lo = [decimal]$pair[2]; $hi = [decimal]$pair[3]

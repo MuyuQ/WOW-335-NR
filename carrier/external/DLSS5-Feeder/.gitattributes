@@ -1,2 +1,6 @@
-# Batch files must keep CRLF: cmd.exe mis-parses goto/labels in LF-only scripts.
-*.bat text eol=crlf
+# Upstream declared "*.bat text eol=crlf" here, but since the Feeder snapshot is
+# vendored as plain files inside the WOW-335-NR repository, the root convention
+# applies instead: byte fidelity, git performs no EOL normalization.
+# (20261109: the deeper rule overrode the root "* -text" and silently normalized
+# eight vendored .bat files to LF in the index while the working tree is CRLF.)
+* -text

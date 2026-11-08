@@ -4,7 +4,7 @@ The Apache License 2.0 in this repository applies to the original DLSS5 ReShade 
 
 ## DLSS5-Feeder and bundled dependencies
 
-The `external/DLSS5-Feeder` Git submodule is developed by Jean-Laurent ROUZIES and is licensed separately under the MIT License. It includes portions attributed to NIGos and dependencies with their own license files, including ReShade, ImGui, MinHook, RenoDX, Microsoft Detours, and Deep-Fried-Chicken components. Preserve the notices shipped in that submodule when redistributing any of its source or binary material.
+The `external/DLSS5-Feeder` directory is a vendored snapshot (upstream commit `75754b2`) of the project developed by Jean-Laurent ROUZIES and is licensed separately under the MIT License. It includes portions attributed to NIGos and dependencies with their own license files, including ReShade, ImGui, MinHook, RenoDX, Microsoft Detours, and Deep-Fried-Chicken components. Preserve the notices shipped in that directory when redistributing any of its source or binary material.
 
 - [`external/DLSS5-Feeder/LICENSE`](external/DLSS5-Feeder/LICENSE)
 - [`external/DLSS5-Feeder`](https://github.com/jlrouzies-fr/DLSS5-Feeder)

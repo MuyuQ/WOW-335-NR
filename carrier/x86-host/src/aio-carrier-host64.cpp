@@ -689,6 +689,11 @@ static DXGI_FORMAT CarrierSwapchainFormat(DXGI_FORMAT format)
         return DXGI_FORMAT_R10G10B10A2_UNORM;
     case DXGI_FORMAT_R16G16B16A16_TYPELESS:
         return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:
+        // FLIP_DISCARD has no X8 swapchain format; map to the same texel family's
+        // A8 twin (the D3D9 X8R8G8B8 backbuffer case; alpha is unused on the way
+        // home). Same decision as FeedFmtOutputFor in feed_fmt.h.
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
     default:
         return format;
     }
@@ -1045,6 +1050,17 @@ static int Serve(DWORD game_pid)
         Log("[host] the game add-on speaks protocol v%u, this host v%u -- the two halves are from "
             "different releases; reinstall dlss5-feed.addon32 and host64\\ together",
             hello.version, FEED_IPC_VERSION);
+        return 1;
+    }
+    // 20261109: the hello pid is untrusted input off the pipe. It must name the same
+    // game process this host was launched for (the pipe name carries that pid). A
+    // mismatched client -- including a same-user process that raced us to the single
+    // pipe instance -- must not be able to point the OpenProcess(PROCESS_DUP_HANDLE)
+    // below at an arbitrary pid.
+    if (hello.pid != game_pid)
+    {
+        Log("[host] hello names game pid %u, this host serves pid %lu -- refusing",
+            hello.pid, static_cast<unsigned long>(game_pid));
         return 1;
     }
 

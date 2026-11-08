@@ -1,8 +1,8 @@
 // WOW-335-NR 控制台：桌面端一站式程序。
 // - 启动游戏、保活游戏内悬浮面板（dlss5-panel.exe）
-// - 展示遥测（NR/FG 帧数、输出帧率、图层覆盖）与全部开关（NR、帧生成、档位、微调）
+// - 展示遥测（NR/FG 帧数、输出帧率、图层覆盖）
 // - 源帧率上限读写（Config.wtf 的 SET MaxFPS / MaxFPSBackground）
-// 参数经 live-params 通道实时写入载体插件；与游戏内悬浮面板共用同一参数模型。
+// 调参由游戏内悬浮面板经 live-params 通道实时写入载体插件；本程序读同一参数模型做展示与档位识别。
 #include <windows.h>
 #include <d3d11.h>
 #include <dxgi.h>
@@ -21,6 +21,7 @@
 #include "imgui.h"
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
+#include "tiers.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -49,23 +50,16 @@ static bool g_tier_locked = true;   // zh: 出厂档=锁定配方（微调禁用
 static Params g_custom;
 static bool g_custom_valid = false;
 
-// zh: 档位=强度阶梯（社区参考：强度 20-35%、结构 10-25% 起步，差异明显化）
-// 轻量≈20%、均衡≈35%/25%、浓郁≈60%——三档间距刻意拉开
+// zh: 档位表来自 tiers.hpp（与面板/PowerShell 共用的唯一事实源）
 static const struct { const char *name; Params p; } kSchemes[] = {
-    { "原画", { false, 1, 1.0f, 1.0f, 1.0f, -1.0f } },
-    { "轻量", { true,  1, 0.4f, 1.0f, 0.2f, -1.0f } },
-    { "均衡", { true,  1, 0.7f, 1.0f, 0.5f, -1.0f } },
-    { "浓郁", { true,  1, 1.2f, 1.3f, 1.0f, -1.0f } },
-};
-
-static const char *kModelDesc[3] = {
-    "模型 1：初代网络（社区称性能向）——重绘较保守，观感最接近原画。",
-    "模型 2：新一代网络（社区称画质向）——质感与细节重绘更强。",
-    "模型 3：新一代变体（画质向）——与模型 2 同代，实测观感差异细微。",
+    { kNrTiers[0].name, { kNrTiers[0].nr,  kNrTiers[0].model, kNrTiers[0].intensity, kNrTiers[0].tone, kNrTiers[0].structure, kNrTiers[0].skin } },
+    { kNrTiers[1].name, { kNrTiers[1].nr,  kNrTiers[1].model, kNrTiers[1].intensity, kNrTiers[1].tone, kNrTiers[1].structure, kNrTiers[1].skin } },
+    { kNrTiers[2].name, { kNrTiers[2].nr,  kNrTiers[2].model, kNrTiers[2].intensity, kNrTiers[2].tone, kNrTiers[2].structure, kNrTiers[2].skin } },
+    { kNrTiers[3].name, { kNrTiers[3].nr,  kNrTiers[3].model, kNrTiers[3].intensity, kNrTiers[3].tone, kNrTiers[3].structure, kNrTiers[3].skin } },
 };
 
 
-static std::wstring IniPath, ParamsPath;
+static std::wstring IniPath;   // zh: host64\ReShade.ini（只读；调参写入由悬浮面板经 live-params 完成）
 static void ReadIniParams(Params &p)
 {
     if (IniPath.empty()) return;
@@ -82,11 +76,11 @@ static void ReadIniParams(Params &p)
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "Model", "", value, sizeof value, ini) && value[0])
         p.model = std::clamp(atoi(value), 1, 3);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "Intensity", "", value, sizeof value, ini) && value[0])
-        p.intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+        p.intensity = std::clamp(static_cast<float>(atof(value)), kNrIntensityMin, kNrIntensityMax);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "LocalTone", "", value, sizeof value, ini) && value[0])
-        p.tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+        p.tone = std::clamp(static_cast<float>(atof(value)), kNrToneMin, kNrToneMax);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "LocalStructure", "", value, sizeof value, ini) && value[0])
-        p.structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+        p.structure = std::clamp(static_cast<float>(atof(value)), kNrStructureMin, kNrStructureMax);
     if (GetPrivateProfileStringA("Standalone.DLSSNR", "SkinStructure", "", value, sizeof value, ini) && value[0])
         p.skin = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
 }
@@ -384,6 +378,25 @@ static std::wstring JoinPath(const std::wstring &dir, const std::wstring &rel)
     return dir + sep + rel;
 }
 
+// zh: 由客户端目录派生的配置路径统一在此计算。选目录后必须重算——旧版只在启动时
+// 算一次，首次引导选完目录后参数读取与帧率上限一直读写错误位置（20261109 修复）。
+static void RefreshClientPaths()
+{
+    const std::wstring host64 = JoinPath(g_client_dir, L"host64");
+    IniPath = JoinPath(host64, L"ReShade.ini");
+    g_config_wtf = JoinPath(JoinPath(g_client_dir, L"WTF"), L"Config.wtf");
+}
+
+// zh: 载入参数并重判档位锁定；启动时与选完目录后共用同一入口。
+static void LoadParamsAndTier()
+{
+    ReadIniParams(g_params);
+    g_tier_locked = false;
+    for (const auto &s : kSchemes)
+        if (g_params.MatchesTier(s.p)) { g_tier_locked = true; break; }
+    ReadMaxFps();
+}
+
 // 游戏目录应用/持久化/选择（wWinMain 与界面引导卡共用）
 static void ApplyGameDir(const std::wstring &dir)
 {
@@ -393,16 +406,22 @@ static void ApplyGameDir(const std::wstring &dir)
     const size_t slash = g_game_exe.find_last_of(L"\\/");
     g_client_dir = g_game_exe.substr(0, slash + 1);
 }
+// zh: 记忆文件按 UTF-8 存客户端目录。旧版按 wchar 低字节逐个截断，中文路径写坏；
+// 回读又把行尾换行带进路径，导致记忆永远失效、每次启动都重新选择（20261109 修复）。
 static void SaveGameDirCfg()
 {
     HANDLE f = CreateFileW(g_cfg_path.c_str(), GENERIC_WRITE, 0, nullptr,
                            CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (f == INVALID_HANDLE_VALUE) return;
-    std::string line = "game=";
-    for (wchar_t ch : g_client_dir) line.push_back(static_cast<char>(ch & 0xFF));
-    line += "\n";
-    DWORD written = 0;
-    WriteFile(f, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    const int size = WideCharToMultiByte(CP_UTF8, 0, g_client_dir.c_str(), -1, nullptr, 0, nullptr, nullptr);
+    if (size > 1) {
+        std::string line = "game=";
+        line.resize(5 + static_cast<size_t>(size) - 1);
+        WideCharToMultiByte(CP_UTF8, 0, g_client_dir.c_str(), -1, line.data() + 5, size - 1, nullptr, nullptr);
+        line += "\n";
+        DWORD written = 0;
+        WriteFile(f, line.data(), static_cast<DWORD>(line.size()), &written, nullptr);
+    }
     CloseHandle(f);
 }
 static bool PickGameDirAndApply()
@@ -424,6 +443,8 @@ static bool PickGameDirAndApply()
             if (SUCCEEDED(item->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
                 ApplyGameDir(path);
                 SaveGameDirCfg();
+                RefreshClientPaths();
+                LoadParamsAndTier();
                 CoTaskMemFree(path);
             }
             item->Release();
@@ -634,8 +655,7 @@ static void RenderUi(bool game_running, DWORD host_pid)
         ImGui::TextWrapped("选择包含 wow.exe 与 host64 的客户端根目录；\n选择结果会被记住，之后启动不再询问。");
         if (ImGui::Button("选择游戏目录", ImVec2(-1, 0))) {
             if (PickGameDirAndApply()) {
-                g_need_setup = false;
-                ReadIniParams(g_params);
+                g_need_setup = false;   // zh: 参数/帧率/档位已在 PickGameDirAndApply 内重载
             }
         }
         EndCard();
@@ -795,12 +815,23 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         HANDLE f = CreateFileW(g_cfg_path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
         if (f != INVALID_HANDLE_VALUE) {
-            char buf[MAX_PATH * 2]{};
+            char buf[MAX_PATH * 4]{};
             DWORD read = 0;
             if (ReadFile(f, buf, sizeof buf - 1, &read, nullptr) && read > 5) {
                 buf[read] = 0;
-                if (std::strncmp(buf, "game=", 5) == 0)
-                    g_client_dir = std::wstring(buf + 5, buf + read);
+                if (std::strncmp(buf, "game=", 5) == 0) {
+                    // zh: 去掉行尾换行，再按 UTF-8 解码（与 SaveGameDirCfg 对应；纯 ASCII 旧文件不受影响）。
+                    char *end = buf + read;
+                    while (end > buf && (end[-1] == '\n' || end[-1] == '\r' || end[-1] == ' ' || end[-1] == '\t')) --end;
+                    *end = 0;
+                    const int wide = MultiByteToWideChar(CP_UTF8, 0, buf + 5, -1, nullptr, 0);
+                    if (wide > 1) {
+                        std::wstring dir(static_cast<size_t>(wide), L'\0');
+                        MultiByteToWideChar(CP_UTF8, 0, buf + 5, -1, dir.data(), wide);
+                        dir.resize(static_cast<size_t>(wide) - 1);
+                        g_client_dir = std::move(dir);
+                    }
+                }
             }
             CloseHandle(f);
         }
@@ -815,14 +846,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
     } else {
         g_need_setup = true;   // 无有效游戏路径：进入界面后顶部引导选择
     }
-    const std::wstring host64 = JoinPath(g_client_dir, L"host64");
-    IniPath = JoinPath(host64, L"ReShade.ini");
-    ParamsPath = JoinPath(host64, L"live-params.json");
-    g_config_wtf = JoinPath(JoinPath(g_client_dir, L"WTF"), L"Config.wtf");
-    ReadIniParams(g_params);
-    for (const auto &s : kSchemes)
-        if (g_params.MatchesTier(s.p)) { g_tier_locked = true; break; }
-    ReadMaxFps();
+    RefreshClientPaths();
+    LoadParamsAndTier();
 
     // DPI 感知：未声明时 DWM 会拉伸窗口位图，字体发虚
     using SetDpiCtxFn = BOOL (WINAPI *)(DPI_AWARENESS_CONTEXT);

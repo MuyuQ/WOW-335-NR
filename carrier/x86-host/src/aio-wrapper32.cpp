@@ -666,9 +666,15 @@ static void HostClose()
     if (g.fence_out_handle != nullptr) { CloseHandle(g.fence_out_handle); g.fence_out_handle = nullptr; }
     // A respawned host creates NEW fences and, on the paths where it owns them, new
     // textures as well. Force the next frame through a full rebuild so both are
-    // re-imported instead of aliasing objects that died with the old host. The D3D11
-    // path creates its own textures and is deliberately left as it was.
-    if (g.is_gl || g.is_vulkan) g.built = false;
+    // re-imported instead of aliasing objects that died with the old host.
+    // 20261109: this is now unconditional. Clearing only for GL/Vulkan stranded the
+    // D3D9/D3D10/D3D11 transports after a host death: g.built stayed true while
+    // BuildShared/EnsureHost -- the only path that respawns a host -- became
+    // unreachable, so "retry bridge" re-disabled the feed forever. The game-side
+    // shared textures survive a host respawn: the rebuild re-sends their handles
+    // with the new FeedBuild, and ReleaseShared() at the top of BuildShared keeps
+    // the extra pass idempotent.
+    g.built = false;
 }
 
 // Set when a restart is initiated from the overlay, so the game's own window can be put
@@ -4125,6 +4131,14 @@ static void DrawAioGroup(dlss5_aio_menu::Group group)
     }
 }
 
+// zh: 覆盖层中文字体。ReShade 的 ImGui 函数表（reshade_overlay.hpp）只转发核心
+// ImGui 调用，不含 ImFontAtlas 字体加载；vendored imgui 只有头文件，静态编译
+// imgui.cpp 的强符号又会压过内联跳转表、让覆盖层脱离 ReShade 的上下文——两条路
+// 都不通（20261109 修复：此前这段代码让 addon32 无法链接，工作树里从未构建成功）。
+// 默认走 ReShade 默认字体；PushFont 调用点都已判空，行为与已部署二进制一致。
+// 若未来函数表开放字体接口或改为独立 ImGui 上下文，置 1 启用。
+#define AIO_ZH_OVERLAY_FONT 0
+
 static ImFont *g_zh_font = nullptr;
 static bool    g_zh_font_tried = false;
 
@@ -4139,6 +4153,7 @@ static void EnsureZhFont()
 {
     if (g_zh_font_tried) return;
     g_zh_font_tried = true;
+#if AIO_ZH_OVERLAY_FONT
     for (const char *fp : {"C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhl.ttc",
                            "C:/Windows/Fonts/simhei.ttf"})
         if ((g_zh_font = ImGui::GetIO().Fonts->AddFontFromFileTTF(fp, 16.0f)) != nullptr)
@@ -4147,6 +4162,7 @@ static void EnsureZhFont()
             return;
         }
     Log("[feed32] zh font load failed; falling back to default font");
+#endif
 }
 
 // 档位应用（存储域：NR 0/1，Model 0/1/2，其余 0-2 与 -1..1）

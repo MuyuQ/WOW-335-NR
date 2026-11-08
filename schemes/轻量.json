@@ -1,0 +1,14 @@
+{
+ "schema": 1,
+ "name": "轻量",
+ "description": "轻量：接近原画的轻度重绘（社区参考强度 20% 起步）",
+ "created_utc": "2026-11-09T00:00:00Z",
+ "values": {
+  "neuralRendering": true,
+  "model": 1,
+  "intensity": 0.2,
+  "localTone": 1.0,
+  "localStructure": 0.1,
+  "skinStructure": -1.0
+ }
+}

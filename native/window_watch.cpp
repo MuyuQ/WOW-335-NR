@@ -157,6 +157,9 @@ int wmain(int argc, wchar_t **argv) {
         game = game.lexically_normal();
     } catch (const fs::filesystem_error &) { return 3; }
     const fs::path host = game.parent_path() / L"host64" / L"AIO DLSS5 32-bit Wrapper.exe";
+    // zh: 以下两个哈希是 payload-lock.json 的 game_sha256 与 host64/AIO DLSS5 32-bit
+    // Wrapper.exe 成员的纵深防御副本；改锁时同步改这里（20261109 标注来源，
+    // 运行时正确性由 Start-Dlss5WindowWatch 按锁先行校验）。
     if (!NoReparsePoints(game) || !NoReparsePoints(host) ||
         Sha256(game) != "4c459de64d38b5795becc6c01a03ba00d34686598fae707c442446722617868a" ||
         Sha256(host) != "e05a0aef9595849e2910d408cdfadf60c79a26addccba6dfe79c96b424bdef8b") {
