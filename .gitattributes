@@ -1,0 +1,10 @@
+# 项目约定：保留文件原有编码与换行（字节级保真），git 不做 EOL 规范化。
+# PowerShell 脚本必须 UTF-8 带 BOM；JSON 必须 UTF-8 无 BOM（见 README 构建）。
+* -text
+*.ps1 -text
+*.cmd -text
+*.bat -text
+*.json -text
+*.cpp -text
+*.hpp -text
+*.h -text

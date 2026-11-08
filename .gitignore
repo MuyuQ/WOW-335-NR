@@ -1,0 +1,28 @@
+# ---- 构建产物 ----
+bin/
+_scratch/
+build/
+*.obj
+*.lib
+*.exp
+*.pdb
+*.ilk
+*.iobj
+*.ipdb
+
+# ---- 运行时状态（机器本地） ----
+imgui.ini
+DLSS5控制台.ini
+*.log
+logs/
+panel-logs/
+
+# ---- 用户自备 NVIDIA 运行时（不入库、不分发） ----
+nvngx.dll
+nvngx_*.dll
+nvofapi*.dll
+nvngx/
+
+# ---- 其他 ----
+*.tmp
+Thumbs.db
