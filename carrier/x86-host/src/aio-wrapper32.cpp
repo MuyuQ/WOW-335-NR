@@ -1,0 +1,4404 @@
+// Standalone DLSS-NR + SR x86 wrapper.
+// Transport derived from DLSS5-Feeder, copyright (c) 2026 Jean-Laurent ROUZIES,
+// used and modified under the MIT License in external/DLSS5-Feeder/LICENSE.
+//
+// A 32-bit game cannot load NGX or the DLSS 5 add-on (x64-only), so this add-on
+// does none of that. Four GPU textures are shared ACROSS PROCESSES, the frame plus
+// the companion effect's depth/motion-vector textures are copied into them, a
+// shared fence is signalled, and host64\\AIO DLSS5 32-bit Wrapper.exe is spawned.
+// That carrier loads the unchanged standalone-dlssnr.addon64, so there
+// is one implementation of NR, DLSS/DLAA, frame generation, pacing, and output.
+//
+// Which side CREATES those textures is the driver's call, not ours, and it differs:
+//
+//  * D3D9: bridged on the game's adapter through legacy shared D3D9/D3D11
+//    surfaces, then enters the same D3D11 transport as every other x86 frame.
+//  * D3D11: created here, opened by the host -- the phase-0-proven direction.
+//  * OpenGL: created by the HOST and imported here, because GL memory objects are
+//    import-only (there is no export in GL_EXT_external_objects_win32). The GL half
+//    is raw, through the very same src/feed_gl.h the 64-bit add-on uses, compiled
+//    x86; both directions are proven by spike/spike-gl32.exe. See PLAN-OPENGL §5.
+//  * Vulkan: created by the HOST too, because D3D12 cannot open what Vulkan exports.
+//    The transport is src/feed_vk.h -- again the 64-bit add-on's own header, compiled
+//    x86 -- with the queue signal/wait going through ReShade (an api::fence handle IS
+//    a VkSemaphore in its Vulkan backend), never a raw vkQueueSubmit. Proven by
+//    spike/spike-vkclient32.exe. See PLAN-VULKAN32; the audience is DXVK, which is
+//    how most surviving 32-bit games reach Vulkan at all (issue #15).
+//
+// If the host dies, the pipe breaks and the game just renders normally.
+
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#include <d3d9.h>
+#include <d3d10_1.h>
+#include <d3d11_4.h>
+#include <dxgi1_2.h>
+#include <d3dcompiler.h>
+#include <cstdio>
+#include <cstdarg>
+#include <cstdint>
+#include <cstring>
+#include <cstdlib>
+#include <string>
+#include <vector>
+#include <algorithm>
+#include <atomic>
+
+#define ImTextureID ImU64   // required by reshade_overlay.hpp before including imgui.h
+#include <imgui.h>
+#include <reshade.hpp>
+
+#include "feed_ipc.h"
+#include "feed_fmt.h"  // the DXGI format decisions shared with the host
+#include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
+#include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
+#include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
+#include "aio-menu-schema.hpp"
+
+#define FEED_VERSION "2.2.4"
+
+extern "C" __declspec(dllexport) const char *NAME = "Standalone DLSS-NR + SR (32-bit wrapper) " FEED_VERSION;
+extern "C" __declspec(dllexport) const char *DESCRIPTION =
+    "Thin x86 capture and settings wrapper for the normal 64-bit Standalone DLSS-NR + SR addon. "
+    "The existing x64 addon remains the sole implementation of NR, DLSS/DLAA, frame generation, pacing, and output.";
+
+// ---------------------------------------------------------------------------
+// Logging (same shape as the 64-bit add-on)
+// ---------------------------------------------------------------------------
+
+static HMODULE          g_self;
+static char             g_log_path[MAX_PATH];
+static CRITICAL_SECTION g_log_cs;
+
+static void Log(const char *fmt, ...)
+{
+    char line[2048];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    EnterCriticalSection(&g_log_cs);
+    FILE *f = nullptr;
+    if (fopen_s(&f, g_log_path, "a") == 0 && f != nullptr)
+    {
+        fprintf(f, "%02u:%02u:%02u.%03u  %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
+        fclose(f);
+    }
+    LeaveCriticalSection(&g_log_cs);
+}
+
+static void Warn(const char *fmt, ...)
+{
+    char line[1024];
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf_s(line, sizeof(line), _TRUNCATE, fmt, ap);
+    va_end(ap);
+    Log("%s", line);
+    char tagged[1100];
+    _snprintf_s(tagged, sizeof(tagged), _TRUNCATE, "[DLSS 5 Feed 32] %s", line);
+    reshade::log::message(reshade::log::level::warning, tagged);
+}
+
+static const char *volatile g_where = "starting up";
+static void Breadcrumb(const char *what) { g_where = what; }
+
+// ---------------------------------------------------------------------------
+// Configuration: same dlss5-feed.cfg as the 64-bit add-on (extra keys ignored)
+// ---------------------------------------------------------------------------
+
+struct Cfg
+{
+    int   enabled;
+    int   mode;            // 0 inert, 1 transport test THROUGH the host (no NGX), 2 full DLSS path
+    int   hdr;             // -1 auto, 0/1 force
+    int   depth_inverted;  // -1 auto (RESHADE_DEPTH_INPUT_IS_REVERSED), 0/1 force
+    int   flags;           // -1 auto, else raw DLSS.Feature.Create.Flags (host applies)
+    int   reset_every;
+    int   log_frames;
+    int   host_window;     // 1 = show the host's window (it carries the DLSS 5 tuning panel: press Home there)
+    int   show_processed_output; // initial virtual-screen A/B state; F10 still toggles it live
+    int   work_resolution; // 50..100 percent of each backbuffer axis; the game stays native-sized
+    int   classic_d3d9_cpu_fallback; // opt-in CPU readback when D3D9/D3D11 sharing is unsupported
+    int   classic_d3d9_fullscreen_virtualization; // opt-in initial exclusive -> borderless rewrite
+    float mv_scale_x, mv_scale_y;
+};
+
+// The AIO wrapper must start in the full processing path. Mode 1 exists only
+// as a transport diagnostic and intentionally returns the unprocessed frame.
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 1, 100, 0, 0, 1.0f, 1.0f };
+static int       g_work_resolution_ui = 100;
+static int       g_pending_work_resolution = 0;
+static ULONGLONG g_work_resolution_apply_after = 0;
+
+// NGX work textures use even dimensions; 100% must return the native extent untouched.
+static UINT ScaledExtent(UINT native_extent, int percent)
+{
+    if (percent >= 100) return native_extent;
+    UINT extent = (native_extent * static_cast<UINT>(percent)) / 100u;
+    extent &= ~1u;
+    return extent >= 2u ? extent : 2u;
+}
+
+static void CfgPath(char *out)
+{
+    GetModuleFileNameA(g_self, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "dlss5-aio-x86.cfg");
+}
+
+static void CfgWriteDefault()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return;
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
+               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\n"
+               "classic_d3d9_cpu_fallback=%d\nclassic_d3d9_fullscreen_virtualization=%d\n"
+               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
+            g_cfg.classic_d3d9_cpu_fallback, g_cfg.classic_d3d9_fullscreen_virtualization,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+    fclose(f);
+}
+
+// Writes every current value, overwriting the file -- used by the overlay page so an
+// edit made there survives the next CfgReload() instead of being read back off the
+// stale on-disk copy 60 frames later.
+static void CfgSave()
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "w") != 0 || f == nullptr) return;
+    fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
+               "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\n"
+               "classic_d3d9_cpu_fallback=%d\nclassic_d3d9_fullscreen_virtualization=%d\n"
+               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
+            g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
+            g_cfg.classic_d3d9_cpu_fallback, g_cfg.classic_d3d9_fullscreen_virtualization,
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+    fclose(f);
+}
+
+// The slider drives a full shared-texture rebuild and a host round trip, so apply it
+// once the user stops dragging rather than once per intermediate value.
+static bool ApplyPendingWorkResolution()
+{
+    if (g_pending_work_resolution == 0 || GetTickCount64() < g_work_resolution_apply_after) return false;
+    const int next = g_pending_work_resolution;
+    g_pending_work_resolution = 0;
+    g_work_resolution_apply_after = 0;
+    if (next == g_cfg.work_resolution) return false;
+    g_cfg.work_resolution = next;
+    CfgSave();
+    Log("[feed32] settled work resolution=%d%%; rebuilding the shared set", g_cfg.work_resolution);
+    return true;
+}
+
+static bool CfgReload()   // true when a build-affecting value changed
+{
+    char path[MAX_PATH];
+    CfgPath(path);
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "r") != 0 || f == nullptr) return false;
+    Cfg next = g_cfg;
+    char line[160];
+    while (fgets(line, sizeof(line), f) != nullptr)
+    {
+        char  key[64];
+        float val = 0.0f;
+        if (sscanf_s(line, "%63[^=]=%f", key, static_cast<unsigned>(sizeof(key)), &val) != 2) continue;
+        const int iv = static_cast<int>(val);
+        if      (_stricmp(key, "enabled")        == 0) next.enabled        = iv;
+        else if (_stricmp(key, "mode")           == 0) next.mode           = iv;
+        else if (_stricmp(key, "hdr")            == 0) next.hdr            = iv;
+        else if (_stricmp(key, "depth_inverted") == 0) next.depth_inverted = iv;
+        else if (_stricmp(key, "flags")          == 0) next.flags          = iv;
+        else if (_stricmp(key, "reset_every")    == 0) next.reset_every    = iv;
+        else if (_stricmp(key, "log_frames")     == 0) next.log_frames     = iv;
+        else if (_stricmp(key, "host_window")    == 0) next.host_window    = iv;
+        else if (_stricmp(key, "show_processed_output") == 0) next.show_processed_output = iv;
+        else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
+        else if (_stricmp(key, "classic_d3d9_cpu_fallback") == 0) next.classic_d3d9_cpu_fallback = iv;
+        else if (_stricmp(key, "classic_d3d9_fullscreen_virtualization") == 0) next.classic_d3d9_fullscreen_virtualization = iv;
+        else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
+        else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
+    }
+    fclose(f);
+    if (next.work_resolution < 50 || next.work_resolution > 100) next.work_resolution = g_cfg.work_resolution;
+    next.classic_d3d9_cpu_fallback = next.classic_d3d9_cpu_fallback != 0 ? 1 : 0;
+    next.classic_d3d9_fullscreen_virtualization =
+        next.classic_d3d9_fullscreen_virtualization != 0 ? 1 : 0;
+    const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
+                         next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
+                         next.classic_d3d9_cpu_fallback != g_cfg.classic_d3d9_cpu_fallback ||
+                         next.mv_scale_x != g_cfg.mv_scale_x || next.mv_scale_y != g_cfg.mv_scale_y;
+    const bool changed = memcmp(&next, &g_cfg, sizeof(Cfg)) != 0;
+    if (changed)
+    {
+        g_cfg = next;
+        Log("[feed32] config: enabled=%d mode=%d hdr=%d depth_inverted=%d flags=%d reset_every=%d",
+            g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every);
+    }
+    return rebuild;
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+static const char *kEffectFile    = "DLSS5_Feed.fx";
+static const char *kD3D9EffectFile = "DLSS5_Feed_D3D9.fx";
+static const char *kTechnique     = "DLSS5_Feed";
+static constexpr UINT kProxySelectNrModelMessage = WM_APP + 0x57;
+static constexpr UINT kProxySelectDlssPresetMessage = WM_APP + 0x58;
+static constexpr UINT kProxySelectNrPassCountMessage = WM_APP + 0x59;
+static constexpr UINT kProxyVisibilityMessage = WM_APP + 0x53;
+static constexpr UINT kProxyShowProcessedMessage = WM_APP + 0x5A;
+static constexpr UINT kProxyEnableNrMessage = WM_APP + 0x5B;
+static constexpr UINT kProxyEnableFgMessage = WM_APP + 0x5C;
+static constexpr UINT kProxySelectNvofResolutionMessage = WM_APP + 0x5D;
+static constexpr UINT kProxyEnableNvofMessage = WM_APP + 0x5E;
+// Known motion-vector providers, keyed by the DLSS5_MV_PROVIDER value DLSS5_Feed.fx
+// was compiled with (0 texMotionVectors, 1 Launchpad, 2 VORT, 3 LumeniteFX Kernel,
+// 4 LumeniteFX QuantMotion). Name checks only, for the status line and a mismatch warning.
+static const struct { int mode; const char *file, *tech; } kMvProviders[] = {
+    { 0, "MotionEstimation.fx",     "DRME" },
+    { 0, "qUINT_motionvectors.fx",  "MotionVectors" },
+    { 0, "dh_uber_motion.fx",       "DH_UBER_MOTION_020" },
+    { 1, "MartysMods_LAUNCHPAD.fx", "MartysMods_Launchpad" },
+    { 2, "vort_Motion.fx",          "vort_MotionEffects" },
+    { 3, "lumenite_Kernel.fx",      "Lumenite_Kernel" },
+    { 4, "lumenite_QuantMotion.fx", "Lumenite_QuantMotion" },
+};
+static const char *kMvModeName[] = { "texMotionVectors", "Launchpad", "VORT", "LumeniteFX Kernel", "LumeniteFX QuantMotion" };
+static const int   kMvModeCount  = static_cast<int>(sizeof(kMvModeName) / sizeof(kMvModeName[0]));
+
+static char g_mv_status[192]  = "not checked yet";
+static char g_mv_problem[640] = "";
+
+// A provider whose effect failed to compile is still listed (and can be "enabled") but writes
+// nothing. ReShade logs the compiler error next to the game; the last line about that file
+// -- an error or a "Successfully compiled" -- is the current state. Same as the 64-bit add-on.
+static bool ProviderCompileError(const char *file, char *out, size_t out_size)
+{
+    out[0] = '\0';
+    char path[MAX_PATH];
+    GetModuleFileNameA(g_self, path, MAX_PATH);
+    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
+    FILE *f = nullptr;
+    if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
+    fseek(f, 0, SEEK_END);
+    const long size = ftell(f);
+    const long take = size < 512 * 1024 ? size : 512 * 1024;
+    fseek(f, size - take, SEEK_SET);
+    std::string buf(static_cast<size_t>(take), '\0');
+    const size_t got = fread(buf.data(), 1, buf.size(), f);
+    fclose(f);
+    buf.resize(got);
+
+    char needle_err[MAX_PATH], needle_ok[MAX_PATH];
+    _snprintf_s(needle_err, sizeof(needle_err), _TRUNCATE, "\\%s(", file);
+    _snprintf_s(needle_ok,  sizeof(needle_ok),  _TRUNCATE, "\\%s'",  file);
+    bool failed = false;
+    size_t pos = 0;
+    while (pos < buf.size())
+    {
+        size_t eol = buf.find('\n', pos);
+        if (eol == std::string::npos) eol = buf.size();
+        const std::string line = buf.substr(pos, eol - pos);
+        pos = eol + 1;
+        if (line.find(needle_ok) != std::string::npos && line.find("Successfully compiled") != std::string::npos)
+            failed = false;
+        else if (const size_t at = line.find(needle_err); at != std::string::npos && line.find("error") != std::string::npos)
+        {
+            failed = true;
+            std::string msg = line.substr(at + 1);
+            while (!msg.empty() && (msg.back() == '\r' || msg.back() == ' ')) msg.pop_back();
+            strncpy_s(out, out_size, msg.c_str(), _TRUNCATE);
+        }
+    }
+    return failed;
+}
+
+static int ReadMvProviderMode(reshade::api::effect_runtime *rt)
+{
+    char v[16] = {};
+    int mode = 0;
+    if (rt->get_preprocessor_definition_for_effect(kEffectFile, "DLSS5_MV_PROVIDER", v) ||
+        rt->get_preprocessor_definition("DLSS5_MV_PROVIDER", v))
+        mode = atoi(v);
+    return (mode < 0 || mode >= kMvModeCount) ? 0 : mode;
+}
+
+struct Feed32
+{
+    reshade::api::effect_runtime          *runtime;
+    reshade::api::effect_technique         technique;
+    reshade::api::effect_technique         launchpad;
+    reshade::api::effect_texture_variable  mv_var;
+    reshade::api::effect_texture_variable  depth_var;
+
+    bool depth_reversed;
+    bool handles_ok;
+    bool missing_reported;
+
+    bool disabled;
+    int  consecutive_fails;
+
+    // host + pipe
+    HANDLE hproc;
+    HANDLE pipe;
+
+    // shared textures (created HERE, opened by the host)
+    ID3D11Texture2D *tex[FEED_SLOTS];
+    HANDLE           tex_handle[FEED_SLOTS];
+    ID3D11ShaderResourceView *output_srv;
+    ID3D11RenderTargetView   *input_rtv[FEED_SLOTS];  // work-resolution resample targets
+    ID3D11Texture2D          *color_stage;            // native-size copy of the frame (the only SRV-able source)
+    ID3D11ShaderResourceView *color_stage_srv;
+    ID3D11Fence     *fence_in;    // we signal        (D3D11 client)
+    ID3D11Fence     *fence_out;   // host signals     (D3D11 client)
+    HANDLE           fence_in_handle, fence_out_handle;   // GL client: kept for the GL import
+    bool             fence_wait_queued;  // a GPU-side Wait(fence_out, frame_n) is outstanding
+    ID3D11DeviceContext4 *ctx4;
+    ID3D11Device    *dev;         // borrowed for D3D11, owned for the native D3D9 bridge
+    bool             owns_d3d11_device;
+
+    // Native x86 D3D9 uses two legacy shared surfaces to enter/leave the same
+    // D3D11 cross-process transport used above. Guides are deliberately neutral
+    // until a real D3D9 motion/depth provider is available.
+    bool                    is_d3d9;
+    IDirect3DDevice9       *dev9;                 // not owned
+    IDirect3DQuery9        *query9;
+    ID3D11Query            *query11;
+    IDirect3DTexture9      *d3d9_color_stage;
+    IDirect3DTexture9      *d3d9_output_stage;
+    IDirect3DSurface9      *d3d9_cpu_readback;
+    bool                    d3d9_cpu_bridge;
+    UINT64                  d3d9_pending_frame;
+    ULONGLONG               d3d9_pending_deadline;
+    ULONGLONG               d3d9_resume_after;
+    bool                    d3d9_device_lost;
+    bool                    d3d9_startup_focus_restored;
+    ID3D11Texture2D        *d3d9_output_stage11;
+    ID3D11RenderTargetView *d3d9_output_rtv;
+    ID3D11Texture2D        *d3d9_zero_mv;
+    ID3D11Texture2D        *d3d9_zero_depth;
+    ID3D11ShaderResourceView *d3d9_zero_mv_srv;
+    ID3D11ShaderResourceView *d3d9_zero_depth_srv;
+
+    // ReShade 6 renders effects for native D3D9 games through an internal
+    // D3D10.1 swapchain. This bridge is therefore the normal D3D9 route there.
+    bool                    is_d3d10;
+    ID3D10Device1          *dev10;                // not owned
+    ID3D10Query            *query10;
+    ID3D10Texture2D        *d3d10_color_stage;
+    ID3D10Texture2D        *d3d10_output_stage;
+    ID3D10RenderTargetView *d3d10_color_rtv;
+    ID3D10Texture2D        *d3d10_source_texture;
+    ID3D10ShaderResourceView *d3d10_source_srv;
+    ID3D10Texture2D        *d3d10_fallback_source;
+    ID3D10ShaderResourceView *d3d10_fallback_source_srv;
+    ID3D10VertexShader     *d3d10_downsample_vs;
+    ID3D10PixelShader      *d3d10_downsample_ps;
+    ID3D10SamplerState     *d3d10_downsample_sampler;
+
+    // OpenGL client: the host creates the shared textures and duplicates the handles
+    // in; we import them raw (feed_gl.h) and never touch D3D11 at all. tex_handle[]
+    // above holds the received handles, closed by ReleaseShared exactly as before.
+    bool   is_gl;
+    FeedGl gl;
+    HGLRC  gl_ctx;               // the context the imports live in (share-group check)
+    GLuint gl_tex[FEED_SLOTS], gl_memobj[FEED_SLOTS];
+    GLuint gl_sem_in, gl_sem_out;
+    GLuint gl_fbo_read, gl_fbo_draw;
+
+    // Vulkan client: the host creates the shared textures here too (D3D12 cannot open
+    // Vulkan-exported memory), and we import them as VkImages. The per-frame COPIES are
+    // raw vkCmd* recorded into ReShade's own command buffer, but every QUEUE operation
+    // goes through ReShade -- an api::fence handle IS a VkSemaphore in its Vulkan
+    // backend -- so signal/wait stay inside its locks and never race the game's submits.
+    bool                       is_vulkan;
+    FeedVk                     vk;
+    reshade::api::device       *rs_dev;     // not owned
+    reshade::api::command_queue *rs_queue;  // not owned
+    reshade::api::fence         rs_fence_in, rs_fence_out;   // our vk_sem_* punned back
+    VkImage                    vk_img[FEED_SLOTS];
+    VkDeviceMemory             vk_mem[FEED_SLOTS];
+    VkSemaphore                vk_sem_in, vk_sem_out;
+    bool                       vk_layout_init;   // our images transitioned UNDEFINED->GENERAL once
+
+    bool        built;
+    UINT        width, height;                  // the work resolution DLSS runs at
+    UINT        backbuffer_width, backbuffer_height;
+    DXGI_FORMAT bb_fmt, color_fmt, output_fmt;
+    UINT64      frame_n;
+    bool        need_reset;
+
+    // blit
+    ID3D11VertexShader *blit_vs;
+    ID3D11PixelShader  *blit_ps;
+    ID3D11PixelShader  *resample_ps;
+    ID3D11SamplerState *blit_sampler;
+    ID3D11SamplerState *point_sampler;
+    ID3D11Buffer       *resample_cb;
+
+    UINT64   frames_done;
+    LONGLONG qpf, cpu_ticks, span_start;
+    UINT64   timed_frames;
+};
+
+static Feed32 g;
+
+template <typename T> static void SafeRelease(T *&p) { if (p) { p->Release(); p = nullptr; } }
+
+static DXGI_FORMAT TypedColorFormat(DXGI_FORMAT f)
+{
+    switch (f)
+    {
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case DXGI_FORMAT_R10G10B10A2_TYPELESS: case DXGI_FORMAT_R10G10B10A2_UNORM:
+        return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case DXGI_FORMAT_R16G16B16A16_TYPELESS: case DXGI_FORMAT_R16G16B16A16_FLOAT:
+        return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R11G11B10_FLOAT:
+        return DXGI_FORMAT_R11G11B10_FLOAT;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static DXGI_FORMAT OutputFormatFor(DXGI_FORMAT color_typed)
+{
+    switch (color_typed)
+    {
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R11G11B10_FLOAT:    return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+    default:                             return DXGI_FORMAT_R8G8B8A8_UNORM;
+    }
+}
+
+// OpenGL has no sized BGRA8 internal format, so the GL path never asks the host for
+// one. The colour moves by blit, which is component-wise, so a BGRA-flavoured game
+// surface lands correctly in an RGBA8 shared texture and comes home the same way.
+static DXGI_FORMAT GlSafeColorFormat(DXGI_FORMAT typed)
+{
+    if (typed == DXGI_FORMAT_B8G8R8A8_UNORM || typed == DXGI_FORMAT_B8G8R8X8_UNORM)
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    return typed;
+}
+
+static bool IsHdrFormat(DXGI_FORMAT typed)
+{
+    return typed == DXGI_FORMAT_R16G16B16A16_FLOAT || typed == DXGI_FORMAT_R11G11B10_FLOAT;
+}
+
+static void FeedDisable(const char *why)
+{
+    if (g.disabled) return;
+    g.disabled = true;
+    Warn("stopped: %s. The game renders normally. See dlss5-feed.log for the detail.", why);
+}
+
+// A build can fail transiently -- the game is mid-resolution-change, or the host's NGX
+// needs a reinit first. Retrying every frame just hammers a broken NGX (and spams the
+// log), so back off exponentially instead of disabling the feed for the whole session:
+// the user should not have to restart the game because one mode switch went wrong.
+static UINT64 g_retry_at;   // GetTickCount64 deadline
+
+static void FeedFail(const char *what)
+{
+    const int n = ++g.consecutive_fails;
+    const DWORD wait_ms = n <= 3 ? 1000u : (n <= 6 ? 5000u : 30000u);
+    g_retry_at = GetTickCount64() + wait_ms;
+    Log("[feed32] failure: %s (attempt %d; retrying in %lu ms)", what, n, wait_ms);
+}
+
+// ---------------------------------------------------------------------------
+// Host process + pipe
+// ---------------------------------------------------------------------------
+
+static void HostDrain()
+{
+    // A GPU-side Wait(fence_out, frame_n) is queued on the immediate context every
+    // frame BEFORE the host has signalled it. If the host goes away first, that wait
+    // can never be satisfied, and everything queued behind it -- Present included --
+    // wedges until the driver TDRs (seen as a system-wide freeze when it happened on
+    // a settings apply). Never let go of a live host before the last submitted frame
+    // has been signalled. The host also catch-up-signals fence_out on its way out,
+    // so with both sides healthy this resolves in milliseconds.
+    // Classic D3D9's CPU fallback deliberately does not enqueue a D3D11 GPU wait:
+    // an unsignalled host fence would otherwise hold Present (and sometimes the
+    // entire desktop) hostage. It can still have one host frame outstanding, so
+    // drain that fence value from the CPU before releasing its shared resources.
+    const UINT64 cpu_pending = g.d3d9_cpu_bridge ? g.d3d9_pending_frame : 0;
+    if (!g.fence_wait_queued && cpu_pending == 0) return;
+    if (g.is_vulkan)
+    {
+        // The imported timeline semaphore IS the host's D3D12 fence, so it can be both
+        // read and waited on with a deadline -- the same shape as the D3D11 arm below.
+        g.fence_wait_queued = false;
+        if (!g.vk.ok || g.vk_sem_out == VK_NULL_HANDLE) return;
+        if (!FeedVkHasTimelineQueries(&g.vk))
+        {
+            // No way to ask or wait on the value (a device that imported a D3D12 fence
+            // without vkWaitSemaphores should not exist, but do not guess). Driving the
+            // queue to completion answers the same question the long way round.
+            Log("[feed32] drain: no timeline query on this device; draining the queue instead");
+            if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
+            return;
+        }
+        if (FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g.frame_n) return;
+        if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
+        {
+            Log("[feed32] drain: host died before signalling frame %llu",
+                static_cast<unsigned long long>(g.frame_n));
+            return;
+        }
+        if (!FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.frame_n, 2000))
+            Log("[feed32] drain: frame %llu never signalled by the host",
+                static_cast<unsigned long long>(g.frame_n));
+        return;
+    }
+    if (g.is_gl)
+    {
+        // On OpenGL the outstanding wait is a glWaitSemaphoreEXT, which has no timeout
+        // and no readable value -- so instead of asking the fence, drive the stream to
+        // completion with a deadline. Same intent, same 2 s, no way to hang the game.
+        // Only the context that queued the wait can drain it; from anywhere else the
+        // wait dies with the context anyway.
+        g.fence_wait_queued = false;
+        if (!g.gl.ok || g.gl.wglGetCurrentContext() != g.gl_ctx || g.gl_ctx == nullptr) return;
+        if (!FeedGlWaitIdle(&g.gl, 2000))
+            Log("[feed32] drain: the GL stream did not finish within 2 s (frame %llu never signalled by the host)",
+                static_cast<unsigned long long>(g.frame_n));
+        return;
+    }
+    if (g.fence_out == nullptr) return;
+    if (cpu_pending != 0)
+    {
+        g.d3d9_pending_frame = 0;
+        g.d3d9_pending_deadline = 0;
+        if (g.fence_out->GetCompletedValue() >= cpu_pending) return;
+        HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (evt != nullptr)
+        {
+            if (SUCCEEDED(g.fence_out->SetEventOnCompletion(cpu_pending, evt)) &&
+                WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
+                Log("[feed32] drain: classic D3D9 host frame %llu never signalled",
+                    static_cast<unsigned long long>(cpu_pending));
+            CloseHandle(evt);
+        }
+        return;
+    }
+    g.fence_wait_queued = false;
+    if (g.fence_out->GetCompletedValue() >= g.frame_n) return;
+    if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
+    {
+        // The host is already dead and can no longer signal: the wait (if the GPU
+        // reached it) is unsatisfiable and there is nothing we can do from D3D11.
+        Log("[feed32] drain: host died before signalling frame %llu",
+            static_cast<unsigned long long>(g.frame_n));
+        return;
+    }
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (evt == nullptr) return;
+    if (SUCCEEDED(g.fence_out->SetEventOnCompletion(g.frame_n, evt)) &&
+        WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
+        Log("[feed32] drain: frame %llu never signalled by the host",
+            static_cast<unsigned long long>(g.frame_n));
+    CloseHandle(evt);
+}
+
+static void HostClose()
+{
+    HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
+    if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
+    if (g.hproc != nullptr)
+    {
+        if (WaitForSingleObject(g.hproc, 2000) != WAIT_OBJECT_0)
+            TerminateProcess(g.hproc, 0);      // it did not exit on the pipe break
+        CloseHandle(g.hproc);
+        g.hproc = nullptr;
+    }
+    // The fences belong to the host that just went away; a new host creates new ones.
+    // Releasing them on EVERY close (not just the apply path) is what makes a respawn
+    // reopen from the new host's BuildAck instead of waiting on dead fences forever.
+    SafeRelease(g.fence_in);
+    SafeRelease(g.fence_out);
+    if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+    {
+        if (g.gl_sem_in  != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);  g.gl_sem_in  = 0; }
+        if (g.gl_sem_out != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_out); g.gl_sem_out = 0; }
+    }
+    g.gl_sem_in = g.gl_sem_out = 0;
+    if (g.vk.ok)
+    {
+        // HostDrain above waits on the semaphore's VALUE, which the HOST's D3D12 queue
+        // advances -- it says nothing about the GAME's queue having retired the batches
+        // that signal fence_in and wait on fence_out, and vkDestroySemaphore requires
+        // exactly that. The gap is not theoretical: if the frame message fails to write,
+        // FeedFrameVk has already enqueued signal(rs_fence_in, n) but never set
+        // fence_wait_queued, so the drain returns instantly and we would destroy a
+        // semaphore with a signal still in flight on it.
+        if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
+        if (g.vk_sem_in  != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr); }
+        if (g.vk_sem_out != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr); }
+    }
+    g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
+    g.rs_fence_in = g.rs_fence_out = {};
+    if (g.fence_in_handle  != nullptr) { CloseHandle(g.fence_in_handle);  g.fence_in_handle  = nullptr; }
+    if (g.fence_out_handle != nullptr) { CloseHandle(g.fence_out_handle); g.fence_out_handle = nullptr; }
+    // A respawned host creates NEW fences and, on the paths where it owns them, new
+    // textures as well. Force the next frame through a full rebuild so both are
+    // re-imported instead of aliasing objects that died with the old host. The D3D11
+    // path creates its own textures and is deliberately left as it was.
+    if (g.is_gl || g.is_vulkan) g.built = false;
+}
+
+// Set when a restart is initiated from the overlay, so the game's own window can be put
+// back in front once the replacement host is up. Windows only honours SetForegroundWindow
+// from a process that is already foreground -- which the game is at the moment the user
+// clicks Apply, so we capture it there and spend it a couple of seconds later.
+static HWND g_restore_focus;
+static int g_aio_nr_pass_count = 1;
+static bool g_aio_nr_pass_touched;
+
+static void CaptureGameFocus()
+{
+    HWND fg = GetForegroundWindow();
+    DWORD pid = 0;
+    if (fg != nullptr && GetWindowThreadProcessId(fg, &pid) != 0 && pid == GetCurrentProcessId())
+        g_restore_focus = fg;   // only ever restore a window that is ours
+}
+
+static void RestoreGameFocus()
+{
+    if (g_restore_focus == nullptr) return;
+    HWND w = g_restore_focus;
+    g_restore_focus = nullptr;
+    if (!IsWindow(w) || GetForegroundWindow() == w) return;
+    SetForegroundWindow(w);
+    Log("[feed32] focus returned to the game window");
+}
+
+static void HostLost(const char *why)
+{
+    Log("[feed32] host lost: %s", why);
+    HostClose();
+    FeedDisable("the 64-bit host went away");
+}
+
+static bool HostAlive()
+{
+    return g.hproc != nullptr && WaitForSingleObject(g.hproc, 0) == WAIT_TIMEOUT;
+}
+
+// ReShade opens host64\ReShade.log in truncate mode whenever the x64 carrier
+// starts. Preserve the completed log before every spawn so applying settings
+// from the x86 overlay does not erase the telemetry needed for an A/B test.
+// This also captures the previous game session and a host that exited early.
+static void ArchivePreviousHostReShadeLog()
+{
+    char game_dir[MAX_PATH];
+    GetModuleFileNameA(g_self, game_dir, MAX_PATH);
+    if (char *s = strrchr(game_dir, '\\')) *(s + 1) = '\0';
+
+    char source[MAX_PATH], archive_dir[MAX_PATH], pattern[MAX_PATH];
+    sprintf_s(source, "%shost64\\ReShade.log", game_dir);
+
+    WIN32_FILE_ATTRIBUTE_DATA source_data = {};
+    if (!GetFileAttributesExA(source, GetFileExInfoStandard, &source_data)) return;
+    if (source_data.nFileSizeHigh == 0 && source_data.nFileSizeLow == 0) return;
+
+    sprintf_s(archive_dir, "%shost64\\logs", game_dir);
+    if (!CreateDirectoryA(archive_dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+    {
+        Log("[feed32] could not create host log archive %s (error %lu)", archive_dir, GetLastError());
+        return;
+    }
+
+    SYSTEMTIME st = {};
+    GetLocalTime(&st);
+    char target[MAX_PATH];
+    bool named = false;
+    for (unsigned suffix = 0; suffix < 100; ++suffix)
+    {
+        if (suffix == 0)
+            sprintf_s(target, "%s\\ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u.log",
+                archive_dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds);
+        else
+            sprintf_s(target, "%s\\ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u-%02u.log",
+                archive_dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
+                st.wSecond, st.wMilliseconds, suffix);
+        if (GetFileAttributesA(target) == INVALID_FILE_ATTRIBUTES)
+        {
+            named = true;
+            break;
+        }
+    }
+    if (!named)
+    {
+        Log("[feed32] host log archive name space exhausted for this millisecond");
+        return;
+    }
+
+    if (!MoveFileExA(source, target, MOVEFILE_WRITE_THROUGH))
+    {
+        Log("[feed32] could not archive host64\\ReShade.log (error %lu)", GetLastError());
+        return;
+    }
+    Log("[feed32] preserved previous host telemetry: %s", target);
+
+    struct ArchivedLog { std::string path; FILETIME written; };
+    std::vector<ArchivedLog> archives;
+    sprintf_s(pattern, "%s\\ReShade-host-*.log", archive_dir);
+    WIN32_FIND_DATAA found = {};
+    HANDLE find = FindFirstFileA(pattern, &found);
+    if (find != INVALID_HANDLE_VALUE)
+    {
+        do
+        {
+            if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
+            {
+                char path[MAX_PATH];
+                sprintf_s(path, "%s\\%s", archive_dir, found.cFileName);
+                archives.push_back({ path, found.ftLastWriteTime });
+            }
+        } while (FindNextFileA(find, &found));
+        FindClose(find);
+    }
+
+    constexpr size_t kRetainedHostLogs = 16;
+    std::sort(archives.begin(), archives.end(), [](const ArchivedLog &a, const ArchivedLog &b) {
+        return CompareFileTime(&a.written, &b.written) > 0;
+    });
+    for (size_t i = kRetainedHostLogs; i < archives.size(); ++i)
+    {
+        if (!DeleteFileA(archives[i].path.c_str()))
+            Log("[feed32] could not prune old host log %s (error %lu)", archives[i].path.c_str(), GetLastError());
+    }
+}
+
+static bool PipeWrite(const void *buf, DWORD len)
+{
+    DWORD put = 0;
+    return g.pipe != nullptr && WriteFile(g.pipe, buf, len, &put, nullptr) && put == len;
+}
+
+static bool PipeRead(void *buf, DWORD len)
+{
+    DWORD got = 0;
+    return g.pipe != nullptr && ReadFile(g.pipe, buf, len, &got, nullptr) && got == len;
+}
+
+static bool EnsureHost()
+{
+    if (g.pipe != nullptr && HostAlive()) return true;
+    HostClose();
+    ArchivePreviousHostReShadeLog();
+
+    char dir[MAX_PATH];
+    GetModuleFileNameA(g_self, dir, MAX_PATH);
+    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+
+    char exe[MAX_PATH], legacy_exe[MAX_PATH], cmd[MAX_PATH + 96], wd[MAX_PATH];
+    sprintf_s(exe, "%shost64\\AIO DLSS5 32-bit Wrapper.exe", dir);
+    sprintf_s(legacy_exe, "%shost64\\dlss5-feed-host64.exe", dir);
+    sprintf_s(wd, "%shost64", dir);
+    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
+    {
+        // One-prototype compatibility fallback. New packages put the clearly
+        // named launcher beside addon32; the architecture-conflicting x64 DLLs
+        // remain under host64.
+        if (GetFileAttributesA(legacy_exe) != INVALID_FILE_ATTRIBUTES)
+        {
+            strcpy_s(exe, legacy_exe);
+            Log("[feed32] using legacy host64\\dlss5-feed-host64.exe location");
+        }
+        else
+        {
+            Warn("host64\\AIO DLSS5 32-bit Wrapper.exe not found");
+            FeedDisable("the 64-bit wrapper executable is not installed");
+            return false;
+        }
+    }
+    const HWND game_window = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
+    sprintf_s(cmd, "\"%s\" %lu --hwnd %llu%s", exe, GetCurrentProcessId(),
+        static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(game_window)),
+        g_cfg.host_window ? "" : " --hide");
+
+    STARTUPINFOA si = { sizeof(si) };
+    PROCESS_INFORMATION pi = {};
+    Breadcrumb("spawning the 64-bit host");
+    char pass_count[8] = {};
+    sprintf_s(pass_count, "%d", std::clamp(g_aio_nr_pass_count, 1, 3));
+    SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", pass_count);
+    SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", g_cfg.show_processed_output ? "1" : "0");
+    if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, wd, &si, &pi))
+    {
+        SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
+        SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
+        Log("[feed32] CreateProcess failed %lu", GetLastError());
+        FeedDisable("could not start the 64-bit host");
+        return false;
+    }
+    SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
+    SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
+    CloseHandle(pi.hThread);
+    g.hproc = pi.hProcess;
+    Log("[feed32] host spawned (pid %lu)", pi.dwProcessId);
+
+    char name[128];
+    sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
+    for (int i = 0; i < 150 && g.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
+    {
+        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        if (p != INVALID_HANDLE_VALUE) { g.pipe = p; break; }
+        if (!HostAlive()) { HostLost("exited during startup"); return false; }
+        Sleep(100);
+    }
+    if (g.pipe == nullptr) { HostLost("pipe never appeared"); return false; }
+
+    const uint32_t kind = g.is_vulkan ? FEED_CLIENT_VULKAN : g.is_gl ? FEED_CLIENT_GL : FEED_CLIENT_D3D11;
+    const char *kind_name = g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" : "D3D11";
+    FeedHello hello = { FEED_IPC_MAGIC, FEED_IPC_VERSION, GetCurrentProcessId(), kind };
+    FeedHelloAck ack = {};
+    if (!PipeWrite(&hello, sizeof(hello)) || !PipeRead(&ack, sizeof(ack)) || ack.magic != FEED_IPC_MAGIC)
+    { HostLost("handshake failed"); return false; }
+    if (ack.version != FEED_IPC_VERSION)
+    {
+        // The message structs after the hello changed size between versions, so a
+        // mismatched pair would not just misbehave, it would desync the pipe. Both
+        // sides refuse rather than guess.
+        Log("[feed32] the x64 wrapper speaks protocol v%u, this add-on v%u", ack.version, FEED_IPC_VERSION);
+        HostClose();
+        FeedDisable("the 32-bit wrapper files are from different releases -- reinstall the package together");
+        return false;
+    }
+    Log("[feed32] host connected (protocol v%u, %s client)", ack.version, kind_name);
+    RestoreGameFocus();   // the replacement host is up; take the foreground back if we lost it
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Proxy of the normal Standalone.DLSSNR settings. The actual implementation and
+// state still live in standalone-dlssnr.addon64 inside host64; this table only
+// gives the 32-bit game's ReShade panel familiar controls for that same addon.
+// Applying restarts the carrier so the x64 addon reloads the changed settings.
+// ---------------------------------------------------------------------------
+using dlss5_aio_menu::NRSetting;
+using dlss5_aio_menu::NR_BOOL;
+using dlss5_aio_menu::NR_COMBO;
+using dlss5_aio_menu::NR_FLOAT;
+static constexpr int NR_COUNT = static_cast<int>(dlss5_aio_menu::kSettingCount);
+static constexpr int NR_TRANSFER_FIRST = NR_COUNT;
+static constexpr int NR_GUIDE_FIRST = NR_COUNT;
+static constexpr const auto &kNR = dlss5_aio_menu::kSettings;
+
+static float DecodeAioValue(int index, float value)
+{
+    if (strcmp(kNR[index].key, "DlssRenderPreset") == 0)
+    {
+        const int raw = static_cast<int>(value);
+        return raw == 10 ? 1.0f : raw == 11 ? 2.0f : raw == 12 ? 3.0f : raw == 13 ? 4.0f : 0.0f;
+    }
+    if (strcmp(kNR[index].key, "Model") == 0) return std::clamp(value - 1.0f, 0.0f, 2.0f);
+    return value;
+}
+
+static float EncodeAioValue(int index, float value)
+{
+    if (strcmp(kNR[index].key, "DlssRenderPreset") == 0)
+    {
+        static const int values[] = {0, 10, 11, 12, 13};
+        return static_cast<float>(values[std::clamp(static_cast<int>(value), 0, 4)]);
+    }
+    if (strcmp(kNR[index].key, "Model") == 0) return value + 1.0f;
+    return value;
+}
+
+static void HostIniPath(char *out)
+{
+    GetModuleFileNameA(g_self, out, MAX_PATH);
+    if (char *s = strrchr(out, '\\'))
+        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
+}
+
+// Cache of the host's settings, shown and edited on the ReShade overlay page (Add-ons
+// tab -> DLSS 5 Feed). Loaded from the host's ini on first resolve so the panel always
+// starts from what is actually active, never a stale default.
+static float g_nr[NR_COUNT];
+static bool  g_nr_present[NR_COUNT];   // the key existed in the host's ini
+static bool  g_nr_touched[NR_COUNT];   // edited here since the last load
+static bool  g_host_nr_loaded;
+
+static void ReadHostNR()
+{
+    char p[MAX_PATH], buf[64];
+    HostIniPath(p);
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        // A sentinel default separates "absent" from "present and equal to our default":
+        // we must not write back a guessed default over a key the add-on owns.
+        GetPrivateProfileStringA(dlss5_aio_menu::kConfigSection, kNR[i].key, "\x01", buf, sizeof(buf), p);
+        g_nr_present[i] = (buf[0] != '\x01');
+        g_nr[i]         = g_nr_present[i] ? DecodeAioValue(i, static_cast<float>(atof(buf))) : kNR[i].def;
+        g_nr_touched[i] = false;
+    }
+}
+
+static void WriteHostNR()
+{
+    char p[MAX_PATH], buf[64];
+    HostIniPath(p);
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        // Only keys the add-on already had, or that the user actually moved here. Writing
+        // our guessed default for an untouched key would silently overwrite the add-on's
+        // own (unpublished) default with ours.
+        if (!g_nr_present[i] && !g_nr_touched[i]) continue;
+        const float encoded = EncodeAioValue(i, g_nr[i]);
+        if (kNR[i].kind == NR_FLOAT) sprintf_s(buf, "%g", encoded);
+        else                         sprintf_s(buf, "%d", static_cast<int>(encoded));
+        WritePrivateProfileStringA(dlss5_aio_menu::kConfigSection, kNR[i].key, buf, p);
+        g_nr_present[i] = true;
+        g_nr_touched[i] = false;
+    }
+}
+
+static void LogHostNR(const char *what)
+{
+    char line[512];
+    int  n = sprintf_s(line, "[feed32] %s:", what);
+    for (int i = 0; i < NR_COUNT && n > 0 && n < static_cast<int>(sizeof(line)) - 48; ++i)
+    {
+        if (kNR[i].kind == NR_FLOAT) n += sprintf_s(line + n, sizeof(line) - n, " %s=%g", kNR[i].key, g_nr[i]);
+        else                         n += sprintf_s(line + n, sizeof(line) - n, " %s=%d", kNR[i].key, static_cast<int>(g_nr[i]));
+        if (!g_nr_present[i] && !g_nr_touched[i]) n += sprintf_s(line + n, sizeof(line) - n, "(default)");
+    }
+    Log("%s", line);
+}
+
+static void HostClose();   // below
+static HWND FindHostProxyWindow();
+static void HideClassicD3D9Proxy();
+static void RestoreD3D9StartupFocusIfReady();
+static void ResolveWorkExtent(UINT source_w, UINT source_h, UINT &work_w, UINT &work_h);
+
+static bool TryApplyLiveHostSettings()
+{
+    bool any = g_aio_nr_pass_touched;
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        if (!g_nr_touched[i]) continue;
+        any = true;
+        if (strcmp(kNR[i].key, "Model") != 0 &&
+            strcmp(kNR[i].key, "DlssRenderPreset") != 0 &&
+            strcmp(kNR[i].key, "NeuralRendering") != 0 &&
+            strcmp(kNR[i].key, "FrameGeneration") != 0 &&
+            strcmp(kNR[i].key, "NvidiaOpticalFlowResolution") != 0 &&
+            strcmp(kNR[i].key, "NvidiaOpticalFlowMotion") != 0)
+            return false;
+    }
+    if (!any) return true;
+
+    const HWND proxy = FindHostProxyWindow();
+    if (proxy == nullptr) return false;
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        if (!g_nr_touched[i]) continue;
+        const int encoded = static_cast<int>(EncodeAioValue(i, g_nr[i]));
+        UINT message = kProxySelectDlssPresetMessage;
+        if (strcmp(kNR[i].key, "Model") == 0) message = kProxySelectNrModelMessage;
+        else if (strcmp(kNR[i].key, "NeuralRendering") == 0) message = kProxyEnableNrMessage;
+        else if (strcmp(kNR[i].key, "FrameGeneration") == 0) message = kProxyEnableFgMessage;
+        else if (strcmp(kNR[i].key, "NvidiaOpticalFlowResolution") == 0)
+            message = kProxySelectNvofResolutionMessage;
+        else if (strcmp(kNR[i].key, "NvidiaOpticalFlowMotion") == 0)
+            message = kProxyEnableNvofMessage;
+        if (!PostMessageW(proxy, message, static_cast<WPARAM>(encoded), 0))
+            return false;
+        g_nr_present[i] = true;
+        g_nr_touched[i] = false;
+    }
+    if (g_aio_nr_pass_touched)
+    {
+        if (!PostMessageW(proxy, kProxySelectNrPassCountMessage,
+                          static_cast<WPARAM>(std::clamp(g_aio_nr_pass_count, 1, 3)), 0))
+            return false;
+        g_aio_nr_pass_touched = false;
+    }
+    Log("[feed32] live-safe AIO setting change sent to host; carrier restart avoided");
+    return true;
+}
+
+static void HostApplySettings()
+{
+    LogHostNR("applying DLSS 5 host settings");
+    if (g.d3d9_cpu_bridge)
+    {
+        if (TryApplyLiveHostSettings())
+        {
+            Warn("DLSS 5 live-safe setting applied without restarting the classic D3D9 carrier");
+            return;
+        }
+        // Do not tear down resources owned by a classic D3D9 device mid-frame,
+        // but do persist non-live settings such as SourceResolutionOverride.
+        // The next launch can then build both halves at the requested size.
+        WriteHostNR();
+        Warn("Classic D3D9 safety: setting saved and will apply after restarting the game; the active carrier was left running");
+        return;
+    }
+    CaptureGameFocus();   // spent once the replacement host has connected
+
+    // Order matters: the host's ReShade saves its ini ON EXIT and would clobber our
+    // values -- close the host first (HostClose drains the in-flight frame and
+    // releases the shared fences), write after, respawn on the next frame.
+    HostClose();
+    WriteHostNR();
+
+    g.built = false;
+    g.disabled = false;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
+    Warn("DLSS 5 settings applied -- restarting the host (up to 15 s)");
+}
+
+// ---------------------------------------------------------------------------
+// Shared resources (created on the game's D3D11 device)
+// ---------------------------------------------------------------------------
+
+static void ReleaseShared()
+{
+    // Vulkan: drop our VkImage aliases of the host's D3D12 textures. The memory belongs
+    // to the host's resource; freeing the import does not free it. Nothing may still be
+    // reading them, and the frame in flight is only one of the things that could be --
+    // so drain the whole queue, not just our own fence.
+    if (g.vk.ok)
+    {
+        if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
+        for (int i = 0; i < FEED_SLOTS; ++i)
+        {
+            if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
+            if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
+        }
+        g.vk_layout_init = false;   // the next set starts from UNDEFINED again
+    }
+    // OpenGL: drop our aliases of the host's textures. Deleting them frees the import,
+    // not the host's D3D12 resource. GL objects can only be deleted from the context
+    // they live in; from anywhere else the driver reclaims them with the context.
+    if (g.gl.ok)
+    {
+        if (g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+        {
+            g.gl.Finish();   // the shared textures must be idle before the handles go
+            for (int i = 0; i < FEED_SLOTS; ++i)
+            {
+                if (g.gl_tex[i]    != 0) { g.gl.DeleteTextures(1, &g.gl_tex[i]);            g.gl_tex[i]    = 0; }
+                if (g.gl_memobj[i] != 0) { g.gl.DeleteMemoryObjectsEXT(1, &g.gl_memobj[i]); g.gl_memobj[i] = 0; }
+            }
+        }
+        else
+        {
+            bool any = false;
+            for (int i = 0; i < FEED_SLOTS; ++i) if (g.gl_tex[i] != 0) { any = true; g.gl_tex[i] = 0; g.gl_memobj[i] = 0; }
+            if (any) Log("[feed32] the GL context is not current here; the imported textures are left to the driver");
+        }
+    }
+    SafeRelease(g.d3d9_zero_mv_srv);
+    SafeRelease(g.d3d9_zero_depth_srv);
+    SafeRelease(g.d3d9_zero_mv);
+    SafeRelease(g.d3d9_zero_depth);
+    SafeRelease(g.d3d9_output_rtv);
+    SafeRelease(g.d3d9_output_stage11);
+    SafeRelease(g.d3d9_cpu_readback);
+    SafeRelease(g.d3d9_output_stage);
+    SafeRelease(g.d3d9_color_stage);
+    g.d3d9_pending_frame = 0;
+    g.d3d9_pending_deadline = 0;
+    g.d3d9_resume_after = 0;
+    g.d3d9_cpu_bridge = false;
+    SafeRelease(g.d3d10_downsample_sampler);
+    SafeRelease(g.d3d10_downsample_ps);
+    SafeRelease(g.d3d10_downsample_vs);
+    SafeRelease(g.d3d10_fallback_source_srv);
+    SafeRelease(g.d3d10_fallback_source);
+    SafeRelease(g.d3d10_source_srv);
+    SafeRelease(g.d3d10_source_texture);
+    SafeRelease(g.d3d10_color_rtv);
+    SafeRelease(g.d3d10_output_stage);
+    SafeRelease(g.d3d10_color_stage);
+    SafeRelease(g.output_srv);
+    SafeRelease(g.color_stage_srv);
+    SafeRelease(g.color_stage);
+    for (int i = 0; i < FEED_SLOTS; ++i)
+    {
+        SafeRelease(g.input_rtv[i]);
+        SafeRelease(g.tex[i]);
+        if (g.tex_handle[i] != nullptr) { CloseHandle(g.tex_handle[i]); g.tex_handle[i] = nullptr; }
+    }
+    g.built = false;
+}
+
+static void PrepareClassicD3D9ForReset(const char *reason)
+{
+    if (!g.is_d3d9) return;
+    HideClassicD3D9Proxy();
+    Log("[feed32] classic D3D9 device lost/reset (%s); releasing all default-pool bridge resources",
+        reason != nullptr ? reason : "unknown");
+
+    // A classic D3D9 Reset returns D3DERR_INVALIDCALL while *any* default-pool
+    // resource from the old device state is alive. End the carrier first so it
+    // releases its cross-process handles, then drop every D3D9 capture surface and
+    // query before allowing the game to call Reset again.
+    HostClose();
+    ReleaseShared();
+    SafeRelease(g.query9);
+    g.d3d9_device_lost = true;
+    g.need_reset = true;
+    g.consecutive_fails = 0;
+    g_retry_at = 0;
+}
+
+static DXGI_FORMAT FromD3D9Format(D3DFORMAT format)
+{
+    switch (format)
+    {
+    case D3DFMT_A8R8G8B8:       return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case D3DFMT_X8R8G8B8:       return DXGI_FORMAT_B8G8R8X8_UNORM;
+    case D3DFMT_A8B8G8R8:       return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case D3DFMT_A2B10G10R10:    return DXGI_FORMAT_R10G10B10A2_UNORM;
+    case D3DFMT_A16B16G16R16F:  return DXGI_FORMAT_R16G16B16A16_FLOAT;
+    default:                     return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+static D3DFORMAT ToD3D9Format(DXGI_FORMAT format)
+{
+    switch (format)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:      return D3DFMT_A8R8G8B8;
+    case DXGI_FORMAT_B8G8R8X8_UNORM:      return D3DFMT_X8R8G8B8;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:      return D3DFMT_A8B8G8R8;
+    case DXGI_FORMAT_R10G10B10A2_UNORM:   return D3DFMT_A2B10G10R10;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT:  return D3DFMT_A16B16G16R16F;
+    default:                               return D3DFMT_UNKNOWN;
+    }
+}
+
+static IDXGIAdapter1 *FindD3D9Adapter(IDirect3DDevice9 *device9)
+{
+    if (device9 == nullptr) return nullptr;
+    D3DDEVICE_CREATION_PARAMETERS creation = {};
+    if (FAILED(device9->GetCreationParameters(&creation))) return nullptr;
+    IDirect3D9 *d3d9 = nullptr;
+    if (FAILED(device9->GetDirect3D(&d3d9)) || d3d9 == nullptr) return nullptr;
+
+    LUID wanted = {};
+    bool have_luid = false;
+    IDirect3D9Ex *d3d9ex = nullptr;
+    if (SUCCEEDED(d3d9->QueryInterface(__uuidof(IDirect3D9Ex), reinterpret_cast<void **>(&d3d9ex))) &&
+        d3d9ex != nullptr && SUCCEEDED(d3d9ex->GetAdapterLUID(creation.AdapterOrdinal, &wanted)))
+        have_luid = true;
+    SafeRelease(d3d9ex);
+    const HMONITOR wanted_monitor = d3d9->GetAdapterMonitor(creation.AdapterOrdinal);
+
+    IDXGIFactory1 *factory = nullptr;
+    if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory))))
+    { d3d9->Release(); return nullptr; }
+    IDXGIAdapter1 *match = nullptr;
+    for (UINT index = 0; ; ++index)
+    {
+        IDXGIAdapter1 *adapter = nullptr;
+        if (factory->EnumAdapters1(index, &adapter) == DXGI_ERROR_NOT_FOUND) break;
+        DXGI_ADAPTER_DESC1 ad = {};
+        adapter->GetDesc1(&ad);
+        if (have_luid && ad.AdapterLuid.HighPart == wanted.HighPart && ad.AdapterLuid.LowPart == wanted.LowPart)
+        { match = adapter; break; }
+        bool monitor_match = false;
+        for (UINT oi = 0; wanted_monitor != nullptr; ++oi)
+        {
+            IDXGIOutput *output = nullptr;
+            if (adapter->EnumOutputs(oi, &output) == DXGI_ERROR_NOT_FOUND) break;
+            DXGI_OUTPUT_DESC od = {};
+            if (SUCCEEDED(output->GetDesc(&od)) && od.Monitor == wanted_monitor) monitor_match = true;
+            output->Release();
+            if (monitor_match) break;
+        }
+        if (monitor_match) { match = adapter; break; }
+        adapter->Release();
+    }
+    factory->Release();
+    d3d9->Release();
+    return match;
+}
+
+static bool InitializeD3D9Transport(IDirect3DDevice9 *device9)
+{
+    if (g.dev != nullptr && g.ctx4 != nullptr && g.dev9 == device9)
+    {
+        if (g.query9 == nullptr)
+            device9->CreateQuery(D3DQUERYTYPE_EVENT, &g.query9);
+        if (g.query11 == nullptr)
+        {
+            D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+            g.dev->CreateQuery(&qd, &g.query11);
+        }
+        return g.query9 != nullptr && g.query11 != nullptr;
+    }
+    IDXGIAdapter1 *adapter = FindD3D9Adapter(device9);
+    if (adapter == nullptr) { Log("[feed32] D3D9 adapter could not be matched to DXGI"); return false; }
+    ID3D11DeviceContext *context = nullptr;
+    D3D_FEATURE_LEVEL requested = D3D_FEATURE_LEVEL_11_0;
+    const HRESULT hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, &requested, 1, D3D11_SDK_VERSION,
+        &g.dev, nullptr, &context);
+    adapter->Release();
+    if (FAILED(hr) || g.dev == nullptr || context == nullptr)
+    { SafeRelease(context); SafeRelease(g.dev); Log("[feed32] D3D9 bridge D3D11CreateDevice failed 0x%08X", hr); return false; }
+    g.owns_d3d11_device = true;
+    g.dev9 = device9;
+    if (FAILED(context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
+    { SafeRelease(context); SafeRelease(g.dev); g.dev9 = nullptr; return false; }
+    context->Release();
+    device9->CreateQuery(D3DQUERYTYPE_EVENT, &g.query9);
+    D3D11_QUERY_DESC qd = { D3D11_QUERY_EVENT, 0 };
+    g.dev->CreateQuery(&qd, &g.query11);
+    Log("[feed32] native D3D9 -> D3D11 transport initialized on the game adapter");
+    return g.query9 != nullptr && g.query11 != nullptr;
+}
+
+static bool CreateD3D9SharedStage(UINT width, UINT height, DXGI_FORMAT format,
+                                  IDirect3DTexture9 **texture9, ID3D11Texture2D **texture11,
+                                  UINT cpu_width = 0, UINT cpu_height = 0,
+                                  bool allow_cpu_fallback = true)
+{
+    const D3DFORMAT format9 = ToD3D9Format(format);
+    if (format9 == D3DFMT_UNKNOWN || g.dev9 == nullptr || g.dev == nullptr) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    HRESULT hr = g.dev->CreateTexture2D(&desc, nullptr, texture11);
+    HANDLE shared = nullptr;
+    IDXGIResource *dxgi = nullptr;
+    if (SUCCEEDED(hr)) hr = (*texture11)->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgi));
+    if (SUCCEEDED(hr)) hr = dxgi->GetSharedHandle(&shared);
+    SafeRelease(dxgi);
+    if (SUCCEEDED(hr))
+        hr = g.dev9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, format9,
+                                   D3DPOOL_DEFAULT, texture9, &shared);
+    if (FAILED(hr))
+    {
+        SafeRelease(*texture9); SafeRelease(*texture11); shared = nullptr;
+        hr = g.dev9->CreateTexture(width, height, 1, D3DUSAGE_RENDERTARGET, format9,
+                                   D3DPOOL_DEFAULT, texture9, &shared);
+        if (SUCCEEDED(hr)) hr = g.dev->OpenSharedResource(shared, __uuidof(ID3D11Texture2D), reinterpret_cast<void **>(texture11));
+    }
+    if (FAILED(hr))
+    {
+        SafeRelease(*texture9); SafeRelease(*texture11);
+        if (g_cfg.classic_d3d9_cpu_fallback == 0 || !allow_cpu_fallback)
+        {
+            Log("[feed32] D3D9/D3D11 shared stage unsupported: %ux%u fmt=%u hr=0x%08X; "
+                "classic D3D9 CPU fallback is disabled",
+                width, height, format, hr);
+            return false;
+        }
+        // A classic IDirect3DDevice9 (rather than IDirect3DDevice9Ex) rejects
+        // shared handles with D3DERR_INVALIDCALL. Keep the existing fast path
+        // for Ex devices, but fall back to an ordinary render target plus a
+        // system-memory readback. The x64 carrier owns the detached processed
+        // output, so this path only has to move the source frame into D3D11;
+        // it does not need an equally expensive CPU copy back into D3D9.
+        const UINT fallback_width = cpu_width >= 2 ? cpu_width : width;
+        const UINT fallback_height = cpu_height >= 2 ? cpu_height : height;
+        D3D11_TEXTURE2D_DESC local_desc = desc;
+        local_desc.Width = fallback_width;
+        local_desc.Height = fallback_height;
+        local_desc.MiscFlags = 0;
+        HRESULT fallback_hr = g.dev9->CreateTexture(fallback_width, fallback_height, 1, D3DUSAGE_RENDERTARGET, format9,
+                                                     D3DPOOL_DEFAULT, texture9, nullptr);
+        if (SUCCEEDED(fallback_hr))
+            fallback_hr = g.dev->CreateTexture2D(&local_desc, nullptr, texture11);
+        if (SUCCEEDED(fallback_hr) && g.d3d9_cpu_readback == nullptr)
+            fallback_hr = g.dev9->CreateOffscreenPlainSurface(fallback_width, fallback_height, format9, D3DPOOL_SYSTEMMEM,
+                                                               &g.d3d9_cpu_readback, nullptr);
+        if (FAILED(fallback_hr))
+        {
+            SafeRelease(*texture9); SafeRelease(*texture11);
+            Log("[feed32] D3D9/D3D11 shared stage failed: %ux%u fmt=%u shared=0x%08X fallback=0x%08X",
+                fallback_width, fallback_height, format, hr, fallback_hr);
+            return false;
+        }
+        if (!g.d3d9_cpu_bridge)
+            Log("[feed32] classic D3D9 device rejected shared textures (0x%08X); using %ux%u CPU capture + detached x64 output",
+                hr, fallback_width, fallback_height);
+        g.d3d9_cpu_bridge = true;
+    }
+    return true;
+}
+
+static bool WaitForD3D9Copy()
+{
+    if (g.query9 == nullptr || FAILED(g.query9->Issue(D3DISSUE_END))) return false;
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g.query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
+}
+
+static bool WaitForD3D11Copy()
+{
+    if (g.query11 == nullptr || g.ctx4 == nullptr) return false;
+    g.ctx4->End(g.query11);
+    g.ctx4->Flush();
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g.ctx4->GetData(g.query11, nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
+}
+
+static bool WaitForHostFenceCpu(UINT64 value, DWORD timeout_ms)
+{
+    if (g.fence_out == nullptr) return false;
+    if (g.fence_out->GetCompletedValue() >= value) return true;
+
+    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+    if (evt == nullptr) return false;
+    const HRESULT hr = g.fence_out->SetEventOnCompletion(value, evt);
+    const DWORD wait = SUCCEEDED(hr) ? WaitForSingleObject(evt, timeout_ms) : WAIT_FAILED;
+    CloseHandle(evt);
+    return wait == WAIT_OBJECT_0;
+}
+
+static void HideClassicD3D9Proxy()
+{
+    const HWND proxy = FindHostProxyWindow();
+    if (proxy != nullptr)
+        PostMessageW(proxy, kProxyVisibilityMessage, 0, 0);
+}
+
+static bool InitializeD3D10Transport(ID3D10Device1 *device10)
+{
+    if (g.dev != nullptr && g.ctx4 != nullptr && g.dev10 == device10) return true;
+    IDXGIDevice *dxgi_device = nullptr;
+    IDXGIAdapter *adapter0 = nullptr;
+    IDXGIAdapter1 *adapter = nullptr;
+    HRESULT hr = device10->QueryInterface(__uuidof(IDXGIDevice), reinterpret_cast<void **>(&dxgi_device));
+    if (SUCCEEDED(hr)) hr = dxgi_device->GetAdapter(&adapter0);
+    if (SUCCEEDED(hr)) hr = adapter0->QueryInterface(__uuidof(IDXGIAdapter1), reinterpret_cast<void **>(&adapter));
+    SafeRelease(adapter0);
+    SafeRelease(dxgi_device);
+    if (FAILED(hr) || adapter == nullptr)
+    { SafeRelease(adapter); Log("[feed32] D3D10 bridge could not obtain the ReShade adapter: 0x%08X", hr); return false; }
+
+    ID3D11DeviceContext *context = nullptr;
+    D3D_FEATURE_LEVEL requested = D3D_FEATURE_LEVEL_11_0;
+    hr = D3D11CreateDevice(adapter, D3D_DRIVER_TYPE_UNKNOWN, nullptr,
+        D3D11_CREATE_DEVICE_BGRA_SUPPORT, &requested, 1, D3D11_SDK_VERSION,
+        &g.dev, nullptr, &context);
+    adapter->Release();
+    if (FAILED(hr) || g.dev == nullptr || context == nullptr)
+    { SafeRelease(context); SafeRelease(g.dev); Log("[feed32] D3D10 bridge D3D11CreateDevice failed 0x%08X", hr); return false; }
+    g.owns_d3d11_device = true;
+    g.dev10 = device10;
+    if (FAILED(context->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
+    { SafeRelease(context); SafeRelease(g.dev); g.dev10 = nullptr; return false; }
+    context->Release();
+    D3D10_QUERY_DESC qd10 = { D3D10_QUERY_EVENT, 0 };
+    device10->CreateQuery(&qd10, &g.query10);
+    D3D11_QUERY_DESC qd11 = { D3D11_QUERY_EVENT, 0 };
+    g.dev->CreateQuery(&qd11, &g.query11);
+    Log("[feed32] ReShade D3D10.1 -> D3D11 transport initialized (native D3D9 presentation route)");
+    return g.query10 != nullptr && g.query11 != nullptr;
+}
+
+static bool CreateD3D10SharedStage(UINT width, UINT height, DXGI_FORMAT format,
+                                   ID3D10Texture2D **texture10, ID3D11Texture2D **texture11)
+{
+    if (g.dev10 == nullptr || g.dev == nullptr) return false;
+    D3D11_TEXTURE2D_DESC desc = {};
+    desc.Width = width; desc.Height = height; desc.MipLevels = 1; desc.ArraySize = 1;
+    desc.Format = format; desc.SampleDesc.Count = 1; desc.Usage = D3D11_USAGE_DEFAULT;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+    HRESULT hr = g.dev->CreateTexture2D(&desc, nullptr, texture11);
+    HANDLE shared = nullptr;
+    IDXGIResource *dxgi = nullptr;
+    if (SUCCEEDED(hr)) hr = (*texture11)->QueryInterface(__uuidof(IDXGIResource), reinterpret_cast<void **>(&dxgi));
+    if (SUCCEEDED(hr)) hr = dxgi->GetSharedHandle(&shared);
+    SafeRelease(dxgi);
+    if (SUCCEEDED(hr)) hr = g.dev10->OpenSharedResource(shared, __uuidof(ID3D10Texture2D), reinterpret_cast<void **>(texture10));
+    if (FAILED(hr))
+    {
+        SafeRelease(*texture10);
+        SafeRelease(*texture11);
+        Log("[feed32] D3D10/D3D11 shared stage failed: %ux%u fmt=%u hr=0x%08X", width, height, format, hr);
+        return false;
+    }
+    return true;
+}
+
+static bool WaitForD3D10Copy()
+{
+    if (g.query10 == nullptr || g.dev10 == nullptr) return false;
+    g.query10->End();
+    g.dev10->Flush();
+    const ULONGLONG deadline = GetTickCount64() + 2000;
+    HRESULT hr = S_FALSE;
+    while ((hr = g.query10->GetData(nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
+        SwitchToThread();
+    return hr == S_OK;
+}
+
+static bool MakeD3D10DownsamplePipeline()
+{
+    if (g.dev10 == nullptr || g.d3d10_color_stage == nullptr) return false;
+    if (g.d3d10_downsample_vs != nullptr && g.d3d10_downsample_ps != nullptr &&
+        g.d3d10_downsample_sampler != nullptr && g.d3d10_color_rtv != nullptr)
+        return true;
+
+    static const char shader[] =
+        "Texture2D<float4> source_texture : register(t0);\n"
+        "SamplerState source_sampler : register(s0);\n"
+        "struct VSOut { float4 position : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv=float2((id<<1)&2,id&2);"
+        " o.uv=uv; o.position=float4(uv*float2(2,-2)+float2(-1,1),0,1); return o; }\n"
+        "float4 ps(VSOut i) : SV_Target { return source_texture.SampleLevel(source_sampler,i.uv,0); }\n";
+    HMODULE compiler_module = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = compiler_module != nullptr ?
+        reinterpret_cast<pD3DCompile>(GetProcAddress(compiler_module, "D3DCompile")) : nullptr;
+    if (compile == nullptr)
+    {
+        Log("[feed32] D3D10.1 source downsample requires d3dcompiler_47.dll");
+        return false;
+    }
+
+    ID3DBlob *vs_blob = nullptr, *ps_blob = nullptr, *errors = nullptr;
+    HRESULT hr = compile(shader, sizeof(shader) - 1, "feed32-d3d10-downsample", nullptr,
+        nullptr, "vs", "vs_4_0", 0, 0, &vs_blob, &errors);
+    SafeRelease(errors);
+    if (SUCCEEDED(hr))
+        hr = compile(shader, sizeof(shader) - 1, "feed32-d3d10-downsample", nullptr,
+            nullptr, "ps", "ps_4_0", 0, 0, &ps_blob, &errors);
+    if (FAILED(hr))
+    {
+        if (errors != nullptr)
+            Log("[feed32] D3D10.1 source downsample shader compilation failed: %s",
+                static_cast<const char *>(errors->GetBufferPointer()));
+        SafeRelease(errors); SafeRelease(vs_blob); SafeRelease(ps_blob);
+        return false;
+    }
+    SafeRelease(errors);
+
+    hr = g.dev10->CreateVertexShader(vs_blob->GetBufferPointer(), vs_blob->GetBufferSize(),
+        &g.d3d10_downsample_vs);
+    if (SUCCEEDED(hr))
+        hr = g.dev10->CreatePixelShader(ps_blob->GetBufferPointer(), ps_blob->GetBufferSize(),
+            &g.d3d10_downsample_ps);
+    SafeRelease(vs_blob); SafeRelease(ps_blob);
+
+    D3D10_SAMPLER_DESC sampler = {};
+    sampler.Filter = D3D10_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sampler.AddressU = sampler.AddressV = sampler.AddressW = D3D10_TEXTURE_ADDRESS_CLAMP;
+    sampler.MaxLOD = D3D10_FLOAT32_MAX;
+    if (SUCCEEDED(hr)) hr = g.dev10->CreateSamplerState(&sampler, &g.d3d10_downsample_sampler);
+
+    D3D10_RENDER_TARGET_VIEW_DESC rtv = {};
+    rtv.Format = g.color_fmt;
+    rtv.ViewDimension = D3D10_RTV_DIMENSION_TEXTURE2D;
+    if (SUCCEEDED(hr))
+        hr = g.dev10->CreateRenderTargetView(g.d3d10_color_stage, &rtv,
+            &g.d3d10_color_rtv);
+    if (FAILED(hr))
+    {
+        Log("[feed32] D3D10.1 source downsample pipeline creation failed: 0x%08X", hr);
+        return false;
+    }
+    return true;
+}
+
+static ID3D10ShaderResourceView *D3D10SourceSrv(ID3D10Texture2D *source)
+{
+    if (source == nullptr || g.dev10 == nullptr) return nullptr;
+    if (g.d3d10_source_texture == source && g.d3d10_source_srv != nullptr)
+        return g.d3d10_source_srv;
+
+    SafeRelease(g.d3d10_source_srv);
+    SafeRelease(g.d3d10_source_texture);
+    D3D10_TEXTURE2D_DESC source_desc = {};
+    source->GetDesc(&source_desc);
+    D3D10_SHADER_RESOURCE_VIEW_DESC srv_desc = {};
+    srv_desc.Format = g.color_fmt;
+    srv_desc.ViewDimension = D3D10_SRV_DIMENSION_TEXTURE2D;
+    srv_desc.Texture2D.MipLevels = 1;
+    HRESULT hr = g.dev10->CreateShaderResourceView(source, &srv_desc,
+        &g.d3d10_source_srv);
+    if (SUCCEEDED(hr))
+    {
+        g.d3d10_source_texture = source;
+        source->AddRef();
+        return g.d3d10_source_srv;
+    }
+
+    // Some ReShade D3D10 effect targets are render-target-only. Keep the
+    // fallback copy entirely on D3D10, then shrink it before crossing into the
+    // D3D11/shared transport instead of synchronizing a native-sized resource.
+    D3D10_TEXTURE2D_DESC fallback_desc = source_desc;
+    fallback_desc.Format = g.color_fmt;
+    fallback_desc.Usage = D3D10_USAGE_DEFAULT;
+    fallback_desc.BindFlags = D3D10_BIND_SHADER_RESOURCE;
+    fallback_desc.CPUAccessFlags = 0;
+    fallback_desc.MiscFlags = 0;
+    if (g.d3d10_fallback_source != nullptr)
+    {
+        D3D10_TEXTURE2D_DESC existing = {};
+        g.d3d10_fallback_source->GetDesc(&existing);
+        if (existing.Width != fallback_desc.Width || existing.Height != fallback_desc.Height ||
+            existing.Format != fallback_desc.Format)
+        {
+            SafeRelease(g.d3d10_fallback_source_srv);
+            SafeRelease(g.d3d10_fallback_source);
+        }
+    }
+    if (g.d3d10_fallback_source == nullptr)
+    {
+        hr = g.dev10->CreateTexture2D(&fallback_desc, nullptr,
+            &g.d3d10_fallback_source);
+        if (SUCCEEDED(hr))
+            hr = g.dev10->CreateShaderResourceView(g.d3d10_fallback_source,
+                &srv_desc, &g.d3d10_fallback_source_srv);
+        if (FAILED(hr))
+        {
+            SafeRelease(g.d3d10_fallback_source_srv);
+            SafeRelease(g.d3d10_fallback_source);
+            Log("[feed32] D3D10.1 source is not shader-readable and fallback creation failed: 0x%08X", hr);
+            return nullptr;
+        }
+        Log("[feed32] D3D10.1 source needs a local shader-readable fallback before pre-interop downsampling");
+    }
+    g.dev10->CopyResource(g.d3d10_fallback_source, source);
+    return g.d3d10_fallback_source_srv;
+}
+
+static bool DownsampleD3D10Frame(ID3D10Texture2D *source)
+{
+    if (source == nullptr || g.dev10 == nullptr || g.d3d10_color_stage == nullptr)
+        return false;
+    D3D10_TEXTURE2D_DESC source_desc = {};
+    source->GetDesc(&source_desc);
+    if (source_desc.Width == g.width && source_desc.Height == g.height)
+    {
+        g.dev10->CopyResource(g.d3d10_color_stage, source);
+        return true;
+    }
+    if (!MakeD3D10DownsamplePipeline()) return false;
+    ID3D10ShaderResourceView *source_srv = D3D10SourceSrv(source);
+    if (source_srv == nullptr) return false;
+
+    ID3D10RenderTargetView *old_rtv = nullptr;
+    ID3D10DepthStencilView *old_dsv = nullptr;
+    ID3D10VertexShader *old_vs = nullptr;
+    ID3D10GeometryShader *old_gs = nullptr;
+    ID3D10PixelShader *old_ps = nullptr;
+    ID3D10ShaderResourceView *old_srv = nullptr;
+    ID3D10SamplerState *old_sampler = nullptr;
+    ID3D10InputLayout *old_layout = nullptr;
+    ID3D10BlendState *old_blend = nullptr;
+    ID3D10DepthStencilState *old_depth = nullptr;
+    ID3D10RasterizerState *old_rasterizer = nullptr;
+    ID3D10Predicate *old_predicate = nullptr;
+    BOOL old_predicate_value = FALSE;
+    FLOAT old_blend_factor[4] = {};
+    UINT old_sample_mask = 0, old_stencil_reference = 0;
+    D3D10_PRIMITIVE_TOPOLOGY old_topology = D3D10_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT viewport_count = D3D10_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+    D3D10_VIEWPORT old_viewports[D3D10_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE] = {};
+
+    g.dev10->OMGetRenderTargets(1, &old_rtv, &old_dsv);
+    g.dev10->VSGetShader(&old_vs); g.dev10->GSGetShader(&old_gs); g.dev10->PSGetShader(&old_ps);
+    g.dev10->PSGetShaderResources(0, 1, &old_srv);
+    g.dev10->PSGetSamplers(0, 1, &old_sampler);
+    g.dev10->IAGetInputLayout(&old_layout); g.dev10->IAGetPrimitiveTopology(&old_topology);
+    g.dev10->OMGetBlendState(&old_blend, old_blend_factor, &old_sample_mask);
+    g.dev10->OMGetDepthStencilState(&old_depth, &old_stencil_reference);
+    g.dev10->RSGetState(&old_rasterizer); g.dev10->RSGetViewports(&viewport_count, old_viewports);
+    g.dev10->GetPredication(&old_predicate, &old_predicate_value);
+
+    D3D10_VIEWPORT viewport = {};
+    viewport.Width = g.width; viewport.Height = g.height; viewport.MaxDepth = 1.0f;
+    ID3D10RenderTargetView *target = g.d3d10_color_rtv;
+    ID3D10SamplerState *sampler = g.d3d10_downsample_sampler;
+    g.dev10->SetPredication(nullptr, FALSE);
+    g.dev10->RSSetViewports(1, &viewport);
+    g.dev10->RSSetState(nullptr);
+    g.dev10->OMSetRenderTargets(1, &target, nullptr);
+    g.dev10->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    g.dev10->OMSetDepthStencilState(nullptr, 0);
+    g.dev10->IASetInputLayout(nullptr);
+    g.dev10->IASetPrimitiveTopology(D3D10_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.dev10->VSSetShader(g.d3d10_downsample_vs);
+    g.dev10->GSSetShader(nullptr);
+    g.dev10->PSSetShader(g.d3d10_downsample_ps);
+    g.dev10->PSSetShaderResources(0, 1, &source_srv);
+    g.dev10->PSSetSamplers(0, 1, &sampler);
+    g.dev10->Draw(3, 0);
+
+    ID3D10ShaderResourceView *null_srv = nullptr;
+    g.dev10->PSSetShaderResources(0, 1, &null_srv);
+    g.dev10->OMSetRenderTargets(1, &old_rtv, old_dsv);
+    g.dev10->VSSetShader(old_vs); g.dev10->GSSetShader(old_gs); g.dev10->PSSetShader(old_ps);
+    g.dev10->PSSetShaderResources(0, 1, &old_srv);
+    g.dev10->PSSetSamplers(0, 1, &old_sampler);
+    g.dev10->IASetInputLayout(old_layout); g.dev10->IASetPrimitiveTopology(old_topology);
+    g.dev10->OMSetBlendState(old_blend, old_blend_factor, old_sample_mask);
+    g.dev10->OMSetDepthStencilState(old_depth, old_stencil_reference);
+    g.dev10->RSSetState(old_rasterizer);
+    if (viewport_count != 0) g.dev10->RSSetViewports(viewport_count, old_viewports);
+    g.dev10->SetPredication(old_predicate, old_predicate_value);
+
+    SafeRelease(old_predicate); SafeRelease(old_rasterizer); SafeRelease(old_depth);
+    SafeRelease(old_blend); SafeRelease(old_layout); SafeRelease(old_sampler);
+    SafeRelease(old_srv); SafeRelease(old_ps); SafeRelease(old_gs); SafeRelease(old_vs);
+    SafeRelease(old_dsv); SafeRelease(old_rtv);
+    return true;
+}
+
+static bool MakeShared(int slot, UINT w, UINT h, DXGI_FORMAT fmt, bool uav, bool render_target)
+{
+    D3D11_TEXTURE2D_DESC td = {};
+    td.Width            = w;
+    td.Height           = h;
+    td.MipLevels        = 1;
+    td.ArraySize        = 1;
+    td.Format           = fmt;
+    td.SampleDesc.Count = 1;
+    td.Usage            = D3D11_USAGE_DEFAULT;
+    td.BindFlags        = D3D11_BIND_SHADER_RESOURCE |
+                          (uav ? D3D11_BIND_UNORDERED_ACCESS : 0) |
+                          (render_target ? D3D11_BIND_RENDER_TARGET : 0);
+    td.MiscFlags        = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED;
+    HRESULT hr = g.dev->CreateTexture2D(&td, nullptr, &g.tex[slot]);
+    if (FAILED(hr)) { Log("[feed32] tex %d CreateTexture2D failed 0x%08X", slot, hr); return false; }
+
+    IDXGIResource1 *r = nullptr;
+    hr = g.tex[slot]->QueryInterface(__uuidof(IDXGIResource1), reinterpret_cast<void **>(&r));
+    if (SUCCEEDED(hr))
+    {
+        hr = r->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE, nullptr,
+                                   &g.tex_handle[slot]);
+        r->Release();
+    }
+    if (FAILED(hr)) { Log("[feed32] tex %d CreateSharedHandle failed 0x%08X", slot, hr); return false; }
+    return true;
+}
+
+static bool MakeBlitShaders()
+{
+    if (g.blit_vs != nullptr && g.blit_ps != nullptr) return true;
+    static const char kSrc[] =
+        "Texture2D<float4> src_color : register(t0);\n"
+        "Texture2D<float2> src_mv : register(t1);\n"
+        "Texture2D<float> src_depth : register(t2);\n"
+        "SamplerState smp : register(s0);\n"
+        "SamplerState point_smp : register(s1);\n"
+        "cbuffer ResampleConstants : register(b0) { float2 mv_scale; float2 _pad; };\n"
+        "struct VSOut { float4 pos : SV_Position; float2 uv : TEXCOORD0; };\n"
+        "VSOut vs(uint id : SV_VertexID) { VSOut o; float2 uv = float2((id << 1) & 2, id & 2);\n"
+        "  o.uv = uv; o.pos = float4(uv * float2(2, -2) + float2(-1, 1), 0, 1); return o; }\n"
+        "float4 ps(VSOut i) : SV_Target { return float4(src_color.Sample(smp, i.uv).rgb, 1.0); }\n"
+        // Motion vectors are in pixels, so they scale with the resolution ratio; depth is a
+        // point sample (interpolating across a silhouette would invent geometry).
+        "struct ResampleOut { float4 color : SV_Target0; float2 mv : SV_Target1; float depth : SV_Target2; };\n"
+        "ResampleOut ps_resample(VSOut i) { ResampleOut o;\n"
+        "  o.color = src_color.SampleLevel(smp, i.uv, 0);\n"
+        "  o.mv = src_mv.SampleLevel(point_smp, i.uv, 0) * mv_scale;\n"
+        "  o.depth = src_depth.SampleLevel(point_smp, i.uv, 0); return o; }\n";
+    HMODULE m = LoadLibraryW(L"d3dcompiler_47.dll");
+    auto compile = m != nullptr ? reinterpret_cast<pD3DCompile>(GetProcAddress(m, "D3DCompile")) : nullptr;
+    if (compile == nullptr) { Log("[feed32] d3dcompiler_47.dll unavailable"); return false; }
+    ID3DBlob *vs = nullptr, *ps = nullptr, *err = nullptr;
+    HRESULT hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "vs", "vs_4_0", 0, 0, &vs, &err);
+    if (FAILED(hr)) { Log("[feed32] blit VS compile failed 0x%08X", hr); SafeRelease(err); return false; }
+    SafeRelease(err);
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps", "ps_4_0", 0, 0, &ps, &err);
+    if (FAILED(hr)) { Log("[feed32] blit PS compile failed 0x%08X", hr); SafeRelease(err); SafeRelease(vs); return false; }
+    SafeRelease(err);
+    ID3DBlob *resample = nullptr;
+    hr = compile(kSrc, sizeof(kSrc) - 1, "feedblit", nullptr, nullptr, "ps_resample", "ps_4_0", 0, 0, &resample, &err);
+    if (FAILED(hr))
+    {
+        Log("[feed32] resample PS compile failed 0x%08X: %s", hr, err ? (const char *)err->GetBufferPointer() : "");
+        SafeRelease(err); SafeRelease(vs); SafeRelease(ps); return false;
+    }
+    SafeRelease(err);
+
+    hr = g.dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &g.blit_vs);
+    if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &g.blit_ps);
+    if (SUCCEEDED(hr)) hr = g.dev->CreatePixelShader(resample->GetBufferPointer(), resample->GetBufferSize(), nullptr, &g.resample_ps);
+    vs->Release();
+    ps->Release();
+    resample->Release();
+    if (FAILED(hr)) { Log("[feed32] blit shader creation failed 0x%08X", hr); return false; }
+
+    D3D11_SAMPLER_DESC sd = {};
+    // Linear: below 100% this sampler both downsamples the colour and upscales the result.
+    // At 100% every tap lands on a texel centre, so it stays bit-identical to the old point filter.
+    sd.Filter   = D3D11_FILTER_MIN_MAG_LINEAR_MIP_POINT;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    sd.MaxLOD   = D3D11_FLOAT32_MAX;
+    if (FAILED(g.dev->CreateSamplerState(&sd, &g.blit_sampler))) { Log("[feed32] blit sampler failed"); return false; }
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
+    if (FAILED(g.dev->CreateSamplerState(&sd, &g.point_sampler))) { Log("[feed32] point sampler failed"); return false; }
+
+    D3D11_BUFFER_DESC cbd = {};
+    cbd.ByteWidth      = 16;
+    cbd.Usage          = D3D11_USAGE_DYNAMIC;
+    cbd.BindFlags      = D3D11_BIND_CONSTANT_BUFFER;
+    cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    if (FAILED(g.dev->CreateBuffer(&cbd, nullptr, &g.resample_cb))) { Log("[feed32] resample constant buffer failed"); return false; }
+    return true;
+}
+
+static bool BuildShared(UINT w, UINT h, UINT backbuffer_w, UINT backbuffer_h, DXGI_FORMAT bb_fmt)
+{
+    Breadcrumb("building the shared textures");
+    ReleaseShared();
+
+    g.width      = w;
+    g.height     = h;
+    g.backbuffer_width  = backbuffer_w;
+    g.backbuffer_height = backbuffer_h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = TypedColorFormat(bb_fmt);
+    // Transport test copies Color->Output host-side with CopyResource: same format then.
+    g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : OutputFormatFor(g.color_fmt);
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    { FeedDisable("unsupported backbuffer format"); return false; }
+    const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (!MakeShared(FEED_COLOR, w, h, g.color_fmt, false, true) ||
+        !MakeShared(FEED_OUTPUT, w, h, g.output_fmt, true, false) ||
+        !MakeShared(FEED_DEPTH, w, h, DXGI_FORMAT_R32_FLOAT, false, true) ||
+        !MakeShared(FEED_MV, w, h, DXGI_FORMAT_R16G16_FLOAT, false, true))
+    { ReleaseShared(); return false; }
+
+    D3D11_SHADER_RESOURCE_VIEW_DESC sv = {};
+    sv.Format              = g.output_fmt;
+    sv.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+    sv.Texture2D.MipLevels = 1;
+    if (FAILED(g.dev->CreateShaderResourceView(g.tex[FEED_OUTPUT], &sv, &g.output_srv)))
+    { Log("[feed32] output SRV failed"); ReleaseShared(); return false; }
+    if (!MakeBlitShaders()) { ReleaseShared(); return false; }
+
+    // Below 100% the guides are resampled into the shared set rather than copied, which
+    // needs an RTV per input and an SRV-able source. ReShade's backbuffer has neither
+    // D3D11_BIND_SHADER_RESOURCE nor a resource behind `DLSS5_ColorInput : COLOR`, so
+    // stage a native-size copy we own and downsample from that.
+    const bool legacy_surface_bridge = g.is_d3d9 || g.is_d3d10;
+    if (backbuffer_w != w || backbuffer_h != h || legacy_surface_bridge)
+    {
+        const int input_slots[] = { FEED_COLOR, FEED_MV, FEED_DEPTH };
+        for (const int slot : input_slots)
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+            rv.Format = slot == FEED_COLOR ? g.color_fmt
+                      : (slot == FEED_MV ? DXGI_FORMAT_R16G16_FLOAT : DXGI_FORMAT_R32_FLOAT);
+            rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(g.dev->CreateRenderTargetView(g.tex[slot], &rv, &g.input_rtv[slot])))
+            { Log("[feed32] input RTV %d failed", slot); ReleaseShared(); return false; }
+        }
+
+        if (g.is_d3d9)
+        {
+            if (!CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                       &g.d3d9_color_stage, &g.color_stage, w, h))
+            { ReleaseShared(); return false; }
+            // The CPU fallback presents through the detached x64 carrier and
+            // never copies its output back into D3D9. Avoid a second unsupported
+            // shared-resource attempt and an unused native-size allocation.
+            if (!g.d3d9_cpu_bridge &&
+                !CreateD3D9SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                       &g.d3d9_output_stage, &g.d3d9_output_stage11,
+                                       0, 0, false))
+            { ReleaseShared(); return false; }
+        }
+        else if (g.is_d3d10)
+        {
+            // Scale on the D3D10.1 side before the shared D3D11 handoff. The
+            // previous path synchronized a native-sized texture and only then
+            // reduced it, which made BioShock pay the expensive interop cost at
+            // full resolution.
+            if (!CreateD3D10SharedStage(w, h, g.color_fmt,
+                                        &g.d3d10_color_stage, &g.color_stage) ||
+                !CreateD3D10SharedStage(backbuffer_w, backbuffer_h, g.color_fmt,
+                                        &g.d3d10_output_stage, &g.d3d9_output_stage11))
+            { ReleaseShared(); return false; }
+            if (!MakeD3D10DownsamplePipeline())
+            { ReleaseShared(); return false; }
+        }
+        else
+        {
+            D3D11_TEXTURE2D_DESC sd = {};
+            sd.Width            = backbuffer_w;
+            sd.Height           = backbuffer_h;
+            sd.MipLevels        = 1;
+            sd.ArraySize        = 1;
+            sd.Format           = bb_fmt;
+            sd.SampleDesc.Count = 1;
+            sd.Usage            = D3D11_USAGE_DEFAULT;
+            sd.BindFlags        = D3D11_BIND_SHADER_RESOURCE;
+            if (FAILED(g.dev->CreateTexture2D(&sd, nullptr, &g.color_stage)))
+            { Log("[feed32] work-resolution staging texture failed (%ux%u fmt=%u)", backbuffer_w, backbuffer_h, bb_fmt); ReleaseShared(); return false; }
+        }
+
+        D3D11_SHADER_RESOURCE_VIEW_DESC ss = {};
+        ss.Format              = g.color_fmt;  // typed view, in case the backbuffer is TYPELESS
+        ss.ViewDimension       = D3D11_SRV_DIMENSION_TEXTURE2D;
+        ss.Texture2D.MipLevels = 1;
+        if (FAILED(g.dev->CreateShaderResourceView(g.color_stage, &ss, &g.color_stage_srv)))
+        { Log("[feed32] work-resolution staging SRV failed"); ReleaseShared(); return false; }
+
+        if (g.is_d3d10)
+            Log("[feed32] D3D10.1 pre-interop source downsample: %ux%u -> %ux%u shared transport",
+                backbuffer_w, backbuffer_h, w, h);
+        else
+            Log("[feed32] work-resolution source: %ux%u staging copy -> %ux%u", backbuffer_w, backbuffer_h, w, h);
+    }
+
+    if (legacy_surface_bridge)
+    {
+        if (g.d3d9_output_stage11 != nullptr)
+        {
+            D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+            rv.Format = g.color_fmt; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+            if (FAILED(g.dev->CreateRenderTargetView(g.d3d9_output_stage11, &rv, &g.d3d9_output_rtv)))
+            { Log("[feed32] legacy output RTV failed"); ReleaseShared(); return false; }
+        }
+
+        const bool guides_at_work_resolution = g.d3d9_cpu_bridge || g.is_d3d10;
+        const UINT guide_w = guides_at_work_resolution ? g.width : g.backbuffer_width;
+        const UINT guide_h = guides_at_work_resolution ? g.height : g.backbuffer_height;
+        auto make_neutral = [guide_w, guide_h](DXGI_FORMAT fmt, ID3D11Texture2D **tex, ID3D11ShaderResourceView **srv, const FLOAT clear[4]) -> bool {
+            D3D11_TEXTURE2D_DESC td = {};
+            td.Width = guide_w; td.Height = guide_h; td.MipLevels = 1; td.ArraySize = 1;
+            td.Format = fmt; td.SampleDesc.Count = 1; td.Usage = D3D11_USAGE_DEFAULT;
+            td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+            if (FAILED(g.dev->CreateTexture2D(&td, nullptr, tex)) ||
+                FAILED(g.dev->CreateShaderResourceView(*tex, nullptr, srv))) return false;
+            ID3D11RenderTargetView *neutral_rtv = nullptr;
+            if (FAILED(g.dev->CreateRenderTargetView(*tex, nullptr, &neutral_rtv))) return false;
+            g.ctx4->ClearRenderTargetView(neutral_rtv, clear);
+            neutral_rtv->Release();
+            return true;
+        };
+        const FLOAT zero_mv[4] = {0, 0, 0, 0};
+        const FLOAT far_depth[4] = {1, 1, 1, 1};
+        if (!make_neutral(DXGI_FORMAT_R16G16_FLOAT, &g.d3d9_zero_mv, &g.d3d9_zero_mv_srv, zero_mv) ||
+            !make_neutral(DXGI_FORMAT_R32_FLOAT, &g.d3d9_zero_depth, &g.d3d9_zero_depth_srv, far_depth))
+        { Log("[feed32] legacy neutral guide creation failed"); ReleaseShared(); return false; }
+        if (g.d3d9_cpu_bridge && (backbuffer_w != w || backbuffer_h != h))
+        {
+            const unsigned long long source_pixels = static_cast<unsigned long long>(backbuffer_w) * backbuffer_h;
+            const unsigned long long work_pixels = static_cast<unsigned long long>(w) * h;
+            const unsigned saved = source_pixels != 0
+                ? static_cast<unsigned>(100ull - (work_pixels * 100ull / source_pixels)) : 0;
+            Log("[feed32] classic D3D9 pre-readback downsample: %ux%u -> %ux%u (CPU transfer reduced about %u%%)",
+                backbuffer_w, backbuffer_h, w, h, saved);
+        }
+    }
+
+    if (!EnsureHost()) return false;
+
+    FeedBuild b = {};
+    b.width          = w;
+    b.height         = h;
+    b.color_fmt      = g.color_fmt;
+    b.output_fmt     = g.output_fmt;
+    b.hdr            = hdr ? 1 : 0;
+    b.depth_inverted = inverted ? 1 : 0;
+    b.flags_override = g_cfg.flags;
+    b.transport      = g_cfg.mode == 1 ? 1 : 0;
+    b.mv_scale_x     = g_cfg.mv_scale_x;
+    b.mv_scale_y     = g_cfg.mv_scale_y;
+    for (int i = 0; i < FEED_SLOTS; ++i)
+        b.tex[i] = reinterpret_cast<uintptr_t>(g.tex_handle[i]);
+
+    Breadcrumb("asking the host to build");
+    BYTE tag = 'B';
+    FeedBuildAck ack = {};
+    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
+    { HostLost("build exchange failed"); return false; }
+    if (!ack.ok)
+    {
+        Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        return false;
+    }
+
+    if (g.fence_in == nullptr || g.fence_out == nullptr)
+    {
+        ID3D11Device5 *dev5 = nullptr;
+        if (FAILED(g.dev->QueryInterface(__uuidof(ID3D11Device5), reinterpret_cast<void **>(&dev5))) || dev5 == nullptr)
+        { FeedDisable("ID3D11Device5 unavailable (Windows 10 1703+ required)"); return false; }
+        HRESULT h1 = dev5->OpenSharedFence(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in)),
+                                           __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g.fence_in));
+        HRESULT h2 = dev5->OpenSharedFence(reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out)),
+                                           __uuidof(ID3D11Fence), reinterpret_cast<void **>(&g.fence_out));
+        dev5->Release();
+        if (FAILED(h1) || FAILED(h2)) { Log("[feed32] OpenSharedFence failed 0x%08X/0x%08X", h1, h2); return false; }
+    }
+
+    Log("[feed32] shared set ready: %ux%u (%d%% of %ux%u) color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
+        w, h, g_cfg.work_resolution, backbuffer_w, backbuffer_h,
+        g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    g.built      = true;
+    g.need_reset = true;
+    g.consecutive_fails = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// OpenGL client: the host creates the shared set and duplicates the handles in,
+// because GL memory objects are import-only. Everything else about the protocol is
+// unchanged -- the host's 'B' and 'F' handlers do not care which API asked.
+// ---------------------------------------------------------------------------
+
+static bool BuildSharedGl(UINT w, UINT h, DXGI_FORMAT bb_fmt, uint64_t rtv_handle)
+{
+    Breadcrumb("building the shared textures (OpenGL)");
+    ReleaseShared();
+
+    g.width  = w;
+    g.height = h;
+    g.backbuffer_width  = w;   // v1 GL is DLAA at 100%: no work-resolution scaling
+    g.backbuffer_height = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = GlSafeColorFormat(TypedColorFormat(bb_fmt));
+    g.output_fmt = g_cfg.mode == 1 ? g.color_fmt : GlSafeColorFormat(OutputFormatFor(g.color_fmt));
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    { FeedDisable("unsupported backbuffer format"); return false; }
+    const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : IsHdrFormat(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (!EnsureHost()) return false;
+
+    FeedBuild b = {};
+    b.width          = w;
+    b.height         = h;
+    b.color_fmt      = g.color_fmt;
+    b.output_fmt     = g.output_fmt;
+    b.hdr            = hdr ? 1 : 0;
+    b.depth_inverted = inverted ? 1 : 0;
+    b.flags_override = g_cfg.flags;
+    b.transport      = g_cfg.mode == 1 ? 1 : 0;
+    b.mv_scale_x     = g_cfg.mv_scale_x;
+    b.mv_scale_y     = g_cfg.mv_scale_y;
+    // b.tex stays zero: on this path the host creates, and answers with its handles.
+
+    Breadcrumb("asking the host to build (OpenGL)");
+    BYTE tag = 'B';
+    FeedBuildAck ack = {};
+    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
+    { HostLost("build exchange failed"); return false; }
+
+    // Own the duplicated handles before any early return can drop them -- see the same
+    // step in BuildSharedVk for why the failing build is exactly when this bites.
+    for (int i = 0; i < FEED_SLOTS; ++i)
+        g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+
+    if (!ack.ok)
+    {
+        Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        return false;
+    }
+
+    // The host owns the Output format on every path where it owns the texture. Today
+    // this always agrees with what we asked for -- GlSafeColorFormat has already ruled
+    // out the one format (BGRA8) the host's typed-UAV-store fallback can change -- but
+    // trusting its answer rather than our assumption is what keeps the two in step.
+    if (ack.output_fmt != 0 && static_cast<DXGI_FORMAT>(ack.output_fmt) != g.output_fmt)
+    {
+        Log("[feed32] the host created the Output as %s, not the requested %s",
+            FeedFmtName(static_cast<DXGI_FORMAT>(ack.output_fmt)), FeedFmtName(g.output_fmt));
+        g.output_fmt = static_cast<DXGI_FORMAT>(ack.output_fmt);
+    }
+
+    // The fences are per session, not per build: import them once.
+    if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
+    {
+        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
+        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
+        g.gl_sem_in  = FeedGlImportFence(&g.gl, g.fence_in_handle);
+        g.gl_sem_out = FeedGlImportFence(&g.gl, g.fence_out_handle);
+        Log("[feed32] D3D12 fence -> GL semaphore import: in=%s out=%s",
+            g.gl_sem_in ? "OK" : "FAILED", g.gl_sem_out ? "OK" : "FAILED");
+        if (g.gl_sem_in == 0 || g.gl_sem_out == 0)
+        { FeedDisable("cross-process fence import failed (see dlss5-feed.log)"); return false; }
+    }
+
+    static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                                  DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
+    for (int i = 0; i < FEED_SLOTS; ++i)
+    {
+        const DXGI_FORMAT f = i == FEED_COLOR ? g.color_fmt : i == FEED_OUTPUT ? g.output_fmt : kFmt[i];
+        const GLenum glf = FeedGlFormat(f);
+        if (glf == 0 || g.tex_handle[i] == nullptr || ack.tex_size[i] == 0 ||
+            !FeedGlImportImage(&g.gl, g.tex_handle[i], ack.tex_size[i],
+                               static_cast<GLsizei>(w), static_cast<GLsizei>(h), glf,
+                               &g.gl_tex[i], &g.gl_memobj[i]))
+        {
+            Log("[feed32] texture import FAILED: slot %d %ux%u fmt=%u (%llu bytes, GL error 0x%04X)",
+                i, w, h, f, static_cast<unsigned long long>(ack.tex_size[i]), FeedGlDrainErrors(&g.gl));
+            ReleaseShared();
+            return false;
+        }
+    }
+
+    if (g.gl_fbo_read == 0) g.gl.GenFramebuffers(1, &g.gl_fbo_read);
+    if (g.gl_fbo_draw == 0) g.gl.GenFramebuffers(1, &g.gl_fbo_draw);
+    if (g.gl_fbo_read == 0 || g.gl_fbo_draw == 0)
+    { Log("[feed32] glGenFramebuffers failed"); ReleaseShared(); return false; }
+
+    {
+        FeedGlStateGuard guard(&g.gl);
+        const GLenum ty = FeedGlHandleType(rtv_handle);
+        const GLint enc = FeedGlColorEncoding(&g.gl, g.gl_fbo_read, rtv_handle);
+        Log("[feed32] technique target: %s (GL object type 0x%04X), colour encoding %s",
+            rtv_handle == 0 ? "the DEFAULT framebuffer" :
+            ty == GL_RENDERBUFFER ? "a renderbuffer" :
+            ty == GL_TEXTURE_2D ? "a GL_TEXTURE_2D" : "an unexpected GL object",
+            ty, enc == GL_SRGB ? "GL_SRGB" : enc == GL_LINEAR ? "GL_LINEAR" : "unknown");
+    }
+
+    Log("[feed32] shared set ready (OpenGL): %ux%u color fmt=%u output fmt=%u (host ngx 0x%08X, %s)",
+        w, h, g.color_fmt, g.output_fmt, ack.ngx_result, g_cfg.mode == 1 ? "transport" : "DLSS");
+    g.built      = true;
+    g.need_reset = true;
+    g.consecutive_fails = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Vulkan client (issue #15: 32-bit games on DXVK). The host creates the shared set
+// here too -- D3D12 cannot open memory Vulkan exported -- and we import it as
+// VkImages, exactly as the 64-bit add-on's Vulkan transport does in-process.
+//
+// The division of labour is the 64-bit path's, unchanged: raw vkCmd* for the copies
+// (recorded into ReShade's own command buffer, so they are simply more commands in
+// the buffer it is already building), and ReShade for every QUEUE operation. That
+// second half matters -- a raw vkQueueSubmit would race ReShade's and the game's
+// submits -- and it is possible because in ReShade's Vulkan backend an api::fence
+// handle IS a VkSemaphore, so our imported timeline semaphores can be handed straight
+// back to it.
+// ---------------------------------------------------------------------------
+
+// Resolve the raw entry points from the game's own VkDevice. Once per device; the
+// failure path is where a missing interop extension is diagnosed.
+static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
+{
+    if (g.vk.ok) return true;
+
+    g.rs_dev   = rt->get_device();
+    g.rs_queue = rt->get_command_queue();
+    if (g.rs_dev == nullptr || g.rs_queue == nullptr)
+    { FeedDisable("the ReShade device/queue is not reachable"); return false; }
+
+    if (FeedVkLoad(&g.vk, FeedVkDispatch<VkDevice>(g.rs_dev->get_native())))
+    {
+        Log("[feed32] Vulkan: interop entry points resolved on device %p (thread %lu)",
+            (void *)g.vk.dev, GetCurrentThreadId());
+        return true;
+    }
+
+    // The KHR external-interop extensions were not enabled at vkCreateDevice. The
+    // add-on's own hook (feed_vk_hook.h) normally appends them; if it never saw this
+    // device -- DXVK resolved vkCreateDevice some way the hook does not cover, or the
+    // hook could not be installed at all -- the out-of-process layer is the fallback.
+    Log("[feed32] the Vulkan external-memory/semaphore entry points are missing: the KHR external-interop");
+    Log("[feed32] extensions were not enabled on this device at vkCreateDevice.");
+    if (g_vk_create_device_target == nullptr)
+        Log("[feed32] The add-on's vkCreateDevice hook was NOT installed (see the hook lines above).");
+    else if (g_vk_hook_devices == 0)
+        Log("[feed32] The add-on's vkCreateDevice hook was installed but never called: this game creates its device some way it does not intercept.");
+    else
+        Log("[feed32] The hook did run (%d vkCreateDevice call(s)); check its per-extension lines above for what the driver refused.", g_vk_hook_devices);
+    Log("[feed32] FALLBACK: launch the game through layer\\x86\\run-with-feed-layer32.bat (the 32-bit VK_LAYER_feed_vk appends them from outside).");
+    FeedDisable("the Vulkan interop extensions are missing on this device -- see dlss5-feed.log");
+    return false;
+}
+
+static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
+{
+    Breadcrumb("building the shared textures (Vulkan)");
+    ReleaseShared();
+
+    g.width  = w;
+    g.height = h;
+    g.backbuffer_width  = w;   // v1 Vulkan is DLAA at 100%: no work-resolution scaling
+    g.backbuffer_height = h;
+    g.bb_fmt     = bb_fmt;
+    g.color_fmt  = FeedFmtTypedColor(bb_fmt);
+    if (g.color_fmt == DXGI_FORMAT_UNKNOWN)
+    {
+        Log("[feed32] backbuffer format %u (%s) is not supported", bb_fmt, FeedFmtName(bb_fmt));
+        FeedDisable("unsupported backbuffer format");
+        return false;
+    }
+    // Transport test copies Color->Output host-side with CopyTextureRegion: same format
+    // then. Otherwise ask for the channel order the backbuffer has, so the way home is a
+    // raw vkCmdCopyImage -- the host gets the final say (see ack.output_fmt below).
+    const DXGI_FORMAT want_output = g_cfg.mode == 1 ? g.color_fmt : FeedFmtOutputFor(g.color_fmt);
+    const bool hdr      = g_cfg.hdr >= 0 ? g_cfg.hdr != 0 : FeedFmtIsHdr(g.color_fmt);
+    const bool inverted = g_cfg.depth_inverted >= 0 ? g_cfg.depth_inverted != 0 : g.depth_reversed;
+
+    if (!EnsureHost()) return false;
+
+    FeedBuild b = {};
+    b.width          = w;
+    b.height         = h;
+    b.color_fmt      = g.color_fmt;
+    b.output_fmt     = want_output;
+    b.hdr            = hdr ? 1 : 0;
+    b.depth_inverted = inverted ? 1 : 0;
+    b.flags_override = g_cfg.flags;
+    b.transport      = g_cfg.mode == 1 ? 1 : 0;
+    b.mv_scale_x     = g_cfg.mv_scale_x;
+    b.mv_scale_y     = g_cfg.mv_scale_y;
+    // b.tex stays zero: on this path the host creates, and answers with its handles.
+
+    Breadcrumb("asking the host to build (Vulkan)");
+    BYTE tag = 'B';
+    FeedBuildAck ack = {};
+    if (!PipeWrite(&tag, 1) || !PipeWrite(&b, sizeof(b)) || !PipeRead(&ack, sizeof(ack)))
+    { HostLost("build exchange failed"); return false; }
+
+    // Take ownership of the duplicated handles NOW, before any early return can drop
+    // them on the floor. The host duplicates all four into this process and fills
+    // ack.tex[] whether or not the build as a whole succeeded -- the common failure is
+    // the textures being made fine and then CreateFeature failing -- and g.tex_handle[]
+    // is the only thing ReleaseShared closes. Every path out of here runs ReleaseShared
+    // first on the next attempt, so this is what keeps a retry loop from leaking four
+    // handles a go. Zeros from a host that did not create anything are harmless.
+    for (int i = 0; i < FEED_SLOTS; ++i)
+        g.tex_handle[i] = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.tex[i]));
+
+    if (!ack.ok)
+    {
+        Log("[feed32] host build failed (ngx 0x%08X)", ack.ngx_result);
+        return false;
+    }
+
+    // The host owns the Output format: only its device can be asked whether a typed UAV
+    // store to BGRA8 exists on this GPU, and it falls back to RGBA8 where it does not.
+    g.output_fmt = ack.output_fmt != 0 ? static_cast<DXGI_FORMAT>(ack.output_fmt) : want_output;
+    if (g.output_fmt != want_output)
+        Log("[feed32] the host created the Output as %s, not the requested %s",
+            FeedFmtName(g.output_fmt), FeedFmtName(want_output));
+
+    // The fences are per session, not per build: import them once.
+    if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+    {
+        g.fence_in_handle  = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_in));
+        g.fence_out_handle = reinterpret_cast<HANDLE>(static_cast<uintptr_t>(ack.fence_out));
+        g.vk_sem_in  = FeedVkImportFence(&g.vk, g.fence_in_handle);
+        g.vk_sem_out = FeedVkImportFence(&g.vk, g.fence_out_handle);
+        Log("[feed32] D3D12 fence -> Vulkan timeline semaphore import: in=%s out=%s",
+            g.vk_sem_in  != VK_NULL_HANDLE ? "OK" : "FAILED",
+            g.vk_sem_out != VK_NULL_HANDLE ? "OK" : "FAILED");
+        if (g.vk_sem_in == VK_NULL_HANDLE || g.vk_sem_out == VK_NULL_HANDLE)
+        { FeedDisable("cross-process fence import failed (see dlss5-feed.log)"); return false; }
+        // Hand them back to ReShade as api::fence handles, which is what they already are.
+        g.rs_fence_in  = { FeedVkValue(g.vk_sem_in) };
+        g.rs_fence_out = { FeedVkValue(g.vk_sem_out) };
+    }
+
+    static const DXGI_FORMAT kFmt[FEED_SLOTS] = { DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN,
+                                                  DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT };
+    for (int i = 0; i < FEED_SLOTS; ++i)
+    {
+        const DXGI_FORMAT f = i == FEED_COLOR ? g.color_fmt : i == FEED_OUTPUT ? g.output_fmt : kFmt[i];
+        const VkFormat vkf = FeedVkFormat(f);
+        // Only the Output is written through a UAV, so only it asks for storage usage --
+        // the same split the 64-bit add-on makes, matching the D3D12 resource's flags.
+        const bool storage = i == FEED_OUTPUT;
+        if (vkf == VK_FORMAT_UNDEFINED || g.tex_handle[i] == nullptr ||
+            !FeedVkImportImage(&g.vk, g.tex_handle[i], w, h, vkf, storage,
+                               &g.vk_img[i], &g.vk_mem[i]))
+        {
+            Log("[feed32] texture import FAILED: slot %d %ux%u %s (raw Vulkan external-memory import)",
+                i, w, h, FeedFmtName(f));
+            if (storage && f == DXGI_FORMAT_B8G8R8A8_UNORM)
+                Log("[feed32] the Output is the one slot imported with VK_IMAGE_USAGE_STORAGE_BIT, and this is "
+                    "a BGRA8 one -- if the driver does not support storage images in that format, that is why. "
+                    "Forcing an RGBA8 backbuffer, or a game/DXVK setting that yields one, works around it.");
+            ReleaseShared();
+            return false;
+        }
+    }
+
+    Log("[feed32] copy home: %s (output %s -> backbuffer %s)",
+        FeedFmtSameTexelLayout(g.output_fmt, bb_fmt) ? "raw vkCmdCopyImage"
+                                                     : "vkCmdBlitImage (CONVERTS: expect issue #11 washout)",
+        FeedFmtName(g.output_fmt), FeedFmtName(bb_fmt));
+    Log("[feed32] shared set ready (Vulkan): %ux%u color %s output %s (host ngx 0x%08X, %s)",
+        w, h, FeedFmtName(g.color_fmt), FeedFmtName(g.output_fmt), ack.ngx_result,
+        g_cfg.mode == 1 ? "transport" : "DLSS");
+    g.built      = true;
+    g.need_reset = true;
+    g.consecutive_fails = 0;
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Guide preparation: a straight copy at 100%, one resample pass below it
+// ---------------------------------------------------------------------------
+
+static bool CopyOrResampleInputs(ID3D11DeviceContext *ctx,
+                                 ID3D11Texture2D *color, ID3D11Texture2D *mv, ID3D11Texture2D *depth,
+                                 ID3D11ShaderResourceView *mv_srv, ID3D11ShaderResourceView *depth_srv,
+                                 UINT source_w, UINT source_h)
+{
+    if (source_w == g.width && source_h == g.height)
+    {
+        ctx->CopyResource(g.tex[FEED_COLOR], color);
+        ctx->CopyResource(g.tex[FEED_DEPTH], depth);
+        ctx->CopyResource(g.tex[FEED_MV], mv);
+        return true;
+    }
+
+    if (g.color_stage == nullptr || g.color_stage_srv == nullptr || g.resample_ps == nullptr) return false;
+    if (mv_srv == nullptr || depth_srv == nullptr) return false;
+    if (g.color_stage != color) ctx->CopyResource(g.color_stage, color);
+
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    if (FAILED(ctx->Map(g.resample_cb, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    { Log("[feed32] resample constant-buffer map failed"); return false; }
+    const float constants[4] = {
+        static_cast<float>(g.width)  / static_cast<float>(source_w),
+        static_cast<float>(g.height) / static_cast<float>(source_h), 0.0f, 0.0f
+    };
+    memcpy(mapped.pData, constants, sizeof(constants));
+    ctx->Unmap(g.resample_cb, 0);
+
+    ID3D11RenderTargetView   *old_rtvs[3] = {};
+    ID3D11DepthStencilView   *old_dsv = nullptr;
+    ID3D11VertexShader       *old_vs = nullptr;
+    ID3D11PixelShader        *old_ps = nullptr;
+    ID3D11ShaderResourceView *old_srvs[3] = {};
+    ID3D11SamplerState       *old_samplers[2] = {};
+    ID3D11Buffer             *old_cb = nullptr;
+    ID3D11InputLayout        *old_il = nullptr;
+    ID3D11BlendState         *old_bs = nullptr; FLOAT old_bf[4] = {}; UINT old_mask = 0;
+    ID3D11DepthStencilState  *old_ds = nullptr; UINT old_sref = 0;
+    ID3D11RasterizerState    *old_rs = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY  old_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT nvp = 1; D3D11_VIEWPORT old_vp = {};
+
+    ctx->OMGetRenderTargets(3, old_rtvs, &old_dsv);
+    ctx->VSGetShader(&old_vs, nullptr, nullptr);
+    ctx->PSGetShader(&old_ps, nullptr, nullptr);
+    ctx->PSGetShaderResources(0, 3, old_srvs);
+    ctx->PSGetSamplers(0, 2, old_samplers);
+    ctx->PSGetConstantBuffers(0, 1, &old_cb);
+    ctx->IAGetInputLayout(&old_il);
+    ctx->IAGetPrimitiveTopology(&old_topo);
+    ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
+    ctx->OMGetDepthStencilState(&old_ds, &old_sref);
+    ctx->RSGetState(&old_rs);
+    ctx->RSGetViewports(&nvp, &old_vp);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width    = static_cast<float>(g.width);
+    vp.Height   = static_cast<float>(g.height);
+    vp.MaxDepth = 1.0f;
+    ID3D11RenderTargetView   *rtvs[3] = { g.input_rtv[FEED_COLOR], g.input_rtv[FEED_MV], g.input_rtv[FEED_DEPTH] };
+    ID3D11ShaderResourceView *srvs[3] = { g.color_stage_srv, mv_srv, depth_srv };
+    ID3D11SamplerState       *samplers[2] = { g.blit_sampler, g.point_sampler };
+
+    ctx->RSSetViewports(1, &vp);
+    ctx->OMSetRenderTargets(3, rtvs, nullptr);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->RSSetState(nullptr);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(g.blit_vs, nullptr, 0);
+    ctx->PSSetShader(g.resample_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 3, srvs);
+    ctx->PSSetSamplers(0, 2, samplers);
+    ctx->PSSetConstantBuffers(0, 1, &g.resample_cb);
+    ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView *null_srvs[3] = {};
+    ID3D11RenderTargetView   *null_rtvs[3] = {};
+    ctx->PSSetShaderResources(0, 3, null_srvs);
+    ctx->OMSetRenderTargets(3, null_rtvs, nullptr);
+
+    ctx->OMSetRenderTargets(3, old_rtvs, old_dsv);
+    ctx->VSSetShader(old_vs, nullptr, 0);
+    ctx->PSSetShader(old_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 3, old_srvs);
+    ctx->PSSetSamplers(0, 2, old_samplers);
+    ctx->PSSetConstantBuffers(0, 1, &old_cb);
+    ctx->IASetInputLayout(old_il);
+    ctx->IASetPrimitiveTopology(old_topo);
+    ctx->OMSetBlendState(old_bs, old_bf, old_mask);
+    ctx->OMSetDepthStencilState(old_ds, old_sref);
+    ctx->RSSetState(old_rs);
+    if (nvp != 0) ctx->RSSetViewports(1, &old_vp);
+
+    for (auto *r : old_rtvs) SafeRelease(r);
+    SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps);
+    for (auto *r : old_srvs) SafeRelease(r);
+    for (auto *r : old_samplers) SafeRelease(r);
+    SafeRelease(old_cb); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// Copy-back blit (verbatim from the 64-bit add-on)
+// ---------------------------------------------------------------------------
+
+static void BlitOutputToBackbuffer(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv)
+{
+    ID3D11RenderTargetView   *old_rtv = nullptr;
+    ID3D11DepthStencilView   *old_dsv = nullptr;
+    ID3D11VertexShader       *old_vs  = nullptr;
+    ID3D11PixelShader        *old_ps  = nullptr;
+    ID3D11ShaderResourceView *old_srv = nullptr;
+    ID3D11SamplerState       *old_smp = nullptr;
+    ID3D11InputLayout        *old_il  = nullptr;
+    ID3D11BlendState         *old_bs  = nullptr; FLOAT old_bf[4]; UINT old_mask = 0;
+    ID3D11DepthStencilState  *old_ds  = nullptr; UINT old_sref = 0;
+    ID3D11RasterizerState    *old_rs  = nullptr;
+    D3D11_PRIMITIVE_TOPOLOGY  old_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+    UINT nvp = 1; D3D11_VIEWPORT old_vp = {};
+    ctx->OMGetRenderTargets(1, &old_rtv, &old_dsv);
+    ctx->VSGetShader(&old_vs, nullptr, nullptr);
+    ctx->PSGetShader(&old_ps, nullptr, nullptr);
+    ctx->PSGetShaderResources(0, 1, &old_srv);
+    ctx->PSGetSamplers(0, 1, &old_smp);
+    ctx->IAGetInputLayout(&old_il);
+    ctx->IAGetPrimitiveTopology(&old_topo);
+    ctx->OMGetBlendState(&old_bs, old_bf, &old_mask);
+    ctx->OMGetDepthStencilState(&old_ds, &old_sref);
+    ctx->RSGetState(&old_rs);
+    ctx->RSGetViewports(&nvp, &old_vp);
+
+    D3D11_VIEWPORT vp = {};
+    vp.Width    = static_cast<float>(g.backbuffer_width);
+    vp.Height   = static_cast<float>(g.backbuffer_height);
+    vp.MaxDepth = 1.0f;
+    ID3D11RenderTargetView *rtvs[] = { rtv };
+    ID3D11ShaderResourceView *srvs[] = { g.output_srv };
+    ID3D11SamplerState *smps[] = { g.blit_sampler };
+    ctx->OMSetRenderTargets(1, rtvs, nullptr);
+    ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+    ctx->OMSetDepthStencilState(nullptr, 0);
+    ctx->RSSetState(nullptr);
+    ctx->RSSetViewports(1, &vp);
+    ctx->IASetInputLayout(nullptr);
+    ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    ctx->VSSetShader(g.blit_vs, nullptr, 0);
+    ctx->PSSetShader(g.blit_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, srvs);
+    ctx->PSSetSamplers(0, 1, smps);
+    ctx->Draw(3, 0);
+
+    ID3D11ShaderResourceView *no_srv = nullptr;
+    ctx->PSSetShaderResources(0, 1, &no_srv);
+    ctx->OMSetRenderTargets(1, &old_rtv, old_dsv);
+    ctx->VSSetShader(old_vs, nullptr, 0);
+    ctx->PSSetShader(old_ps, nullptr, 0);
+    ctx->PSSetShaderResources(0, 1, &old_srv);
+    ctx->PSSetSamplers(0, 1, &old_smp);
+    ctx->IASetInputLayout(old_il);
+    ctx->IASetPrimitiveTopology(old_topo);
+    ctx->OMSetBlendState(old_bs, old_bf, old_mask);
+    ctx->OMSetDepthStencilState(old_ds, old_sref);
+    ctx->RSSetState(old_rs);
+    if (nvp) ctx->RSSetViewports(1, &old_vp);
+    SafeRelease(old_rtv); SafeRelease(old_dsv); SafeRelease(old_vs); SafeRelease(old_ps); SafeRelease(old_srv);
+    SafeRelease(old_smp); SafeRelease(old_il); SafeRelease(old_bs); SafeRelease(old_ds); SafeRelease(old_rs);
+}
+
+// ---------------------------------------------------------------------------
+// Per frame
+// ---------------------------------------------------------------------------
+
+static void TimingTick(LONGLONG entry, LONGLONG exit)
+{
+    if (g.qpf == 0)
+    {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        g.qpf = f.QuadPart;
+        g.span_start = entry;
+    }
+    g.cpu_ticks += (exit - entry);
+    if (++g.timed_frames < 600) return;
+    const double span_ms = 1000.0 * double(exit - g.span_start) / double(g.qpf);
+    const double cpu_ms  = 1000.0 * double(g.cpu_ticks) / double(g.qpf);
+    const double n       = double(g.timed_frames);
+    Log("[feed32] 600 frames: feed CPU %.2f ms/frame | frame interval %.2f ms (%.1f fps) | feed is %.0f%% of the frame",
+        cpu_ms / n, span_ms / n, 1000.0 / (span_ms / n), 100.0 * cpu_ms / span_ms);
+    g.cpu_ticks = 0;
+    g.timed_frames = 0;
+    g.span_start = exit;
+}
+
+static ID3D11Texture2D *AsTexture2D(ID3D11Resource *res, D3D11_TEXTURE2D_DESC *desc)
+{
+    if (res == nullptr) return nullptr;
+    ID3D11Texture2D *tex = nullptr;
+    if (FAILED(res->QueryInterface(__uuidof(ID3D11Texture2D), reinterpret_cast<void **>(&tex))) || tex == nullptr)
+        return nullptr;
+    tex->GetDesc(desc);
+    return tex;
+}
+
+static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv);
+
+static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    auto *dev_api = rt->get_device();
+    auto resource = dev_api->get_resource_from_view(rtv);
+    auto *source_object = reinterpret_cast<IUnknown *>(resource.handle);
+    if (source_object == nullptr) return;
+
+    // ReShade's D3D9 resource-view handle is an IDirect3DResource9. Depending
+    // on the game/backend, that may be either a surface directly or the parent
+    // texture (New Vegas uses the latter). Resolve a level-zero surface before
+    // falling through to the internal D3D10.1 effect-renderer route.
+    IDirect3DSurface9 *source9 = nullptr;
+    if (FAILED(source_object->QueryInterface(__uuidof(IDirect3DSurface9),
+            reinterpret_cast<void **>(&source9))) || source9 == nullptr)
+    {
+        IDirect3DTexture9 *source_texture9 = nullptr;
+        if (SUCCEEDED(source_object->QueryInterface(__uuidof(IDirect3DTexture9),
+                reinterpret_cast<void **>(&source_texture9))) && source_texture9 != nullptr)
+        {
+            const HRESULT surface_hr = source_texture9->GetSurfaceLevel(0, &source9);
+            source_texture9->Release();
+            if (FAILED(surface_hr)) source9 = nullptr;
+            static bool reported_d3d9_texture_target = false;
+            if (source9 != nullptr && !reported_d3d9_texture_target)
+            {
+                reported_d3d9_texture_target = true;
+                Log("[feed32] D3D9 effect target is a texture; capturing its level-zero surface");
+            }
+        }
+
+        if (source9 == nullptr)
+        {
+            static bool reported_d3d10_effect_target = false;
+            if (!reported_d3d10_effect_target)
+            {
+                reported_d3d10_effect_target = true;
+                Log("[feed32] D3D9 API exposes a non-D3D9 effect target; trying the ReShade D3D10.1 transport");
+            }
+            FeedFrameD3D10(rt, rtv);
+            return;
+        }
+    }
+
+    LARGE_INTEGER t0 = {}, t1 = {};
+    QueryPerformanceCounter(&t0);
+
+    // ReShade's D3D9 effect runtime may be backed by its internal D3D10.1
+    // renderer. get_native() is therefore not guaranteed to be the D3D9 device
+    // that owns this render target. The surface itself is authoritative.
+    struct ScopedD3D9Refs
+    {
+        IDirect3DSurface9 *surface = nullptr;
+        IDirect3DDevice9 *value = nullptr;
+        ~ScopedD3D9Refs()
+        {
+            if (value != nullptr) value->Release();
+            if (surface != nullptr) surface->Release();
+        }
+    } refs;
+    refs.surface = source9;
+    if (FAILED(source9->GetDevice(&refs.value)) || refs.value == nullptr) return;
+    IDirect3DDevice9 *const device9 = refs.value;
+
+    D3DSURFACE_DESC sd = {};
+    if (FAILED(source9->GetDesc(&sd))) return;
+
+    g.is_d3d9 = true;
+    g.is_d3d10 = false;
+    if (g.d3d9_device_lost)
+    {
+        const HRESULT cooperative = device9->TestCooperativeLevel();
+        if (cooperative != D3D_OK)
+            return; // the game owns Reset; do not touch its lost device while it recovers
+        g.d3d9_device_lost = false;
+        g.need_reset = true;
+        Log("[feed32] classic D3D9 device recovered; rebuilding the bridge on the new device state");
+    }
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+    if (!InitializeD3D9Transport(device9))
+    { FeedDisable("native D3D9 transport initialization failed"); return; }
+
+    // The classic (non-Ex) D3D9 fallback has a single CPU-uploaded input set.
+    // Never overwrite it while the x64 host still owns the preceding frame. More
+    // importantly, do not queue a GPU wait for that host here: if NGX pauses during
+    // a loading transition, that wait also blocks the game's Present indefinitely.
+    const ULONGLONG now = GetTickCount64();
+    if (g.d3d9_cpu_bridge && g.d3d9_pending_frame != 0)
+    {
+        if (g.fence_out != nullptr &&
+            g.fence_out->GetCompletedValue() >= g.d3d9_pending_frame)
+        {
+            Log("[feed32] classic D3D9 host frame %llu completed after the loading-safety timeout",
+                static_cast<unsigned long long>(g.d3d9_pending_frame));
+            g.d3d9_pending_frame = 0;
+            g.d3d9_pending_deadline = 0;
+            g.need_reset = true;
+            ++g.frames_done;
+            g.consecutive_fails = 0;
+            RestoreD3D9StartupFocusIfReady();
+        }
+        else
+        {
+            HideClassicD3D9Proxy();
+            if (g.d3d9_pending_deadline != 0 && now >= g.d3d9_pending_deadline)
+            {
+                // Leave the game's original Present path untouched for the rest of
+                // this run. The user can retry from the add-on page; a wedged host is
+                // never allowed to turn an old game's loading screen into a PC hang.
+                g.d3d9_pending_frame = 0;
+                g.d3d9_pending_deadline = 0;
+                FeedDisable("classic D3D9 host stopped completing frames during a loading transition");
+            }
+            return;
+        }
+    }
+    if (g.d3d9_cpu_bridge && now < g.d3d9_resume_after)
+    {
+        HideClassicD3D9Proxy();
+        return;
+    }
+    if (g.d3d9_cpu_bridge) g.d3d9_resume_after = 0;
+
+    const DXGI_FORMAT bb_fmt = FromD3D9Format(sd.Format);
+    UINT work_w = 0, work_h = 0;
+    ResolveWorkExtent(sd.Width, sd.Height, work_w, work_h);
+    bool ok = bb_fmt != DXGI_FORMAT_UNKNOWN;
+    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
+               sd.Width != g.backbuffer_width || sd.Height != g.backbuffer_height || bb_fmt != g.bb_fmt))
+    {
+        if (GetTickCount64() < g_retry_at) ok = false;
+        else
+        {
+            Log("[feed32] building native D3D9 bridge: %ux%u work (%d%%) -> %ux%u fmt9=%u/dxgi=%u",
+                work_w, work_h, g_cfg.work_resolution, sd.Width, sd.Height, sd.Format, bb_fmt);
+            ok = BuildShared(work_w, work_h, sd.Width, sd.Height, bb_fmt);
+            if (!ok && !g.disabled) FeedFail("native D3D9 shared build");
+        }
+    }
+
+    if (ok && g.built && HostAlive())
+    {
+        IDirect3DSurface9 *stage_in9 = nullptr;
+        bool captured = false;
+        bool loading_safety_pause = false;
+        bool device_lost = false;
+        const char *capture_failure = nullptr;
+        HRESULT capture_hr = S_OK;
+        const ULONGLONG capture_started = GetTickCount64();
+        if (SUCCEEDED(g.d3d9_color_stage->GetSurfaceLevel(0, &stage_in9)) && stage_in9 != nullptr)
+        {
+            if (g.d3d9_cpu_bridge)
+            {
+                // GetRenderTargetData performs the unavoidable GPU->CPU sync on
+                // classic D3D9. Upload to our local D3D11 staging texture; the
+                // normal resample/shared-input path continues from there.
+                D3DLOCKED_RECT locked = {};
+                const bool pre_readback_scale = sd.Width != g.width || sd.Height != g.height;
+                capture_hr = device9->StretchRect(source9, nullptr, stage_in9, nullptr,
+                                                  pre_readback_scale ? D3DTEXF_LINEAR : D3DTEXF_NONE);
+                // A few old drivers reject linear filtering for particular RT
+                // formats but still support StretchRect scaling. Retain a
+                // point-filter fallback rather than disabling the bridge.
+                if (FAILED(capture_hr) && pre_readback_scale)
+                    capture_hr = device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE);
+                if (FAILED(capture_hr)) capture_failure = "StretchRect";
+                if (SUCCEEDED(capture_hr))
+                {
+                    capture_hr = device9->GetRenderTargetData(stage_in9, g.d3d9_cpu_readback);
+                    if (FAILED(capture_hr)) capture_failure = "GetRenderTargetData";
+                }
+                if (SUCCEEDED(capture_hr))
+                {
+                    capture_hr = g.d3d9_cpu_readback->LockRect(&locked, nullptr, D3DLOCK_READONLY);
+                    if (FAILED(capture_hr)) capture_failure = "LockRect";
+                }
+                if (SUCCEEDED(capture_hr))
+                {
+                    g.ctx4->UpdateSubresource(g.color_stage, 0, nullptr, locked.pBits,
+                                              static_cast<UINT>(locked.Pitch), 0);
+                    g.d3d9_cpu_readback->UnlockRect();
+                    captured = CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                                    g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
+                                                    g.width, g.height);
+                    if (!captured) capture_failure = "D3D11 upload/resample";
+                }
+            }
+            else
+            {
+                captured = SUCCEEDED(device9->StretchRect(source9, nullptr, stage_in9, nullptr, D3DTEXF_NONE)) &&
+                           WaitForD3D9Copy() &&
+                           CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                                g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
+                                                sd.Width, sd.Height);
+            }
+        }
+        const ULONGLONG capture_ms = GetTickCount64() - capture_started;
+        if (g.d3d9_cpu_bridge && capture_ms > 250)
+        {
+            // GetRenderTargetData is synchronous on classic D3D9. If the GPU was
+            // unavailable for a quarter second, submitting more NR work immediately
+            // tends to starve games whose loader and Present share a thread. Give the
+            // game a short unprocessed recovery window instead.
+            loading_safety_pause = true;
+            captured = false;
+            g.d3d9_resume_after = GetTickCount64() + 1500;
+            g.need_reset = true;
+            HideClassicD3D9Proxy();
+            Log("[feed32] classic D3D9 capture took %llu ms; bypassing the pipeline for 1500 ms",
+                static_cast<unsigned long long>(capture_ms));
+        }
+        if (captured)
+        {
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+            g.ctx4->Signal(g.fence_in, n);
+            g.ctx4->Flush();
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm))) HostLost("D3D9 frame message failed");
+            else
+            {
+                if (g.d3d9_cpu_bridge)
+                {
+                    // The carrier's detached native-resolution window presents
+                    // the processed frame. Wait from the CPU with a hard deadline;
+                    // unlike ID3D11DeviceContext4::Wait this cannot poison the GPU
+                    // queue with an unsatisfiable wait if the host stalls or exits.
+                    if (WaitForHostFenceCpu(n, 250))
+                    {
+                        const UINT64 done = ++g.frames_done;
+                        g.consecutive_fails = 0;
+                        RestoreD3D9StartupFocusIfReady();
+                        if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                            Log("[feed32] frame %llu delivered (%ux%u, reset=%d, classic D3D9 CPU capture)",
+                                done, g.width, g.height, reset);
+                    }
+                    else
+                    {
+                        g.d3d9_pending_frame = n;
+                        // Feature creation in the x64 carrier can legitimately
+                        // hold its first NGX frame for several seconds. The game
+                        // is already back on its original D3D9 presentation path
+                        // here and no unsignalled wait was queued on either game
+                        // GPU stream, so allowing a longer CPU-side recovery
+                        // window is safe. The old three-second deadline raced NR
+                        // initialization in New Vegas and disabled the bridge a
+                        // fraction of a second before the carrier became ready.
+                        g.d3d9_pending_deadline = GetTickCount64() + 15000;
+                        g.d3d9_resume_after = GetTickCount64() + 1500;
+                        g.need_reset = true;
+                        HideClassicD3D9Proxy();
+                        Log("[feed32] classic D3D9 host frame %llu exceeded 250 ms; showing the original game while it recovers",
+                            static_cast<unsigned long long>(n));
+                    }
+                }
+                else
+                {
+                    g.ctx4->Wait(g.fence_out, n);
+                    g.fence_wait_queued = true;
+                    BlitOutputToBackbuffer(g.ctx4, g.d3d9_output_rtv);
+                    if (WaitForD3D11Copy())
+                    {
+                        g.fence_wait_queued = false; // the event query retired the wait and copy-back
+                        IDirect3DSurface9 *stage_out9 = nullptr;
+                        if (SUCCEEDED(g.d3d9_output_stage->GetSurfaceLevel(0, &stage_out9)) &&
+                            SUCCEEDED(device9->StretchRect(stage_out9, nullptr, source9, nullptr, D3DTEXF_NONE)) &&
+                            WaitForD3D9Copy())
+                        {
+                            const UINT64 done = ++g.frames_done;
+                            g.consecutive_fails = 0;
+                            if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                                Log("[feed32] frame %llu delivered (%ux%u, reset=%d, native D3D9)", done, g.width, g.height, reset);
+                        }
+                        SafeRelease(stage_out9);
+                    }
+                }
+            }
+        }
+        else if (!loading_safety_pause)
+        {
+            if (capture_failure != nullptr)
+                Log("[feed32] native D3D9 capture failed at %s: 0x%08X",
+                    capture_failure, static_cast<unsigned int>(capture_hr));
+            device_lost = capture_hr == D3DERR_DEVICELOST || capture_hr == D3DERR_DEVICENOTRESET;
+            if (!device_lost)
+                FeedFail("native D3D9 frame bridge");
+        }
+        SafeRelease(stage_in9);
+        if (device_lost)
+            PrepareClassicD3D9ForReset(capture_failure);
+    }
+    else if (ok && !HostAlive() && g.hproc != nullptr) HostLost("process died");
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// The OpenGL sibling of FeedFrame below: same protocol, same host, raw GL instead of
+// D3D11. No barriers of any kind -- every command enters the context's single in-order
+// stream, and the semaphores carry the cross-process release/acquire.
+static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
+        }
+        return;
+    }
+
+    const resource bb_res    = dev_api->get_resource_from_view(rtv);
+    const resource mv_res    = dev_api->get_resource_from_view(mv_srv);
+    const resource depth_res = dev_api->get_resource_from_view(d_srv);
+    if (mv_res.handle == 0 || depth_res.handle == 0) return;
+    // bb_res.handle == 0 is legal on GL and means the DEFAULT framebuffer, which the
+    // blit path attaches as FBO 0 + GL_BACK; only its description is then unavailable,
+    // so the sizes come from the motion vectors (backbuffer-sized by construction).
+
+    const resource_desc md = dev_api->get_resource_desc(mv_res);
+    const resource_desc dd = dev_api->get_resource_desc(depth_res);
+    const bool have_bb_desc = bb_res.handle != 0;
+    const resource_desc cd = have_bb_desc ? dev_api->get_resource_desc(bb_res) : md;
+    const UINT w = cd.texture.width, h = cd.texture.height;
+    // glCopyImageSubData needs real textures on both sides; effect textures always are,
+    // but checking it here turns a wrong assumption into a log line, not a black frame.
+    const bool guides_are_textures = FeedGlHandleType(mv_res.handle) == GL_TEXTURE_2D &&
+                                     FeedGlHandleType(depth_res.handle) == GL_TEXTURE_2D;
+    if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
+        cd.texture.samples != 1 || !guides_are_textures ||
+        md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u"
+                " | mv/depth GL types 0x%04X/0x%04X",
+                w, h, (unsigned)cd.texture.format, cd.texture.samples, md.texture.width, md.texture.height,
+                (unsigned)md.texture.format, dd.texture.width, dd.texture.height, (unsigned)dd.texture.format,
+                FeedGlHandleType(mv_res.handle), FeedGlHandleType(depth_res.handle));
+        }
+        return;
+    }
+
+    if (!g.gl.ok)
+    {
+        if (!FeedGlLoad(&g.gl))
+        {
+            Log("[feed32] OpenGL interop unavailable: %s", g.gl.missing);
+            Log("[feed32] renderer=\"%s\" version=\"%s\"", g.gl.renderer, g.gl.version);
+            Log("[feed32] extension query: %s", g.gl.diag);
+            Log("[feed32] GL_EXT_memory_object_win32 + GL_EXT_semaphore_win32 are NVIDIA-supported on every");
+            Log("[feed32] DLSS-capable driver. Their absence means this frame is not being rendered on the");
+            Log("[feed32] NVIDIA GPU -- on a hybrid laptop, force the game onto it (Windows graphics settings).");
+            FeedDisable("the OpenGL interop extensions are missing on the rendering GPU -- see dlss5-feed.log");
+            return;
+        }
+        g.gl_ctx = g.gl.wglGetCurrentContext();
+        Log("[feed32] OpenGL: renderer=\"%s\" version=\"%s\" context=%p thread=%lu (interop extensions present)",
+            g.gl.renderer, g.gl.version, (void *)g.gl_ctx, GetCurrentThreadId());
+        Log("[feed32] extension query: %s", g.gl.diag);
+    }
+    // GL names live in the share group of the context current at import: a context
+    // change strands every one of them, so start over on the new one.
+    if (g.gl.wglGetCurrentContext() != g.gl_ctx)
+    {
+        Log("[feed32] the GL context changed (%p -> %p); rebuilding on the new one",
+            (void *)g.gl_ctx, (void *)g.gl.wglGetCurrentContext());
+        HostClose();
+        ReleaseShared();
+        g.gl_ctx = g.gl.wglGetCurrentContext();
+        g.gl_fbo_read = g.gl_fbo_draw = 0;
+    }
+
+    const DXGI_FORMAT bbf = have_bb_desc ? static_cast<DXGI_FORMAT>(cd.texture.format)
+                                         : DXGI_FORMAT_R8G8B8A8_UNORM;
+    bool ok = true;
+    if (!g.built || w != g.width || h != g.height || bbf != g.bb_fmt)
+    {
+        if (GetTickCount64() < g_retry_at)
+            ok = false;                       // backing off after a failed build
+        else
+        {
+            Log("[feed32] building: %ux%u backbuffer fmt=%u (OpenGL, depth reversed=%d, mode=%d)",
+                w, h, bbf, g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildSharedGl(w, h, bbf, bb_res.handle);
+            if (ok) g.consecutive_fails = 0;
+            else if (!g.disabled) FeedFail("shared build");
+        }
+    }
+
+    if (ok && g.built)
+    {
+        if (!HostAlive()) { HostLost("process died"); }
+        else
+        {
+            FeedGlStateGuard guard(&g.gl);
+
+            Breadcrumb("copying inputs (OpenGL)");
+            FeedGlCopy(&g.gl, FeedGlHandleName(mv_res.handle),    g.gl_tex[FEED_MV],    w, h);
+            FeedGlCopy(&g.gl, FeedGlHandleName(depth_res.handle), g.gl_tex[FEED_DEPTH], w, h);
+            if (!FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                            bb_res.handle, false, g.gl_tex[FEED_COLOR], true, w, h))
+            {
+                static bool said = false;
+                if (!said) { said = true; Log("[feed32] the colour capture blit could not be set up (incomplete framebuffer)"); }
+                FeedFail("colour capture");
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
+
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            {
+                const GLuint inputs[3] = { g.gl_tex[FEED_COLOR], g.gl_tex[FEED_DEPTH], g.gl_tex[FEED_MV] };
+                FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, 3);   // includes the glFlush the host's wait needs
+            }
+
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+                HostLost("frame message failed");
+            else
+            {
+                Breadcrumb("waiting for the host's result (OpenGL)");
+                const GLuint outputs[1] = { g.gl_tex[FEED_OUTPUT] };
+                FeedGlWait(&g.gl, g.gl_sem_out, n, outputs, 1);   // server-side; the host CPU-signals on failure
+                g.fence_wait_queued = true;                       // HostDrain must resolve this before any close
+                FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
+                           g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false, w, h);
+                const UINT64 done = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d, OpenGL)", done, g.width, g.height, reset);
+            }
+
+            if (g.frames_done <= static_cast<UINT64>(g_cfg.log_frames))
+                if (const GLenum e = FeedGlDrainErrors(&g.gl))
+                    Log("[feed32] GL error 0x%04X during frame %llu", e, g.frames_done);
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// The Vulkan sibling of FeedFrame below: the same protocol and the same host, with
+// raw vkCmd* copies recorded into ReShade's command buffer and every queue operation
+// handed back to ReShade. Structurally this is the 64-bit add-on's FeedFrameVk with
+// the D3D12 middle replaced by the pipe -- and with no MASK slot, which the 32-bit
+// protocol has never carried.
+static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_list *cl,
+                        reshade::api::resource_view rtv)
+{
+    using namespace reshade::api;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    device *dev_api = rt->get_device();
+
+    resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
+        }
+        return;
+    }
+
+    const resource bb_res    = dev_api->get_resource_from_view(rtv);
+    const resource mv_res    = dev_api->get_resource_from_view(mv_srv);
+    const resource depth_res = dev_api->get_resource_from_view(d_srv);
+    if (bb_res.handle == 0 || mv_res.handle == 0 || depth_res.handle == 0) return;
+
+    const resource_desc cd = dev_api->get_resource_desc(bb_res);
+    const resource_desc md = dev_api->get_resource_desc(mv_res);
+    const resource_desc dd = dev_api->get_resource_desc(depth_res);
+    const UINT w = cd.texture.width, h = cd.texture.height;
+    if (w != md.texture.width || h != md.texture.height || w != dd.texture.width || h != dd.texture.height ||
+        cd.texture.samples != 1 ||
+        md.texture.format != format::r16g16_float || dd.texture.format != format::r32_float)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u",
+                w, h, (unsigned)cd.texture.format, cd.texture.samples, md.texture.width, md.texture.height,
+                (unsigned)md.texture.format, dd.texture.width, dd.texture.height, (unsigned)dd.texture.format);
+        }
+        return;
+    }
+
+    // A recreated device strands every import: the images, the semaphores and the
+    // entry points all belong to the old one. Drop them WITHOUT calling into it --
+    // they died with it -- and start over on the new device.
+    if (g.vk.ok && g.rs_dev != nullptr && g.rs_dev != dev_api)
+    {
+        Log("[feed32] the game recreated its Vulkan device; rebuilding on the new one");
+        g.fence_wait_queued = false;
+        for (int i = 0; i < FEED_SLOTS; ++i) { g.vk_img[i] = VK_NULL_HANDLE; g.vk_mem[i] = VK_NULL_HANDLE; }
+        g.vk = {};
+        g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
+        g.rs_fence_in = g.rs_fence_out = {};
+        g.vk_layout_init = false;
+        g.rs_queue = nullptr;
+        HostClose();
+        ReleaseShared();
+    }
+    if (!EnsureVulkanLoaded(rt)) return;
+
+    const DXGI_FORMAT bbf = static_cast<DXGI_FORMAT>(cd.texture.format);
+    bool ok = true;
+    if (!g.built || w != g.width || h != g.height || bbf != g.bb_fmt)
+    {
+        if (GetTickCount64() < g_retry_at)
+            ok = false;                       // backing off after a failed build
+        else
+        {
+            Log("[feed32] building: %ux%u backbuffer %s (Vulkan, depth reversed=%d, mode=%d)",
+                w, h, FeedFmtName(bbf), g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildSharedVk(w, h, bbf);
+            if (ok) g.consecutive_fails = 0;
+            else if (!g.disabled) FeedFail("shared build");
+        }
+    }
+
+    if (ok && g.built)
+    {
+        if (!HostAlive()) { HostLost("process died"); }
+        else
+        {
+            VkCommandBuffer cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());
+            const VkImage bb_img = FeedVkHandle<VkImage>(bb_res.handle);
+            const VkImage mv_img = FeedVkHandle<VkImage>(mv_res.handle);
+            const VkImage dp_img = FeedVkHandle<VkImage>(depth_res.handle);
+
+            // Our imported images live permanently in GENERAL; only these raw barriers
+            // ever move them, and only the first frame after a build starts UNDEFINED.
+            Breadcrumb("copying inputs (Vulkan)");
+            {
+                const VkImageLayout from = g.vk_layout_init ? VK_IMAGE_LAYOUT_GENERAL : VK_IMAGE_LAYOUT_UNDEFINED;
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                    FeedVkBarrier(&g.vk, cb, g.vk_img[i], from, VK_IMAGE_LAYOUT_GENERAL);
+                g.vk_layout_init = true;
+            }
+            // The game's own images go through ReShade's barrier API so its layout
+            // tracking stays correct; the copies themselves are raw.
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::render_target, resource_usage::shader_resource,
+                                                 resource_usage::shader_resource };
+                const resource_usage to[3]   = { resource_usage::copy_source, resource_usage::copy_source,
+                                                 resource_usage::copy_source };
+                cl->barrier(3, res, from, to);
+            }
+            FeedVkCopyImage(&g.vk, cb, bb_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_COLOR], VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, mv_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_MV],    VK_IMAGE_LAYOUT_GENERAL, w, h);
+            FeedVkCopyImage(&g.vk, cb, dp_img, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g.vk_img[FEED_DEPTH], VK_IMAGE_LAYOUT_GENERAL, w, h);
+
+            // Park the backbuffer as copy_dest to receive the result; hand mv/depth back.
+            {
+                const resource       res[3]  = { bb_res, mv_res, depth_res };
+                const resource_usage from[3] = { resource_usage::copy_source, resource_usage::copy_source,
+                                                 resource_usage::copy_source };
+                const resource_usage to[3]   = { resource_usage::copy_dest, resource_usage::shader_resource,
+                                                 resource_usage::shader_resource };
+                cl->barrier(3, res, from, to);
+            }
+
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            Breadcrumb("signalling the host (Vulkan)");
+            g.rs_queue->flush_immediate_command_list();
+            g.rs_queue->signal(g.rs_fence_in, n);
+
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            bool delivered = false;
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+                HostLost("frame message failed");
+            else
+            {
+                Breadcrumb("waiting for the host's result (Vulkan)");
+                g.rs_queue->wait(g.rs_fence_out, n);   // GPU-side; the host CPU-signals on failure
+                g.fence_wait_queued = true;            // HostDrain must resolve this before any close
+                cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());   // fresh buffer after the flush
+                // Prefer the raw copy: vkCmdBlitImage CONVERTS, and that conversion is
+                // sRGB-aware, so blitting our linear-typed output into a VK_FORMAT_*_SRGB
+                // swapchain re-encodes it and the frame comes back washed out (issue #11).
+                // The frame we were handed is already encoded; the bytes must go home
+                // untouched. The blit stays only for layouts a raw copy cannot express.
+                if (FeedFmtSameTexelLayout(g.output_fmt, g.bb_fmt))
+                    FeedVkCopyImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                else
+                    FeedVkBlitImage(&g.vk, cb, g.vk_img[FEED_OUTPUT], VK_IMAGE_LAYOUT_GENERAL,
+                                    bb_img, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, w, h);
+                delivered = true;
+            }
+
+            // The backbuffer goes back to render_target whether or not the round trip
+            // happened: leaving ReShade's tracking believing it is still copy_dest would
+            // break every pass after ours, including its own UI.
+            {
+                const resource       res[1]  = { bb_res };
+                const resource_usage from[1] = { resource_usage::copy_dest };
+                const resource_usage to[1]   = { resource_usage::render_target };
+                cl->barrier(1, res, from, to);
+            }
+
+            if (delivered)
+            {
+                const UINT64 done = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d, Vulkan)", done, g.width, g.height, reset);
+            }
+        }
+    }
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resource_view rtv)
+{
+    LARGE_INTEGER t0 = {}, t1 = {};
+    QueryPerformanceCounter(&t0);
+    auto *dev_api = rt->get_device();
+    auto resource = dev_api->get_resource_from_view(rtv);
+    auto *source_object = reinterpret_cast<IUnknown *>(resource.handle);
+    ID3D10Texture2D *source10 = nullptr;
+    if (source_object == nullptr ||
+        FAILED(source_object->QueryInterface(__uuidof(ID3D10Texture2D), reinterpret_cast<void **>(&source10))) ||
+        source10 == nullptr) return;
+
+    ID3D10Device *device10_base = nullptr;
+    ID3D10Device1 *device10 = nullptr;
+    source10->GetDevice(&device10_base);
+    HRESULT device_hr = device10_base != nullptr ?
+        device10_base->QueryInterface(__uuidof(ID3D10Device1), reinterpret_cast<void **>(&device10)) : E_NOINTERFACE;
+    SafeRelease(device10_base);
+    if (FAILED(device_hr) || device10 == nullptr)
+    {
+        SafeRelease(source10);
+        return;
+    }
+    D3D10_TEXTURE2D_DESC sd = {};
+    source10->GetDesc(&sd);
+
+    g.is_d3d10 = true;
+    g.is_d3d9 = false;
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) { SafeRelease(device10); SafeRelease(source10); return; }
+    if (!InitializeD3D10Transport(device10))
+    {
+        SafeRelease(device10);
+        SafeRelease(source10);
+        FeedDisable("ReShade D3D10.1 transport initialization failed");
+        return;
+    }
+
+    UINT work_w = 0, work_h = 0;
+    ResolveWorkExtent(sd.Width, sd.Height, work_w, work_h);
+    bool ok = TypedColorFormat(sd.Format) != DXGI_FORMAT_UNKNOWN && sd.SampleDesc.Count == 1;
+    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
+               sd.Width != g.backbuffer_width || sd.Height != g.backbuffer_height || sd.Format != g.bb_fmt))
+    {
+        if (GetTickCount64() < g_retry_at) ok = false;
+        else
+        {
+            Log("[feed32] building ReShade D3D10.1 bridge for native D3D9: %ux%u work (%d%%) -> %ux%u fmt=%u",
+                work_w, work_h, g_cfg.work_resolution, sd.Width, sd.Height, sd.Format);
+            ok = BuildShared(work_w, work_h, sd.Width, sd.Height, sd.Format);
+            if (!ok && !g.disabled) FeedFail("D3D10.1 shared build");
+        }
+    }
+
+    if (ok && g.built && HostAlive())
+    {
+        if (DownsampleD3D10Frame(source10) && WaitForD3D10Copy() &&
+            CopyOrResampleInputs(g.ctx4, g.color_stage, g.d3d9_zero_mv, g.d3d9_zero_depth,
+                                 g.d3d9_zero_mv_srv, g.d3d9_zero_depth_srv,
+                                 g.width, g.height))
+        {
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+            g.ctx4->Signal(g.fence_in, n);
+            g.ctx4->Flush();
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm))) HostLost("D3D10 frame message failed");
+            else
+            {
+                g.ctx4->Wait(g.fence_out, n);
+                g.fence_wait_queued = true;
+                BlitOutputToBackbuffer(g.ctx4, g.d3d9_output_rtv);
+                if (WaitForD3D11Copy())
+                {
+                    g.fence_wait_queued = false;
+                    device10->CopyResource(source10, g.d3d10_output_stage);
+                    if (WaitForD3D10Copy())
+                    {
+                        const UINT64 done = ++g.frames_done;
+                        g.consecutive_fails = 0;
+                        if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                            Log("[feed32] frame %llu delivered (%ux%u, reset=%d, D3D9 via ReShade D3D10.1)",
+                                done, g.width, g.height, reset);
+                    }
+                }
+            }
+        }
+        else FeedFail("D3D10.1 frame bridge");
+    }
+    else if (ok && !HostAlive() && g.hproc != nullptr) HostLost("process died");
+
+    SafeRelease(device10);
+    SafeRelease(source10);
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
+{
+
+    if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
+
+    LARGE_INTEGER t0, t1;
+    QueryPerformanceCounter(&t0);
+
+    reshade::api::device *dev_api = rt->get_device();
+    if (dev_api->get_api() == reshade::api::device_api::opengl)
+    { g.is_gl = true; FeedFrameGl(rt, rtv); return; }
+    if (dev_api->get_api() == reshade::api::device_api::vulkan)
+    { g.is_vulkan = true; FeedFrameVk(rt, cl, rtv); return; }
+    if (dev_api->get_api() == reshade::api::device_api::d3d9)
+    { FeedFrameD3D9(rt, rtv); return; }
+    if (dev_api->get_api() == reshade::api::device_api::d3d10)
+    { FeedFrameD3D10(rt, rtv); return; }
+    if (dev_api->get_api() != reshade::api::device_api::d3d11)
+    { FeedDisable("only Direct3D 9/11, OpenGL and Vulkan games are supported by the 32-bit add-on"); return; }
+
+    auto *ctx = reinterpret_cast<ID3D11DeviceContext *>(cl->get_native());
+    if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
+
+    if (ApplyPendingWorkResolution()) g.built = false;
+    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    if (!g_cfg.enabled || g_cfg.mode == 0) return;
+
+    reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
+    if (g.mv_var.handle != 0)    rt->get_texture_binding(g.mv_var, &mv_srv, &mv_srgb);
+    if (g.depth_var.handle != 0) rt->get_texture_binding(g.depth_var, &d_srv, &d_srgb);
+    if (mv_srv.handle == 0 || d_srv.handle == 0)
+    {
+        if (!g.missing_reported)
+        {
+            g.missing_reported = true;
+            Warn("DLSS5_Feed.fx textures not found. Install DLSS5_Feed.fx + a texMotionVectors provider and enable both.");
+        }
+        return;
+    }
+
+    auto *color_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(rtv).handle);
+    auto *mv_res    = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(mv_srv).handle);
+    auto *depth_res = reinterpret_cast<ID3D11Resource *>(dev_api->get_resource_from_view(d_srv).handle);
+    auto *rtv11     = reinterpret_cast<ID3D11RenderTargetView *>(rtv.handle);
+
+    D3D11_TEXTURE2D_DESC cd = {}, md = {}, dd = {};
+    ID3D11Texture2D *color = AsTexture2D(color_res, &cd);
+    ID3D11Texture2D *mv    = AsTexture2D(mv_res, &md);
+    ID3D11Texture2D *depth = AsTexture2D(depth_res, &dd);
+    if (color == nullptr || mv == nullptr || depth == nullptr)
+    { SafeRelease(color); SafeRelease(mv); SafeRelease(depth); return; }
+
+    bool ok = true;
+    if (cd.Width != md.Width || cd.Height != md.Height || cd.Width != dd.Width || cd.Height != dd.Height ||
+        cd.SampleDesc.Count != 1 || md.Format != DXGI_FORMAT_R16G16_FLOAT || dd.Format != DXGI_FORMAT_R32_FLOAT)
+    {
+        static bool said = false;
+        if (!said)
+        {
+            said = true;
+            Log("[feed32] input mismatch: color %ux%u fmt=%u samp=%u | mv %ux%u fmt=%u | depth %ux%u fmt=%u",
+                cd.Width, cd.Height, cd.Format, cd.SampleDesc.Count, md.Width, md.Height, md.Format,
+                dd.Width, dd.Height, dd.Format);
+        }
+        ok = false;
+    }
+
+    if (ok && g.dev == nullptr)
+    {
+        g.is_d3d9 = false;
+        g.is_d3d10 = false;
+        g.owns_d3d11_device = false;
+        ctx->GetDevice(&g.dev);
+        if (g.dev != nullptr) g.dev->Release();   // not owned; the game outlives us
+        if (FAILED(ctx->QueryInterface(__uuidof(ID3D11DeviceContext4), reinterpret_cast<void **>(&g.ctx4))))
+        { FeedDisable("ID3D11DeviceContext4 unavailable (Windows 10 1703+ required)"); ok = false; }
+    }
+
+    UINT work_w = 0, work_h = 0;
+    ResolveWorkExtent(cd.Width, cd.Height, work_w, work_h);
+    if (ok && (!g.built || work_w != g.width || work_h != g.height ||
+               cd.Width != g.backbuffer_width || cd.Height != g.backbuffer_height || cd.Format != g.bb_fmt))
+    {
+        if (GetTickCount64() < g_retry_at)
+            ok = false;                       // backing off after a failed build
+        else
+        {
+            Log("[feed32] building: %ux%u work resolution (%d%%) -> %ux%u backbuffer fmt=%u (depth reversed=%d, mode=%d)",
+                work_w, work_h, g_cfg.work_resolution, cd.Width, cd.Height, cd.Format, g.depth_reversed ? 1 : 0, g_cfg.mode);
+            ok = BuildShared(work_w, work_h, cd.Width, cd.Height, cd.Format);
+            if (ok) g.consecutive_fails = 0;
+            else if (!g.disabled) FeedFail("shared build");
+        }
+    }
+
+    if (ok && g.built)
+    {
+        if (!HostAlive()) { HostLost("process died"); }
+        else
+        {
+            Breadcrumb("preparing work-resolution inputs");
+            if (!CopyOrResampleInputs(ctx, color, mv, depth,
+                                      reinterpret_cast<ID3D11ShaderResourceView *>(mv_srv.handle),
+                                      reinterpret_cast<ID3D11ShaderResourceView *>(d_srv.handle),
+                                      cd.Width, cd.Height))
+            {
+                // Cannot prepare the guides (only reachable below 100%): count it as a
+                // failure so the usual backoff applies, and leave the frame untouched.
+                FeedFail("work-resolution resample");
+                SafeRelease(color); SafeRelease(mv); SafeRelease(depth);
+                QueryPerformanceCounter(&t1);
+                TimingTick(t0.QuadPart, t1.QuadPart);
+                return;
+            }
+
+            const UINT64 n = ++g.frame_n;
+            const int reset = (g.need_reset || g_cfg.reset_every) ? 1 : 0;
+            g.need_reset = false;
+
+            g.ctx4->Signal(g.fence_in, n);
+            ctx->Flush();
+
+            BYTE tag = 'F';
+            FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
+            if (!PipeWrite(&tag, 1) || !PipeWrite(&fm, sizeof(fm)))
+                HostLost("frame message failed");
+            else
+            {
+                Breadcrumb("waiting for the host's result");
+                g.ctx4->Wait(g.fence_out, n);       // GPU-side; the host CPU-signals on failure
+                g.fence_wait_queued = true;         // HostDrain must resolve this before any close
+                BlitOutputToBackbuffer(ctx, rtv11);
+                const UINT64 done = ++g.frames_done;
+                g.consecutive_fails = 0;
+                if (done <= static_cast<UINT64>(g_cfg.log_frames) || (done % 1800) == 0)
+                    Log("[feed32] frame %llu delivered (%ux%u, reset=%d)", done, g.width, g.height, reset);
+            }
+        }
+    }
+
+    SafeRelease(color);
+    SafeRelease(mv);
+    SafeRelease(depth);
+
+    QueryPerformanceCounter(&t1);
+    TimingTick(t0.QuadPart, t1.QuadPart);
+}
+
+// ---------------------------------------------------------------------------
+// ReShade events
+// ---------------------------------------------------------------------------
+
+// The x64 AIO presents its processed result through a non-activating output
+// window. DXGI exclusive fullscreen cannot coexist with that second top-level
+// presentation surface: older games repeatedly try to reclaim exclusive
+// ownership and Windows minimizes them on every focus transition. The normal
+// x64 add-on virtualizes this inside the game process, but on the x86 carrier
+// route that add-on lives in the helper process and cannot see the game's HWND.
+// Do the one x86-specific part here: acknowledge the exclusive request without
+// forwarding it to DXGI, then turn the real game HWND into monitor-sized
+// borderless on a worker (never mutate a window from inside the DXGI callback).
+static std::atomic<bool> g_fullscreen_virtualization_pending{false};
+static std::atomic<bool> g_classic_d3d9_swapchain_seen{false};
+static std::atomic<bool> g_classic_d3d9_startup_activation_done{false};
+
+static DWORD WINAPI DeferredFullscreenVirtualizationWorker(void *parameter)
+{
+    const HWND game_window = static_cast<HWND>(parameter);
+    if (game_window == nullptr || !IsWindow(game_window))
+    {
+        g_fullscreen_virtualization_pending = false;
+        return 0;
+    }
+
+    const HMONITOR monitor = MonitorFromWindow(game_window, MONITOR_DEFAULTTONEAREST);
+    MONITORINFO monitor_info = {sizeof(monitor_info)};
+    if (!GetMonitorInfoW(monitor, &monitor_info))
+    {
+        Log("[feed32] exclusive-fullscreen virtualization could not query the monitor: error=%lu", GetLastError());
+        g_fullscreen_virtualization_pending = false;
+        return 0;
+    }
+
+    LONG_PTR style = GetWindowLongPtrW(game_window, GWL_STYLE);
+    style &= ~(WS_CAPTION | WS_THICKFRAME | WS_MINIMIZEBOX | WS_MAXIMIZEBOX | WS_SYSMENU);
+    style |= WS_POPUP | WS_VISIBLE;
+    SetWindowLongPtrW(game_window, GWL_STYLE, style);
+
+    const RECT &bounds = monitor_info.rcMonitor;
+    // The first exclusive-to-borderless conversion is part of game startup and
+    // must activate the real game HWND. Keeping SWP_NOACTIVATE here left Steam
+    // in front and made multiple titles look as if they had never launched.
+    // Subsequent Reset/mode-change conversions remain non-activating so a game
+    // that the user intentionally alt-tabbed away from cannot steal focus.
+    const bool startup_activation =
+        !g_classic_d3d9_startup_activation_done.exchange(true);
+    const UINT placement_flags = SWP_FRAMECHANGED | SWP_SHOWWINDOW |
+        (startup_activation ? 0u : SWP_NOACTIVATE);
+    if (!SetWindowPos(game_window, HWND_TOP,
+        bounds.left, bounds.top, bounds.right - bounds.left, bounds.bottom - bounds.top,
+        placement_flags))
+        Log("[feed32] exclusive-fullscreen borderless placement failed: error=%lu", GetLastError());
+    else
+    {
+        if (startup_activation) SetForegroundWindow(game_window);
+        Log("[feed32] exclusive fullscreen virtualized to %s borderless: %ldx%ld",
+            startup_activation ? "startup-activating" : "non-activating",
+            bounds.right - bounds.left, bounds.bottom - bounds.top);
+    }
+
+    g_fullscreen_virtualization_pending = false;
+    return 0;
+}
+
+static bool OnCreateSwapchain(reshade::api::device_api api,
+    reshade::api::swapchain_desc &desc, void *window)
+{
+    if (api == reshade::api::device_api::d3d9)
+        g_classic_d3d9_swapchain_seen = true;
+    if (g_cfg.enabled == 0 || api != reshade::api::device_api::d3d9 ||
+        g_cfg.classic_d3d9_fullscreen_virtualization == 0 || !desc.fullscreen_state)
+        return false;
+
+    // A second, detached native-output HWND cannot coexist reliably with classic
+    // D3D9 exclusive fullscreen. Fable demonstrates the failure mode: merely
+    // exposing that top-level output can lose the D3D9 device during loading. Make
+    // the actual swapchain windowed while retaining its requested backbuffer size;
+    // the worker below removes the frame and covers the monitor, so visually this
+    // is still fullscreen borderless and no focus-loss Reset is required.
+    desc.fullscreen_state = false;
+    desc.fullscreen_refresh_rate = 0.0f;
+    const HWND game_window = static_cast<HWND>(window);
+    if (game_window != nullptr && IsWindow(game_window) &&
+        !g_fullscreen_virtualization_pending.exchange(true))
+    {
+        if (!QueueUserWorkItem(DeferredFullscreenVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
+        {
+            g_fullscreen_virtualization_pending = false;
+            Log("[feed32] D3D9 borderless worker could not be queued: error=%lu", GetLastError());
+        }
+    }
+    Log("[feed32] classic D3D9 exclusive swapchain rewritten as windowed borderless");
+    return true;
+}
+
+static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
+{
+    if (g_cfg.enabled == 0 || !fullscreen || swapchain == nullptr)
+        return false;
+
+    if (swapchain->get_device() == nullptr)
+        return false;
+    const auto api = swapchain->get_device()->get_api();
+    if ((api == reshade::api::device_api::d3d9 || g_classic_d3d9_swapchain_seen.load()) &&
+        g_cfg.classic_d3d9_fullscreen_virtualization == 0)
+        return false;
+
+    const HWND game_window = static_cast<HWND>(swapchain->get_hwnd());
+    if (game_window == nullptr || !IsWindow(game_window))
+        return false;
+
+    if (!g_fullscreen_virtualization_pending.exchange(true))
+    {
+        if (!QueueUserWorkItem(DeferredFullscreenVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
+        {
+            g_fullscreen_virtualization_pending = false;
+            Log("[feed32] exclusive-fullscreen virtualization worker could not be queued: error=%lu", GetLastError());
+            return false;
+        }
+        Log("[feed32] blocked incompatible DXGI exclusive-fullscreen request; borderless transition queued");
+    }
+
+    return true;
+}
+
+static void ResolveHandles(reshade::api::effect_runtime *rt, bool report_missing = true)
+{
+    // ReShade 6 exposes native D3D9 effect rendering through its D3D10.1
+    // presentation runtime, so both API identities use the lightweight trigger.
+    const auto runtime_api = rt->get_device()->get_api();
+    const bool native_d3d9 = runtime_api == reshade::api::device_api::d3d9 ||
+                             runtime_api == reshade::api::device_api::d3d10;
+    const char *effect_file = native_d3d9 ? kD3D9EffectFile : kEffectFile;
+    g.technique = rt->find_technique(effect_file, kTechnique);
+    g.mv_var    = rt->find_texture_variable(effect_file, "DLSS5_MV");
+    g.depth_var = rt->find_texture_variable(effect_file, "DLSS5_Depth");
+    if (native_d3d9)
+    {
+        g.launchpad = {};
+        g.depth_reversed = true;
+        g.handles_ok = g.technique.handle != 0;
+        g.missing_reported = false;
+        strcpy_s(g_mv_status, "Native D3D9: deterministic neutral motion/depth guides");
+        g_mv_problem[0] = '\0';
+        if (g.technique.handle != 0)
+        {
+            rt->set_technique_state(g.technique, true);
+            Log("[feed32] native D3D9 capture trigger found and enabled");
+        }
+        else if (report_missing)
+            Warn("DLSS5_Feed_D3D9.fx is missing or failed to compile");
+        return;
+    }
+    const int mode = ReadMvProviderMode(rt);
+    g.launchpad = {};
+    const char *provider = "none";
+    const char *provider_file = nullptr;
+    reshade::api::effect_technique other = {};
+    const char *other_tech = nullptr;
+    int other_mode = -1;
+    for (const auto &p : kMvProviders)
+    {
+        const reshade::api::effect_technique t = rt->find_technique(p.file, p.tech);
+        if (t.handle == 0) continue;
+        const bool on = rt->get_technique_state(t);
+        if (p.mode == mode)
+        {
+            if (g.launchpad.handle == 0 || on) { g.launchpad = t; provider = p.tech; provider_file = p.file; }
+        }
+        else if (on && other.handle == 0) { other = t; other_tech = p.tech; other_mode = p.mode; }
+    }
+    char compile_error[512] = {};
+    const bool provider_broken = provider_file != nullptr && ProviderCompileError(provider_file, compile_error, sizeof(compile_error));
+
+    if (!g_host_nr_loaded)
+    {
+        ReadHostNR();
+        g_host_nr_loaded = true;
+        LogHostNR("host DLSS 5 settings loaded into the overlay page");
+    }
+
+    char v[16] = {};
+    g.depth_reversed = true;
+    if (rt->get_preprocessor_definition("RESHADE_DEPTH_INPUT_IS_REVERSED", v))
+        g.depth_reversed = atoi(v) != 0;
+
+    g.handles_ok = g.technique.handle != 0 && g.mv_var.handle != 0 && g.depth_var.handle != 0;
+    g.missing_reported = false;
+
+    const bool provider_on = g.launchpad.handle && rt->get_technique_state(g.launchpad);
+    const int signature = (g.technique.handle ? 1 : 0) | (g.mv_var.handle ? 2 : 0) | (g.depth_var.handle ? 4 : 0) |
+                          (g.launchpad.handle ? 8 : 0) | (g.depth_reversed ? 16 : 0) | (provider_on ? 32 : 0) |
+                          (mode << 6) | (other.handle ? 512 : 0) | ((other_mode & 7) << 10) | (provider_broken ? 8192 : 0);
+    static int last_signature = -1;
+    if (signature == last_signature) return;
+    last_signature = signature;
+
+    _snprintf_s(g_mv_status, sizeof(g_mv_status), _TRUNCATE, "DLSS5_MV_PROVIDER=%d (%s) -> %s (%s)",
+                mode, kMvModeName[mode], provider,
+                g.launchpad.handle ? (provider_broken ? "FAILED TO COMPILE" : provider_on ? "enabled" : "DISABLED") : "not installed");
+    g_mv_problem[0] = '\0';
+    Log("[feed32] effects: technique %s, DLSS5_MV %s, DLSS5_Depth %s, %s, depth reversed=%d",
+        g.technique.handle ? "found" : "MISSING", g.mv_var.handle ? "found" : "MISSING",
+        g.depth_var.handle ? "found" : "MISSING", g_mv_status, g.depth_reversed ? 1 : 0);
+    if (g.handles_ok && g.launchpad.handle == 0)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "DLSS5_Feed.fx is compiled for motion-vector provider %d (%s) but no known %s shader is installed: motion vectors will be zero. "
+                    "Install one, or change the DLSS5_MV_PROVIDER preprocessor definition.", mode, kMvModeName[mode], kMvModeName[mode]);
+    else if (g.handles_ok && provider_broken)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "motion-vector provider %s FAILED TO COMPILE, so it writes nothing and DLSS runs on zero vectors. ReShade.log: %s -- use another provider (VORT: DLSS5_MV_PROVIDER=2).",
+                    provider, compile_error);
+    else if (g.handles_ok && !provider_on)
+        _snprintf_s(g_mv_problem, sizeof(g_mv_problem), _TRUNCATE,
+                    "motion-vector provider %s is installed but DISABLED: enable it above DLSS 5 Feed.", provider);
+    if (other.handle != 0)
+    {
+        char more[320];
+        _snprintf_s(more, sizeof(more), _TRUNCATE,
+                    "%s%s is enabled, but DLSS5_Feed.fx is compiled for provider %d (%s) and does not read it -- set the DLSS5_MV_PROVIDER preprocessor definition to %d to use it.",
+                    g_mv_problem[0] ? " " : "", other_tech, mode, kMvModeName[mode], other_mode);
+        strncat_s(g_mv_problem, sizeof(g_mv_problem), more, _TRUNCATE);
+    }
+    if (g_mv_problem[0] && report_missing) Warn("%s", g_mv_problem);
+}
+
+// The normal AIO menu stores an exact source-resolution choice in the x64
+// carrier's ReShade.ini. Make that choice authoritative before the x86 bridge
+// captures a frame. This matters most for classic D3D9, where shrinking only
+// after GetRenderTargetData would save NR work but not CPU-transfer cost.
+static void ResolveWorkExtent(UINT source_w, UINT source_h, UINT &work_w, UINT &work_h)
+{
+    if (!g_host_nr_loaded)
+    {
+        ReadHostNR();
+        g_host_nr_loaded = true;
+    }
+
+    int source_index = -1;
+    for (int i = 0; i < NR_COUNT; ++i)
+        if (strcmp(kNR[i].key, "SourceResolutionOverride") == 0)
+        {
+            source_index = i;
+            break;
+        }
+
+    UINT requested_w = 0, requested_h = 0;
+    if (source_index >= 0)
+    {
+        const int choice = static_cast<int>(g_nr[source_index]);
+        const NRSetting &setting = kNR[source_index];
+        if (choice > 0 && choice < setting.item_count)
+        {
+            const char *dash = strchr(setting.items[choice], '-');
+            if (dash != nullptr)
+                sscanf_s(dash + 1, " %u x %u", &requested_w, &requested_h);
+        }
+    }
+
+    bool valid = requested_w >= 2 && requested_h >= 2 &&
+                 requested_w <= source_w && requested_h <= source_h;
+    if (valid)
+    {
+        const unsigned long long lhs = static_cast<unsigned long long>(requested_w) * source_h;
+        const unsigned long long rhs = static_cast<unsigned long long>(requested_h) * source_w;
+        const unsigned long long delta = lhs > rhs ? lhs - rhs : rhs - lhs;
+        valid = rhs != 0 && delta * 100ull <= rhs * 2ull;
+    }
+
+    if (valid)
+    {
+        work_w = requested_w & ~1u;
+        work_h = requested_h & ~1u;
+    }
+    else
+    {
+        work_w = ScaledExtent(source_w, g_cfg.work_resolution);
+        work_h = ScaledExtent(source_h, g_cfg.work_resolution);
+    }
+}
+
+static void RestoreD3D9StartupFocusIfReady()
+{
+    if (g.d3d9_startup_focus_restored || FindHostProxyWindow() == nullptr ||
+        g.runtime == nullptr)
+        return;
+
+    const HWND game_window = static_cast<HWND>(g.runtime->get_hwnd());
+    if (game_window == nullptr || !IsWindow(game_window)) return;
+
+    DWORD foreground_process = 0;
+    const HWND foreground = GetForegroundWindow();
+    if (foreground != nullptr)
+        GetWindowThreadProcessId(foreground, &foreground_process);
+    if (foreground_process == GetCurrentProcessId())
+    {
+        g.d3d9_startup_focus_restored = true;
+        return;
+    }
+
+    // The detached host is deliberately non-activating. If it becomes ready
+    // while Steam or an Unreal splash window is foreground, an old D3D9 game
+    // that was converted from exclusive fullscreen may never activate its new
+    // borderless HWND on its own. Perform the handoff from inside the game
+    // process once the processed proxy actually exists; the host watchdog can
+    // then validate the real game PID normally without weakening its desktop
+    // escape safety.
+    if (IsIconic(game_window)) ShowWindowAsync(game_window, SW_RESTORE);
+    else ShowWindowAsync(game_window, SW_SHOW);
+    SetForegroundWindow(game_window);
+
+    foreground_process = 0;
+    const HWND restored = GetForegroundWindow();
+    if (restored != nullptr)
+        GetWindowThreadProcessId(restored, &foreground_process);
+    if (foreground_process == GetCurrentProcessId())
+    {
+        g.d3d9_startup_focus_restored = true;
+        Log("[feed32] processed carrier ready; startup focus handed back to the D3D9 game");
+    }
+}
+
+static ULONGLONG g_next_effect_resolve_tick;
+static ULONGLONG g_effect_resolve_started_tick;
+static bool g_effect_missing_reported;
+
+static void OnReshadePresent(reshade::api::effect_runtime *rt)
+{
+    if (rt == nullptr || rt != g.runtime || g.handles_ok)
+        return;
+    const ULONGLONG now = GetTickCount64();
+    if (now < g_next_effect_resolve_tick)
+        return;
+    g_next_effect_resolve_tick = now + 250;
+
+    ResolveHandles(rt, false);
+    if (g.handles_ok)
+        Log("[feed32] feed shader resolved after asynchronous effect compilation");
+    else if (!g_effect_missing_reported && g_effect_resolve_started_tick != 0 &&
+             now - g_effect_resolve_started_tick >= 60000)
+    {
+        g_effect_missing_reported = true;
+        ResolveHandles(rt, true);
+    }
+}
+
+static void OnInitEffectRuntime(reshade::api::effect_runtime *rt)
+{
+    g.runtime = rt;
+    g_next_effect_resolve_tick = GetTickCount64() + 250;
+    g_effect_resolve_started_tick = GetTickCount64();
+    g_effect_missing_reported = false;
+    Log("[feed32] game presentation window resolved: hwnd=%p", rt->get_hwnd());
+    ResolveHandles(rt, false);
+    static int inits = 0;
+    if (++inits <= 8) Log("[feed32] effect runtime %p initialised", (void *)rt);
+}
+
+static void OnDestroyEffectRuntime(reshade::api::effect_runtime *rt)
+{
+    if (rt != g.runtime) return;
+    // The shared textures live on the game's device and survive runtime churn; keep them.
+    g.runtime = nullptr;
+    g_next_effect_resolve_tick = 0;
+    g_effect_resolve_started_tick = 0;
+    g_effect_missing_reported = false;
+    g.technique = {}; g.launchpad = {}; g.mv_var = {}; g.depth_var = {};
+    g.handles_ok = false;
+}
+
+static void OnReloadedEffects(reshade::api::effect_runtime *rt)
+{
+    if (rt == g.runtime || g.runtime == nullptr)
+    {
+        g.runtime = rt;
+        g_next_effect_resolve_tick = GetTickCount64() + 250;
+        g_effect_resolve_started_tick = GetTickCount64();
+        g_effect_missing_reported = false;
+        ResolveHandles(rt, false);
+    }
+}
+
+struct HostProxyWindowSearch
+{
+    DWORD process_id;
+    HWND window;
+};
+
+static BOOL CALLBACK FindHostProxyWindowProc(HWND window, LPARAM parameter)
+{
+    auto *search = reinterpret_cast<HostProxyWindowSearch *>(parameter);
+    DWORD process_id = 0;
+    GetWindowThreadProcessId(window, &process_id);
+    if (process_id != search->process_id)
+        return TRUE;
+
+    wchar_t class_name[96] = {};
+    if (GetClassNameW(window, class_name, static_cast<int>(std::size(class_name))) != 0 &&
+        wcscmp(class_name, L"StandaloneDLSSNRNativeOutput") == 0)
+    {
+        search->window = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static HWND FindHostProxyWindow()
+{
+    if (!HostAlive()) return nullptr;
+    HostProxyWindowSearch search = {GetProcessId(g.hproc), nullptr};
+    if (search.process_id != 0)
+        EnumWindows(FindHostProxyWindowProc, reinterpret_cast<LPARAM>(&search));
+    return search.window;
+}
+
+static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open,
+    reshade::api::input_source)
+{
+    if (runtime != g.runtime) return false;
+
+    // WM_APP + 0x56 is the normal AIO's proxy side-preview command. Moving the
+    // x64 virtual screen into that preview exposes this process's real ReShade
+    // runtime, so mouse and keyboard input stay native to the 32-bit game.
+    const HWND proxy_window = FindHostProxyWindow();
+    if (proxy_window != nullptr && PostMessageW(proxy_window, WM_APP + 0x56, open ? 1 : 0, 0))
+        Log("[feed32] ReShade overlay %s; x64 virtual output %s",
+            open ? "opened" : "closed", open ? "moved to side preview" : "restored full-screen");
+    else
+        Log("[feed32] ReShade overlay %s before the x64 virtual output was available",
+            open ? "opened" : "closed");
+    return false;
+}
+
+static void OnRenderTechnique(reshade::api::effect_runtime *rt, reshade::api::effect_technique technique,
+                              reshade::api::command_list *cl, reshade::api::resource_view rtv,
+                              reshade::api::resource_view /*rtv_srgb*/)
+{
+    if (rt != g.runtime || g.technique.handle == 0 || technique.handle != g.technique.handle) return;
+    FeedFrame(rt, cl, rtv);
+}
+
+static void OnDestroySwapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+    if (g_cfg.classic_d3d9_cpu_fallback == 0 || swapchain == nullptr ||
+        swapchain->get_device() == nullptr ||
+        swapchain->get_device()->get_api() != reshade::api::device_api::d3d9)
+        return;
+    PrepareClassicD3D9ForReset(resize ? "swapchain resize/reset" : "swapchain destruction");
+}
+
+static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool resize)
+{
+    if (g_cfg.classic_d3d9_cpu_fallback == 0 || !g.is_d3d9 ||
+        swapchain == nullptr || swapchain->get_device() == nullptr ||
+        swapchain->get_device()->get_api() != reshade::api::device_api::d3d9)
+        return;
+    g.d3d9_device_lost = false;
+    g.need_reset = true;
+    g.built = false;
+    Log("[feed32] classic D3D9 swapchain %s; bridge rebuild armed",
+        resize ? "reset completed" : "initialized");
+}
+
+static void OnDestroyDevice(reshade::api::device *dev)
+{
+    const bool ours = (g.is_d3d9 && reinterpret_cast<IDirect3DDevice9 *>(dev->get_native()) == g.dev9) ||
+                      (g.is_d3d10 && reinterpret_cast<ID3D10Device1 *>(dev->get_native()) == g.dev10) ||
+                      (g.dev != nullptr && !g.is_d3d9 && reinterpret_cast<ID3D11Device *>(dev->get_native()) == g.dev) ||
+                      (g.is_gl && dev->get_api() == reshade::api::device_api::opengl) ||
+                      (g.is_vulkan && dev == g.rs_dev);
+    if (!ours) return;
+
+    Log("[feed32] game device destroyed; shutting down");
+    HostClose();     // drain + end the host while the fences are still alive
+    ReleaseShared();
+    g.vk = {};
+    g.rs_dev = nullptr;
+    g.rs_queue = nullptr;
+    g.vk_layout_init = false;
+    if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+    {
+        if (g.gl_fbo_read != 0) { g.gl.DeleteFramebuffers(1, &g.gl_fbo_read); g.gl_fbo_read = 0; }
+        if (g.gl_fbo_draw != 0) { g.gl.DeleteFramebuffers(1, &g.gl_fbo_draw); g.gl_fbo_draw = 0; }
+    }
+    g.gl_fbo_read = g.gl_fbo_draw = 0;
+    g.gl = {};
+    g.gl_ctx = nullptr;
+    SafeRelease(g.ctx4);
+    SafeRelease(g.query9);
+    SafeRelease(g.query10);
+    SafeRelease(g.query11);
+    SafeRelease(g.blit_vs);
+    SafeRelease(g.blit_ps);
+    SafeRelease(g.blit_sampler);
+    if (g.owns_d3d11_device) SafeRelease(g.dev); else g.dev = nullptr;
+    g.dev9 = nullptr;
+    g.dev10 = nullptr;
+    g.owns_d3d11_device = false;
+    g.is_d3d9 = false;
+    g.is_d3d10 = false;
+}
+
+// ---------------------------------------------------------------------------
+// ReShade overlay page (Add-ons tab -> DLSS 5 Feed): the local dlss5-feed.cfg, and --
+// unlike the 64-bit add-on -- the DLSS 5 host's own neural-rendering settings, which
+// on this path live in a separate process's ReShade.ini. Replaces the old approach of
+// bridging them through hidden shader uniforms in DLSS5_Feed.fx.
+// ---------------------------------------------------------------------------
+
+static void HelpMarker(const char *desc)
+{
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+    {
+        ImGui::BeginTooltip();
+        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
+        ImGui::TextUnformatted(desc);
+        ImGui::PopTextWrapPos();
+        ImGui::EndTooltip();
+    }
+}
+
+static void DrawLegacyOverlay(reshade::api::effect_runtime *)
+{
+    bool dirty = false;
+    bool enabled = g_cfg.enabled != 0;
+    if (ImGui::Checkbox("Enabled", &enabled)) { g_cfg.enabled = enabled ? 1 : 0; dirty = true; }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("Status");
+    ImGui::Text("Feed: %s", g.disabled ? "disabled (see dlss5-feed.log)" : g.built ? "built" : "not built");
+    ImGui::Text("Render API: %s", g.is_vulkan ? "Vulkan" : g.is_gl ? "OpenGL" :
+        g.is_d3d10 ? "Direct3D 9 via ReShade D3D10.1" : g.is_d3d9 ? "Direct3D 9" : "Direct3D 11");
+    ImGui::Text("Host process: %s", HostAlive() ? "running" : "not running");
+    if (g.frames_done > 0) ImGui::Text("Frames delivered: %llu", static_cast<unsigned long long>(g.frames_done));
+    ImGui::TextWrapped("Motion vectors: %s", g_mv_status);
+    if (g_mv_problem[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f), "%s", g_mv_problem);
+    if (g.disabled && ImGui::Button("Re-enable"))
+    {
+        g.disabled = false;
+        g.consecutive_fails = 0;
+        g_retry_at = 0;
+        Log("[feed32] re-enabled from the overlay");
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS contract");
+    static const char *kModes[] = { "Inert", "Transport test (no NGX, left half only)", "Full DLSS path" };
+    if (ImGui::Combo("Mode", &g_cfg.mode, kModes, 3)) dirty = true;
+
+    // Below 100% the guides have to be resampled into the shared set, which is a
+    // D3D11 pixel-shader pass this add-on only has on the D3D11 path. The OpenGL and
+    // Vulkan transports run DLAA at the native size, so the slider would lie.
+    if (g.is_gl || g.is_vulkan)
+    {
+        ImGui::BeginDisabled();
+        int fixed = 100;
+        ImGui::SliderInt("Work resolution (%)", &fixed, 50, 100);
+        ImGui::EndDisabled();
+        ImGui::SameLine(); HelpMarker("Fixed at 100% on the OpenGL and Vulkan transports: DLSS runs at the "
+                                      "game's native resolution there.");
+    }
+    else
+    {
+        if (g_pending_work_resolution == 0 && g_work_resolution_ui != g_cfg.work_resolution)
+            g_work_resolution_ui = g_cfg.work_resolution;
+        if (ImGui::SliderInt("Work resolution (%)", &g_work_resolution_ui, 50, 100))
+        {
+            g_pending_work_resolution = g_work_resolution_ui;
+            g_work_resolution_apply_after = GetTickCount64() + 400;
+        }
+        ImGui::SameLine(); HelpMarker("Scales both axes of the shared DLAA + Neural Rendering work textures the host "
+                                      "runs on. The game and its backbuffer stay native-sized. Applied once 400 ms "
+                                      "after dragging stops, since each change rebuilds the shared set.");
+        if (g_pending_work_resolution != 0)
+            ImGui::TextDisabled("Pending: %d%%", g_pending_work_resolution);
+        else if (g.backbuffer_width != 0)
+            ImGui::TextDisabled("Active: %ux%u (%d%%) -> %ux%u", g.width, g.height,
+                                g_cfg.work_resolution, g.backbuffer_width, g.backbuffer_height);
+    }
+
+    static const char *kTri[] = { "Auto", "Force off", "Force on" };
+    int hdr_idx = g_cfg.hdr + 1, di_idx = g_cfg.depth_inverted + 1;
+    if (ImGui::Combo("HDR", &hdr_idx, kTri, 3)) { g_cfg.hdr = hdr_idx - 1; dirty = true; }
+    if (ImGui::Combo("Depth inverted", &di_idx, kTri, 3)) { g_cfg.depth_inverted = di_idx - 1; dirty = true; }
+    bool reset_every = g_cfg.reset_every != 0;
+    if (ImGui::Checkbox("Reset every frame (diagnostic)", &reset_every)) { g_cfg.reset_every = reset_every ? 1 : 0; dirty = true; }
+    if (ImGui::SliderFloat("MV scale X", &g_cfg.mv_scale_x, 0.0f, 4.0f)) dirty = true;
+    if (ImGui::SliderFloat("MV scale Y", &g_cfg.mv_scale_y, 0.0f, 4.0f)) dirty = true;
+
+    bool show_host_window = g_cfg.host_window != 0;
+    if (ImGui::Checkbox("Show the DLSS 5 host window", &show_host_window)) { g_cfg.host_window = show_host_window ? 1 : 0; dirty = true; }
+    ImGui::SameLine(); HelpMarker("The helper process's own window. Only needed for settings not listed here.");
+
+    if (ImGui::CollapsingHeader("Advanced"))
+    {
+        if (ImGui::InputInt("Raw create flags (-1 = auto)", &g_cfg.flags)) dirty = true;
+        if (ImGui::SliderInt("Log first N frames", &g_cfg.log_frames, 0, 20)) dirty = true;
+    }
+
+    ImGui::Separator();
+    ImGui::TextUnformatted("DLSS 5 neural-rendering settings (on the host)");
+    ImGui::SameLine();
+    HelpMarker("The same settings, in the same order, as the \"DLSS 5 Neural Rendering\" panel in "
+               "the host window -- mirrored here so you do not have to alt-tab. They live in the "
+               "host's own ReShade.ini, which it reads at startup, so applying them restarts the "
+               "host. Settings you never touch here are left exactly as the add-on wrote them.");
+
+    // The overlay can be opened before the first effect-runtime resolve has loaded these.
+    if (!g_host_nr_loaded) { ReadHostNR(); g_host_nr_loaded = true; }
+
+    for (int i = 0; i < NR_COUNT; ++i)
+    {
+        if (i == NR_TRANSFER_FIRST)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Control-compatible color transfer");
+        }
+        else if (i == NR_GUIDE_FIRST)
+        {
+            ImGui::Spacing();
+            ImGui::TextDisabled("Guide overrides (leave at defaults unless diagnostics require them)");
+        }
+
+        const NRSetting &s = kNR[i];
+        bool edited = false;
+        if (s.kind == NR_BOOL)
+        {
+            bool b = g_nr[i] != 0.0f;
+            if (ImGui::Checkbox(s.label, &b)) { g_nr[i] = b ? 1.0f : 0.0f; edited = true; }
+        }
+        else if (s.kind == NR_COMBO)
+        {
+            int idx = static_cast<int>(g_nr[i]);
+            if (idx < 0 || idx >= s.item_count) idx = 0;   // a value the add-on could not have written
+            if (ImGui::Combo(s.label, &idx, s.items, s.item_count)) { g_nr[i] = static_cast<float>(idx); edited = true; }
+        }
+        else
+        {
+            if (ImGui::SliderFloat(s.label, &g_nr[i], s.lo, s.hi, s.format)) edited = true;
+        }
+        if (edited) g_nr_touched[i] = true;
+
+        if (s.tooltip != nullptr) { ImGui::SameLine(); HelpMarker(s.tooltip); }
+
+        // Flag a stored value the add-on's own widget could never produce (an older build of
+        // this panel wrote NRStyle=2 into a two-entry dropdown).
+        if (s.kind == NR_COMBO && (g_nr[i] < 0.0f || g_nr[i] >= static_cast<float>(s.item_count)))
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.3f, 1.0f),
+                               "   stored value %d is out of range - pick one above to correct it",
+                               static_cast<int>(g_nr[i]));
+        else if (!g_nr_present[i] && !g_nr_touched[i])
+            { ImGui::SameLine(); ImGui::TextDisabled("(add-on default)"); }
+    }
+
+    ImGui::Spacing();
+    if (ImGui::Button("Apply to the DLSS 5 host"))
+        HostApplySettings();
+    ImGui::SameLine();
+    if (ImGui::Button("Reload from host"))
+    {
+        ReadHostNR();
+        LogHostNR("host DLSS 5 settings reloaded from the overlay page");
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(applying restarts the helper process; up to 15 s without DLSS)");
+
+    if (dirty) CfgSave();
+}
+
+static bool DrawAioSetting(int index)
+{
+    const NRSetting &setting = kNR[index];
+    bool changed = false;
+    if (setting.kind == NR_BOOL)
+    {
+        bool value = g_nr[index] != 0.0f;
+        if (ImGui::Checkbox(setting.label, &value))
+        {
+            g_nr[index] = value ? 1.0f : 0.0f;
+            changed = true;
+        }
+    }
+    else if (setting.kind == NR_COMBO)
+    {
+        int value = std::clamp(static_cast<int>(g_nr[index]), 0, setting.item_count - 1);
+        if (ImGui::Combo(setting.label, &value, setting.items, setting.item_count))
+        {
+            g_nr[index] = static_cast<float>(value);
+            changed = true;
+        }
+    }
+    else if (ImGui::SliderFloat(setting.label, &g_nr[index], setting.lo, setting.hi, setting.format))
+    {
+        changed = true;
+    }
+    if (changed) g_nr_touched[index] = true;
+    if (setting.tooltip != nullptr)
+    {
+        ImGui::SameLine();
+        HelpMarker(setting.tooltip);
+    }
+    return changed;
+}
+
+static void DrawAioGroup(dlss5_aio_menu::Group group)
+{
+    for (int index = 0; index < NR_COUNT; ++index)
+    {
+        const NRSetting &setting = kNR[index];
+        if (setting.group != group) continue;
+        const bool setting_changed = DrawAioSetting(index);
+        if (setting_changed && g.d3d9_cpu_bridge && HostAlive() &&
+            (strcmp(setting.key, "Model") == 0 || strcmp(setting.key, "DlssRenderPreset") == 0 ||
+             strcmp(setting.key, "NeuralRendering") == 0 || strcmp(setting.key, "FrameGeneration") == 0 ||
+             strcmp(setting.key, "NvidiaOpticalFlowResolution") == 0 ||
+             strcmp(setting.key, "NvidiaOpticalFlowMotion") == 0))
+            HostApplySettings();
+
+        if (strcmp(setting.key, "DlssRenderPreset") == 0)
+            ImGui::TextDisabled("Preset L is recommended. Ctrl+Alt+P cycles the modern presets.");
+        else if (strcmp(setting.key, "Model") == 0)
+        {
+            int pass_index = std::clamp(g_aio_nr_pass_count, 1, 3) - 1;
+            if (ImGui::Combo("NR pass count (experimental)", &pass_index,
+                "1x (default)\0" "2x (very expensive)\0" "3x (extreme)\0"))
+            {
+                g_aio_nr_pass_count = pass_index + 1;
+                g_aio_nr_pass_touched = true;
+                if (g.d3d9_cpu_bridge && HostAlive())
+                    HostApplySettings();
+            }
+            ImGui::TextDisabled("Session-only. The x64 AIO returns to 1x after relaunch.");
+        }
+    }
+}
+
+static ImFont *g_zh_font = nullptr;
+static bool    g_zh_font_tried = false;
+
+static int AioIndexByKey(const char *key)
+{
+    for (int i = 0; i < NR_COUNT; ++i)
+        if (strcmp(kNR[i].key, key) == 0) return i;
+    return -1;
+}
+
+static void EnsureZhFont()
+{
+    if (g_zh_font_tried) return;
+    g_zh_font_tried = true;
+    for (const char *fp : {"C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhl.ttc",
+                           "C:/Windows/Fonts/simhei.ttf"})
+        if ((g_zh_font = ImGui::GetIO().Fonts->AddFontFromFileTTF(fp, 16.0f)) != nullptr)
+        {
+            Log("[feed32] zh font loaded: %s", fp);
+            return;
+        }
+    Log("[feed32] zh font load failed; falling back to default font");
+}
+
+// 档位应用（存储域：NR 0/1，Model 0/1/2，其余 0-2 与 -1..1）
+static void ApplyZhChange()
+{
+    // live-safe 通道即时生效（CPU 桥模式），同时持久化到载体 ini
+    if (g.d3d9_cpu_bridge && HostAlive())
+        if (TryApplyLiveHostSettings())
+            Log("[feed32] zh panel: live-safe settings applied");
+    WriteHostNR();
+}
+
+static void DrawOverlay(reshade::api::effect_runtime *)
+{
+    if (!g_host_nr_loaded)
+    {
+        ReadHostNR();
+        g_host_nr_loaded = true;
+    }
+    EnsureZhFont();
+    if (g_zh_font) ImGui::PushFont(g_zh_font);
+
+    const int idx_nr = AioIndexByKey("NeuralRendering");
+    const int idx_model = AioIndexByKey("Model");
+    const int idx_int = AioIndexByKey("Intensity");
+    const int idx_tone = AioIndexByKey("LocalTone");
+    const int idx_str = AioIndexByKey("LocalStructure");
+    const int idx_skin = AioIndexByKey("SkinStructure");
+
+    ImGui::TextUnformatted("DLSS5 神经渲染 - 魔兽 3.3.5 汉化版");
+    ImGui::TextDisabled("32 位包装器 - 处理由 x64 AIO 插件完成");
+    ImGui::Separator();
+    ImGui::Text("传输通道：%s", g.is_vulkan ? "Vulkan x86" : g.is_gl ? "OpenGL x86" :
+        g.is_d3d10 ? "D3D9/ReShade-D3D10.1 x86" : g.is_d3d9 ? "D3D9 x86" : "D3D11 x86");
+    if (g.backbuffer_width != 0)
+        ImGui::Text("源分辨率：%ux%u", g.backbuffer_width, g.backbuffer_height);
+    else
+        ImGui::TextUnformatted("源分辨率：检测中");
+    ImGui::Text("64 位载体：%s", HostAlive() ? "运行中" :
+        (g.handles_ok ? "等待首帧" : "等待 AIO feed 着色器"));
+    ImGui::Text("传输状态：%s", g.disabled ? "已停用（见 dlss5-aio-x86.log）" :
+        g.built ? "活动" : "初始化中");
+    if (g.frames_done != 0)
+        ImGui::Text("已传输帧数：%llu", static_cast<unsigned long long>(g.frames_done));
+    ImGui::Separator();
+
+    // 档位区（存储域：NR 0/1，Model 0/1/2，其余 0-2 与 -1..1）
+    static const char *kTierNames[6] = {"原画", "轻触", "标准", "强结构", "柔和", "电影"};
+    static const float kTiers[6][5] = {
+        {0, 1.0f, 1.0f, 1.0f, -1.0f},
+        {1, 0.5f, 1.0f, 1.0f, -1.0f},
+        {1, 1.0f, 1.0f, 1.0f, -1.0f},
+        {1, 1.0f, 1.0f, 2.0f, -1.0f},
+        {1, 0.7f, 0.8f, 0.6f, -1.0f},
+        {1, 1.0f, 1.5f, 1.2f, -1.0f},
+    };
+    ImGui::SeparatorText("档位");
+    for (int t = 0; t < 6; ++t) {
+        if (t % 3) ImGui::SameLine();
+        const bool active = g_nr[idx_nr] == kTiers[t][0] && g_nr[idx_model] == kTiers[t][1] &&
+            fabsf(g_nr[idx_int] - kTiers[t][2]) < 0.005f && fabsf(g_nr[idx_tone] - kTiers[t][3]) < 0.005f &&
+            fabsf(g_nr[idx_str] - kTiers[t][4]) < 0.005f && fabsf(g_nr[idx_skin] - kTiers[t][5]) < 0.005f;
+        if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.45f, 0.28f, 1.0f));
+        if (ImGui::Button(kTierNames[t], ImVec2(104, 0))) {
+            g_nr[idx_nr] = kTiers[t][0];
+            g_nr[idx_int] = kTiers[t][1];
+            g_nr[idx_tone] = kTiers[t][2];
+            g_nr[idx_str] = kTiers[t][3];
+            g_nr[idx_skin] = kTiers[t][4];
+            g_nr_touched[idx_nr] = g_nr_touched[idx_int] = true;
+            g_nr_touched[idx_tone] = g_nr_touched[idx_str] = g_nr_touched[idx_skin] = true;
+            ApplyZhChange();
+        }
+        if (active) ImGui::PopStyleColor();
+    }
+
+    // 微调区
+    ImGui::SeparatorText("微调");
+    bool nr_on = g_nr[idx_nr] != 0.0f;
+    if (ImGui::Checkbox("启用 NR（神经渲染）", &nr_on)) {
+        g_nr[idx_nr] = nr_on ? 1.0f : 0.0f;
+        g_nr_touched[idx_nr] = true;
+        ApplyZhChange();
+    }
+    int model_idx = std::clamp(static_cast<int>(g_nr[idx_model]), 0, 2);
+    if (ImGui::Combo("模型", &model_idx, "模型 1\0模型 2\0模型 3\0")) {
+        g_nr[idx_model] = static_cast<float>(model_idx);
+        g_nr_touched[idx_model] = true;
+        ApplyZhChange();
+    }
+    if (ImGui::SliderFloat("强度", &g_nr[idx_int], 0.0f, 2.0f, "%.2f")) {
+        g_nr_touched[idx_int] = true;
+        ApplyZhChange();
+    }
+    if (ImGui::SliderFloat("色调结构", &g_nr[idx_tone], 0.0f, 2.0f, "%.2f")) {
+        g_nr_touched[idx_tone] = true;
+        ApplyZhChange();
+    }
+    if (ImGui::SliderFloat("结构强度", &g_nr[idx_str], 0.0f, 2.0f, "%.2f")) {
+        g_nr_touched[idx_str] = true;
+        ApplyZhChange();
+    }
+    if (ImGui::SliderFloat("皮肤结构", &g_nr[idx_skin], -1.0f, 1.0f, "%.2f")) {
+        g_nr_touched[idx_skin] = true;
+        ApplyZhChange();
+    }
+    ImGui::TextDisabled("改动实时生效并自动保存到载体配置。");
+    ImGui::Separator();
+
+    // 显示控制（F10 的手动等价）
+    bool show_processed_output = g_cfg.show_processed_output != 0;
+    if (ImGui::Checkbox("显示处理画面（虚拟屏输出）", &show_processed_output))
+    {
+        g_cfg.show_processed_output = show_processed_output ? 1 : 0;
+        CfgSave();
+        const HWND proxy = FindHostProxyWindow();
+        if (proxy != nullptr &&
+            PostMessageW(proxy, kProxyShowProcessedMessage,
+                         show_processed_output ? 1 : 0, 0))
+            Log("[feed32] virtual-screen output changed live to %s",
+                show_processed_output ? "processed" : "raw A/B");
+        else
+            Log("[feed32] virtual-screen startup output changed to %s; it will apply when the carrier starts",
+                show_processed_output ? "processed" : "raw A/B");
+    }
+
+    // 兼容与诊断（高级；内容保持英文以便对照上游文档）
+    if (ImGui::CollapsingHeader("Compatibility / diagnostics (advanced)"))
+    {
+        DrawAioGroup(dlss5_aio_menu::Group::Compatibility);
+
+        ImGui::SeparatorText("Classic Direct3D 9 (32-bit only)");
+        bool cpu_fallback = g_cfg.classic_d3d9_cpu_fallback != 0;
+        if (ImGui::Checkbox("Allow classic D3D9 CPU bridge", &cpu_fallback))
+        {
+            g_cfg.classic_d3d9_cpu_fallback = cpu_fallback ? 1 : 0;
+            CfgSave();
+            Log("[feed32] classic D3D9 CPU fallback %s; bridge rebuild requested",
+                cpu_fallback ? "enabled" : "disabled");
+        }
+        ImGui::SameLine();
+        HelpMarker("Leave disabled normally. Enable only when a 32-bit Direct3D 9 game reports that "
+                   "D3D9/D3D11 shared textures are unsupported. This slower fallback copies frames "
+                   "through system memory and can reduce performance.");
+
+        bool virtualize_fullscreen = g_cfg.classic_d3d9_fullscreen_virtualization != 0;
+        if (ImGui::Checkbox("Virtualize classic D3D9 fullscreen at startup", &virtualize_fullscreen))
+        {
+            g_cfg.classic_d3d9_fullscreen_virtualization = virtualize_fullscreen ? 1 : 0;
+            CfgSave();
+            Log("[feed32] classic D3D9 startup fullscreen virtualization %s; applies on next swapchain creation",
+                virtualize_fullscreen ? "enabled" : "disabled");
+        }
+        ImGui::SameLine();
+        HelpMarker("Leave disabled normally. Enable if a 32-bit Direct3D 9 game minimizes, loses its "
+                   "device, or cannot coexist with the detached processed-output window in exclusive "
+                   "fullscreen. Restart the game after changing this option.");
+
+        if (g.is_d3d9)
+            ImGui::TextDisabled("Current classic D3D9 transport: %s",
+                g.d3d9_cpu_bridge ? "CPU fallback" : "GPU shared textures (fast path)");
+
+        ImGui::SeparatorText("Diagnostics");
+        const bool compiling = !g.handles_ok && g_effect_resolve_started_tick != 0 &&
+            GetTickCount64() - g_effect_resolve_started_tick < 60000;
+        ImGui::TextWrapped("Feed shader: %s", g.handles_ok ? "ready" :
+            compiling ? "waiting for ReShade shader compilation" : "missing or failed to compile");
+        ImGui::TextWrapped("Motion provider: %s", g_mv_status);
+        if (g_mv_problem[0]) ImGui::TextWrapped("%s", g_mv_problem);
+        if (g.disabled && ImGui::Button("Retry bridge"))
+        {
+            g.disabled = false;
+            g.consecutive_fails = 0;
+            g_retry_at = 0;
+        }
+        if (ImGui::Button("Apply settings and restart 64-bit AIO"))
+            HostApplySettings();
+        ImGui::SameLine();
+        if (ImGui::Button("Reload settings from 64-bit AIO"))
+            ReadHostNR();
+    }
+
+    if (g_zh_font) ImGui::PopFont();
+}
+
+// ---------------------------------------------------------------------------
+
+// Fired by ReShade before the device (for Vulkan: from inside its vkCreateInstance
+// hook, i.e. before the game's vkCreateDevice). That is the one moment the interop
+// extensions can still be added from in-process -- see feed_vk_hook.h.
+static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_version*/)
+{
+    if (api == reshade::api::device_api::vulkan)
+        FeedVkHookInstall();
+    return false;   // never change the requested API version
+}
+
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+{
+    if (reason == DLL_PROCESS_ATTACH)
+    {
+        g_self = module;
+        DisableThreadLibraryCalls(module);
+        InitializeCriticalSection(&g_log_cs);
+        GetModuleFileNameA(module, g_log_path, MAX_PATH);
+        if (char *s = strrchr(g_log_path, '\\'))
+            strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-aio-x86.log");
+        { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
+
+        if (!reshade::register_addon(module)) return FALSE;
+        Log("dlss5-feed32 %s (built %s %s) attached.", FEED_VERSION, __DATE__, __TIME__);
+        {
+            wchar_t exe[MAX_PATH] = {};
+            GetModuleFileNameW(nullptr, exe, MAX_PATH);
+            Log("  host game: %ls", exe);
+        }
+        CfgWriteDefault();
+        CfgReload();
+
+        reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
+        reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::register_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+        reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+        reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+        reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
+        reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        reshade::register_overlay(nullptr, DrawOverlay);
+    }
+    else if (reason == DLL_PROCESS_DETACH)
+    {
+        reshade::unregister_overlay(nullptr, DrawOverlay);
+        reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+        reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
+        reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+        reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+        reshade::unregister_event<reshade::addon_event::destroy_swapchain>(OnDestroySwapchain);
+        reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+        reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+        reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
+        reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+        FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
+        HostClose();
+        reshade::unregister_addon(module);
+        Log("shut down cleanly.");
+    }
+    return TRUE;
+}
