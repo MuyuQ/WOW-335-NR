@@ -23,6 +23,10 @@ nvngx_*.dll
 nvofapi*.dll
 nvngx/
 
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+
 # ---- 其他 ----
 *.tmp
 Thumbs.db

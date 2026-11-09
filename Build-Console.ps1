@@ -34,8 +34,6 @@ $cpp = Join-Path $PSScriptRoot 'native/console.cpp'
 $imgui = Join-Path $PSScriptRoot 'native/imgui'
 $exe = Join-Path $output 'dlss5-console.exe'
 $cmd = Join-Path $output 'build.cmd'
-$clientFwd = (Join-Path $project '_scratch/dlss5-aio/20261106-093536/client') -replace '\\', '/'
-# GAME_DIR 宏用正斜杠（结尾反斜杠会转义 C 字符串闭合引号）；客户端路径为纯 ASCII，可安全嵌入批处理
 $body = @"
 @echo off
 cd /d "%DLSS5_TASK_OUT%"
