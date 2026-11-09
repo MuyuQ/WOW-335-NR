@@ -661,7 +661,6 @@ static void PageNr()
 
     ImGui::Spacing();
     ImGui::TextColored(kAccent, "微调");
-    ImGui::TextDisabled("滑杆统一为 -1…+1 归一化刻度；写入时自动换算为各参数原始范围。");
     if (g_tier_locked) ImGui::TextDisabled("出厂档位锁定。点「自定义」解锁微调。");
     if (g_tier_locked) ImGui::BeginDisabled(true);
     {
