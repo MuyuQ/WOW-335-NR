@@ -77,8 +77,8 @@ NVIDIA 运行时 `nvngx_dlssnr.dll`、`nvngx_dlss.dll`、`nvngx_dlssg.dll` 由�
 - 悬浮面板/控制台在前台时，载体保持输出可见。标题白名单可用 `host64/ReShade.ini` 的
   `[Standalone.DLSSNR] TuningWindowTitles=WOW-335-NR|DLSS5` 覆盖（竖线分隔子串；
   面板窗口类 `Dlss5PanelWindow` 始终识别）。
-- 面板「微调」的四个滑杆统一为 **-1…+1** 归一化刻度；写入 live-params/ini 时换算为
-  各参数原始范围（强度/结构 0–1，色调 0–2，皮肤 -1…+1）。
+- 面板「微调」保留各参数自然量程并统一两位小数显示：强度/结构 0–1，色调 0–2
+  （1 为中性），皮肤 -1…+1（0 为中性）；每个滑杆上方说明零点含义与效果。
 
 ## 载体血统对照
 
