@@ -22,6 +22,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <vector>
+#include <algorithm>
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
@@ -1015,19 +1016,67 @@ static int RunTest()
 // Serve mode: the real pipe server for a 32-bit game
 // ---------------------------------------------------------------------------
 
-static bool ReadFull(HANDLE pipe, void *buf, DWORD len)
+// The pipe is byte-mode and synchronous. A plain ReadFile waits forever if the
+// client writes a tag and then stalls mid-message (game killed in a debugger,
+// driver hang, paused process), leaving the host window "Not Responding" and the
+// wrapper waiting on a host that will never answer. Poll with a deadline; the
+// caller then closes the pipe and lets the wrapper respawn a fresh host.
+static bool ReadFull(HANDLE pipe, void *buf, DWORD len, DWORD timeout_ms = 5000)
 {
-    DWORD got = 0;
-    return ReadFile(pipe, buf, len, &got, nullptr) && got == len;
+    unsigned char *dst = static_cast<unsigned char *>(buf);
+    DWORD total = 0;
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    while (total < len)
+    {
+        DWORD available = 0;
+        if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &available, nullptr))
+            return false;   // pipe broken
+        if (available == 0)
+        {
+            if (GetTickCount64() >= deadline)
+            {
+                Log("[host] read timed out after %lu of %lu bytes", static_cast<unsigned long>(total),
+                    static_cast<unsigned long>(len));
+                return false;
+            }
+            Sleep(1);
+            continue;
+        }
+        const DWORD chunk = std::min<DWORD>(available, len - total);
+        DWORD got = 0;
+        if (!ReadFile(pipe, dst + total, chunk, &got, nullptr) || got == 0)
+            return false;
+        total += got;
+    }
+    return true;
 }
 
 static int Serve(DWORD game_pid)
 {
     char name[128];
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(game_pid));
-    HANDLE pipe = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                   1, 1024, 1024, 0, nullptr);
-    if (pipe == INVALID_HANDLE_VALUE) { Log("[host] CreateNamedPipe failed %lu", GetLastError()); return 1; }
+    HANDLE pipe = INVALID_HANDLE_VALUE;
+    for (int attempt = 0; attempt < 50; ++attempt)
+    {
+        pipe = CreateNamedPipeA(name, PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                1, 1024, 1024, 0, nullptr);
+        if (pipe != INVALID_HANDLE_VALUE) break;
+        const DWORD error = GetLastError();
+        if (error != ERROR_ACCESS_DENIED)
+        {
+            Log("[host] CreateNamedPipe failed %lu", error);
+            return 1;
+        }
+        // A host for the same game may still be draining its queue after the
+        // wrapper closed the pipe. Wait for the name instead of exiting and
+        // making the wrapper treat startup as a lost host.
+        Sleep(100);
+    }
+    if (pipe == INVALID_HANDLE_VALUE)
+    {
+        Log("[host] CreateNamedPipe failed after retries (stale host still owns the name?)");
+        return 1;
+    }
     Log("[host] serving on %s", name);
     if (!ConnectNamedPipe(pipe, nullptr) && GetLastError() != ERROR_PIPE_CONNECTED)
     { Log("[host] ConnectNamedPipe failed %lu", GetLastError()); return 1; }
@@ -1245,9 +1294,23 @@ static int Serve(DWORD game_pid)
 
 int main(int argc, char **argv)
 {
-    GetModuleFileNameA(nullptr, g_log_path, MAX_PATH);
-    if (char *s = strrchr(g_log_path, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-feed-host.log");
+    {
+        char module_path[32768] = {};
+        const DWORD length = GetModuleFileNameA(nullptr, module_path, static_cast<DWORD>(sizeof(module_path)));
+        const char *log_name = "dlss5-feed-host.log";
+        const char *slash = length > 0 && length < sizeof(module_path) ? strrchr(module_path, '\\') : nullptr;
+        const size_t dir_length = slash != nullptr ? static_cast<size_t>(slash - module_path) + 1 : 0;
+        if (dir_length > 0 && dir_length + strlen(log_name) + 1 <= sizeof(g_log_path))
+        {
+            memcpy(g_log_path, module_path, dir_length);
+            strcpy_s(g_log_path + dir_length, sizeof(g_log_path) - dir_length, log_name);
+        }
+        else
+        {
+            // Long install path: a relative log beats aborting the carrier.
+            strcpy_s(g_log_path, log_name);
+        }
+    }
     { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
 
     Log("AIO DLSS5 32-bit Wrapper (x64 processing carrier, built %s %s)", __DATE__, __TIME__);

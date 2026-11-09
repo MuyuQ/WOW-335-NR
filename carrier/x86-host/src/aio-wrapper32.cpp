@@ -153,11 +153,28 @@ static UINT ScaledExtent(UINT native_extent, int percent)
     return extent >= 2u ? extent : 2u;
 }
 
+// Build "<directory of this DLL>\<name>" without ever letting strcpy_s or
+// sprintf_s abort the game on a path that no longer fits MAX_PATH. Returns
+// false and leaves out empty; callers then behave as if the file is missing.
+static bool SiblingPath(char *out, size_t capacity, const char *name)
+{
+    if (out == nullptr || capacity == 0) return false;
+    out[0] = '\0';
+    char module_path[32768] = {};
+    const DWORD length = GetModuleFileNameA(g_self, module_path, static_cast<DWORD>(sizeof(module_path)));
+    if (length == 0 || length >= sizeof(module_path)) return false;
+    char *slash = strrchr(module_path, '\\');
+    const size_t dir_length = slash != nullptr ? static_cast<size_t>(slash - module_path) + 1 : 0;
+    const size_t name_length = strlen(name);
+    if (dir_length + name_length + 1 > capacity) return false;
+    memcpy(out, module_path, dir_length);
+    memcpy(out + dir_length, name, name_length + 1);
+    return true;
+}
+
 static void CfgPath(char *out)
 {
-    GetModuleFileNameA(g_self, out, MAX_PATH);
-    if (char *s = strrchr(out, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "dlss5-aio-x86.cfg");
+    SiblingPath(out, MAX_PATH, "dlss5-aio-x86.cfg");
 }
 
 static void CfgWriteDefault()
@@ -305,8 +322,7 @@ static bool ProviderCompileError(const char *file, char *out, size_t out_size)
 {
     out[0] = '\0';
     char path[MAX_PATH];
-    GetModuleFileNameA(g_self, path, MAX_PATH);
-    if (char *s = strrchr(path, '\\')) strcpy_s(s + 1, MAX_PATH - (s + 1 - path), "ReShade.log");
+    if (!SiblingPath(path, sizeof(path), "ReShade.log")) return false;
     FILE *f = nullptr;
     if (fopen_s(&f, path, "rb") != 0 || f == nullptr) return false;
     fseek(f, 0, SEEK_END);
@@ -638,14 +654,24 @@ static void HostDrain()
     CloseHandle(evt);
 }
 
-static void HostClose()
+static void HostClose(bool wait_for_exit = true)
 {
-    HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
+    if (wait_for_exit) HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
     if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
     if (g.hproc != nullptr)
     {
-        if (WaitForSingleObject(g.hproc, 2000) != WAIT_OBJECT_0)
-            TerminateProcess(g.hproc, 0);      // it did not exit on the pipe break
+        if (wait_for_exit)
+        {
+            // The host drains for up to 2 s after the pipe break, then signals
+            // UINT64_MAX and exits. 2 s was too tight and could kill a host
+            // that was still releasing GPU waits.
+            if (WaitForSingleObject(g.hproc, 5000) != WAIT_OBJECT_0)
+            {
+                Log("[feed32] host did not exit after the pipe closed; terminating pid %lu",
+                    static_cast<unsigned long>(GetProcessId(g.hproc)));
+                TerminateProcess(g.hproc, 0);
+            }
+        }
         CloseHandle(g.hproc);
         g.hproc = nullptr;
     }
@@ -732,41 +758,74 @@ static bool HostAlive()
 // starts. Preserve the completed log before every spawn so applying settings
 // from the x86 overlay does not erase the telemetry needed for an A/B test.
 // This also captures the previous game session and a host that exited early.
+static bool ModuleDirectory(std::string &dir)
+{
+    char buffer[32768] = {};
+    const DWORD length = GetModuleFileNameA(g_self, buffer, static_cast<DWORD>(sizeof(buffer)));
+    if (length == 0 || length >= sizeof(buffer))
+        return false;
+    char *slash = strrchr(buffer, '\\');
+    if (slash == nullptr)
+    {
+        dir.assign(".");
+        return true;
+    }
+    dir.assign(buffer, static_cast<size_t>(slash - buffer) + 1);
+    return true;
+}
+
+// Win32 A-API file calls stop at MAX_PATH unless the path is prefixed. Prefix
+// only fully-qualified drive-letter paths; a >260 character install directory
+// must log and fail cleanly instead of aborting the game in sprintf_s'
+// invalid-parameter handler.
+static std::string LongPath(const std::string &path)
+{
+    if (path.size() < MAX_PATH ||
+        (path.size() >= 2 && path[0] == '\\' && path[1] == '\\'))
+        return path;
+    return "\\\\?\\" + path;
+}
+
+// ReShade opens host64\ReShade.log in truncate mode whenever the x64 carrier
+// starts. Preserve the completed log before every spawn so applying settings
+// from the x86 overlay does not erase the telemetry needed for an A/B test.
+// This also captures the previous game session and a host that exited early.
 static void ArchivePreviousHostReShadeLog()
 {
-    char game_dir[MAX_PATH];
-    GetModuleFileNameA(g_self, game_dir, MAX_PATH);
-    if (char *s = strrchr(game_dir, '\\')) *(s + 1) = '\0';
-
-    char source[MAX_PATH], archive_dir[MAX_PATH], pattern[MAX_PATH];
-    sprintf_s(source, "%shost64\\ReShade.log", game_dir);
+    std::string game_dir;
+    if (!ModuleDirectory(game_dir))
+    {
+        Log("[feed32] could not resolve the install directory for host log archiving");
+        return;
+    }
+    const std::string source = LongPath(game_dir + "host64\\ReShade.log");
 
     WIN32_FILE_ATTRIBUTE_DATA source_data = {};
-    if (!GetFileAttributesExA(source, GetFileExInfoStandard, &source_data)) return;
+    if (!GetFileAttributesExA(source.c_str(), GetFileExInfoStandard, &source_data)) return;
     if (source_data.nFileSizeHigh == 0 && source_data.nFileSizeLow == 0) return;
 
-    sprintf_s(archive_dir, "%shost64\\logs", game_dir);
-    if (!CreateDirectoryA(archive_dir, nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
+    const std::string archive_dir = LongPath(game_dir + "host64\\logs");
+    if (!CreateDirectoryA(archive_dir.c_str(), nullptr) && GetLastError() != ERROR_ALREADY_EXISTS)
     {
-        Log("[feed32] could not create host log archive %s (error %lu)", archive_dir, GetLastError());
+        Log("[feed32] could not create host log archive %s (error %lu)", archive_dir.c_str(), GetLastError());
         return;
     }
 
     SYSTEMTIME st = {};
     GetLocalTime(&st);
-    char target[MAX_PATH];
+    char leaf[128] = {};
+    std::string target;
     bool named = false;
     for (unsigned suffix = 0; suffix < 100; ++suffix)
     {
         if (suffix == 0)
-            sprintf_s(target, "%s\\ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u.log",
-                archive_dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
-                st.wSecond, st.wMilliseconds);
+            snprintf(leaf, sizeof(leaf), "ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u.log",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds);
         else
-            sprintf_s(target, "%s\\ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u-%02u.log",
-                archive_dir, st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute,
-                st.wSecond, st.wMilliseconds, suffix);
-        if (GetFileAttributesA(target) == INVALID_FILE_ATTRIBUTES)
+            snprintf(leaf, sizeof(leaf), "ReShade-host-%04u%02u%02u-%02u%02u%02u-%03u-%02u.log",
+                st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, suffix);
+        target = archive_dir + "\\" + leaf;
+        if (GetFileAttributesA(target.c_str()) == INVALID_FILE_ATTRIBUTES)
         {
             named = true;
             break;
@@ -778,28 +837,24 @@ static void ArchivePreviousHostReShadeLog()
         return;
     }
 
-    if (!MoveFileExA(source, target, MOVEFILE_WRITE_THROUGH))
+    if (!MoveFileExA(source.c_str(), target.c_str(), MOVEFILE_WRITE_THROUGH))
     {
         Log("[feed32] could not archive host64\\ReShade.log (error %lu)", GetLastError());
         return;
     }
-    Log("[feed32] preserved previous host telemetry: %s", target);
+    Log("[feed32] preserved previous host telemetry: %s", target.c_str());
 
     struct ArchivedLog { std::string path; FILETIME written; };
     std::vector<ArchivedLog> archives;
-    sprintf_s(pattern, "%s\\ReShade-host-*.log", archive_dir);
+    const std::string pattern = archive_dir + "\\ReShade-host-*.log";
     WIN32_FIND_DATAA found = {};
-    HANDLE find = FindFirstFileA(pattern, &found);
+    HANDLE find = FindFirstFileA(pattern.c_str(), &found);
     if (find != INVALID_HANDLE_VALUE)
     {
         do
         {
             if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0)
-            {
-                char path[MAX_PATH];
-                sprintf_s(path, "%s\\%s", archive_dir, found.cFileName);
-                archives.push_back({ path, found.ftLastWriteTime });
-            }
+                archives.push_back({ archive_dir + "\\" + found.cFileName, found.ftLastWriteTime });
         } while (FindNextFileA(find, &found));
         FindClose(find);
     }
@@ -833,22 +888,25 @@ static bool EnsureHost()
     HostClose();
     ArchivePreviousHostReShadeLog();
 
-    char dir[MAX_PATH];
-    GetModuleFileNameA(g_self, dir, MAX_PATH);
-    if (char *s = strrchr(dir, '\\')) *(s + 1) = '\0';
+    std::string dir;
+    if (!ModuleDirectory(dir))
+    {
+        Warn("the game directory path could not be resolved");
+        FeedDisable("the game directory path could not be resolved");
+        return false;
+    }
 
-    char exe[MAX_PATH], legacy_exe[MAX_PATH], cmd[MAX_PATH + 96], wd[MAX_PATH];
-    sprintf_s(exe, "%shost64\\AIO DLSS5 32-bit Wrapper.exe", dir);
-    sprintf_s(legacy_exe, "%shost64\\dlss5-feed-host64.exe", dir);
-    sprintf_s(wd, "%shost64", dir);
-    if (GetFileAttributesA(exe) == INVALID_FILE_ATTRIBUTES)
+    std::string exe = dir + "host64\\AIO DLSS5 32-bit Wrapper.exe";
+    const std::string legacy_exe = dir + "host64\\dlss5-feed-host64.exe";
+    const std::string wd = dir + "host64";
+    if (GetFileAttributesA(LongPath(exe).c_str()) == INVALID_FILE_ATTRIBUTES)
     {
         // One-prototype compatibility fallback. New packages put the clearly
         // named launcher beside addon32; the architecture-conflicting x64 DLLs
         // remain under host64.
-        if (GetFileAttributesA(legacy_exe) != INVALID_FILE_ATTRIBUTES)
+        if (GetFileAttributesA(LongPath(legacy_exe).c_str()) != INVALID_FILE_ATTRIBUTES)
         {
-            strcpy_s(exe, legacy_exe);
+            exe = legacy_exe;
             Log("[feed32] using legacy host64\\dlss5-feed-host64.exe location");
         }
         else
@@ -859,10 +917,20 @@ static bool EnsureHost()
         }
     }
     const HWND game_window = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
-    sprintf_s(cmd, "\"%s\" %lu --hwnd %llu%s%s", exe, GetCurrentProcessId(),
+    char tail[160] = {};
+    snprintf(tail, sizeof(tail), " %lu --hwnd %llu%s%s", GetCurrentProcessId(),
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(game_window)),
         g_cfg.host_window ? "" : " --hide",
         g_cfg.debug ? " --debug" : "");
+    std::string command = "\"" + LongPath(exe) + "\"" + tail;
+    if (command.size() >= 32767)
+    {
+        Warn("the install path is too long to start the 64-bit wrapper");
+        FeedDisable("the install path is too long to start the 64-bit wrapper");
+        return false;
+    }
+    std::vector<char> cmd(command.begin(), command.end());
+    cmd.push_back('\0');
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -871,7 +939,7 @@ static bool EnsureHost()
     sprintf_s(pass_count, "%d", std::clamp(g_aio_nr_pass_count, 1, 3));
     SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", pass_count);
     SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", g_cfg.show_processed_output ? "1" : "0");
-    if (!CreateProcessA(nullptr, cmd, nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, wd, &si, &pi))
+    if (!CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_NO_WINDOW, nullptr, LongPath(wd).c_str(), &si, &pi))
     {
         SetEnvironmentVariableA("DLSS5_AIO_NR_PASSES", nullptr);
         SetEnvironmentVariableA("DLSS5_AIO_SHOW_PROCESSED", nullptr);
@@ -956,9 +1024,7 @@ static float EncodeAioValue(int index, float value)
 
 static void HostIniPath(char *out)
 {
-    GetModuleFileNameA(g_self, out, MAX_PATH);
-    if (char *s = strrchr(out, '\\'))
-        strcpy_s(s + 1, MAX_PATH - (s + 1 - out), "host64\\ReShade.ini");
+    SiblingPath(out, MAX_PATH, "host64\\ReShade.ini");
 }
 
 // Cache of the host's settings, shown and edited on the ReShade overlay page (Add-ons
@@ -1019,7 +1085,7 @@ static void LogHostNR(const char *what)
     Log("%s", line);
 }
 
-static void HostClose();   // below
+static void HostClose(bool wait_for_exit);   // defined above; default argument is on the definition
 static HWND FindHostProxyWindow();
 static void HideClassicD3D9Proxy();
 static void RestoreD3D9StartupFocusIfReady();
@@ -4337,7 +4403,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         ImGui::SameLine();
         HelpMarker("Leave disabled normally. Enable if a 32-bit Direct3D 9 game minimizes, loses its "
                    "device, or cannot coexist with the detached processed-output window in exclusive "
-                   "fullscreen. Restart the game after changing this option.");
+                   "fullscreen. Restart the game after changing this option. Runtime exclusive-fullscreen "
+                   "requests from any API are always converted to borderless; this option only controls the "
+                   "classic D3D9 rewrite at startup.");
 
         if (g.is_d3d9)
             ImGui::TextDisabled("Current classic D3D9 transport: %s",
@@ -4378,16 +4446,31 @@ static bool OnCreateDevice(reshade::api::device_api api, uint32_t & /*api_versio
     return false;   // never change the requested API version
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
 {
     if (reason == DLL_PROCESS_ATTACH)
     {
         g_self = module;
         DisableThreadLibraryCalls(module);
         InitializeCriticalSection(&g_log_cs);
-        GetModuleFileNameA(module, g_log_path, MAX_PATH);
-        if (char *s = strrchr(g_log_path, '\\'))
-            strcpy_s(s + 1, MAX_PATH - (s + 1 - g_log_path), "dlss5-aio-x86.log");
+        {
+            char module_path[32768] = {};
+            const DWORD length = GetModuleFileNameA(module, module_path, static_cast<DWORD>(sizeof(module_path)));
+            const char *log_name = "dlss5-aio-x86.log";
+            const char *slash = length > 0 && length < sizeof(module_path) ? strrchr(module_path, '\\') : nullptr;
+            const size_t dir_length = slash != nullptr ? static_cast<size_t>(slash - module_path) + 1 : 0;
+            if (dir_length > 0 && dir_length + strlen(log_name) + 1 <= sizeof(g_log_path))
+            {
+                memcpy(g_log_path, module_path, dir_length);
+                strcpy_s(g_log_path + dir_length, sizeof(g_log_path) - dir_length, log_name);
+            }
+            else
+            {
+                // Long or unexpected install path: a truncated absolute path is
+                // worse than a relative one, and strcpy_s would abort the game.
+                strcpy_s(g_log_path, log_name);
+            }
+        }
         { FILE *f = nullptr; if (fopen_s(&f, g_log_path, "w") == 0 && f) fclose(f); }
 
         if (!reshade::register_addon(module)) return FALSE;
@@ -4430,7 +4513,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
         reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
-        HostClose();
+        // lpReserved != nullptr means the process is exiting: the OS reclaims the
+        // child and its handles, and waiting (let alone TerminateProcess) under
+        // the loader lock is the hazard. An explicit unload keeps the full wait
+        // so the pipe name is free before a replacement host is spawned.
+        HostClose(reserved == nullptr);
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
     }

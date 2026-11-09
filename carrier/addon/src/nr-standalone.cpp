@@ -382,6 +382,10 @@ static std::atomic<unsigned long long> g_neural_busy_frame_skips{0};
 static std::atomic<unsigned long long> g_proxy_busy_frame_skips{0};
 static bool g_native_streamline_present_hook;
 static std::atomic<bool> g_fullscreen_virtualization_pending{false};
+// zh: Foreground window titles that count as "tuning tools" (the panel and the
+// control center). "|" separates substrings; overridden by
+// [Standalone.DLSSNR] TuningWindowTitles at attach time.
+static std::wstring g_tuning_window_titles = L"WOW-335-NR|DLSS5";
 static bool g_windowed_virtualization_enabled;
 static bool g_auto_windowed_virtualization = true;
 static std::atomic<bool> g_auto_windowed_virtualization_active{false};
@@ -8744,18 +8748,48 @@ static bool IsGameProcessForeground(HWND foreground)
 // the play session; while it holds the foreground the detached output must
 // stay visible, otherwise panel tweaks look like they never apply (the
 // watchdog hides the output as soon as the game loses foreground focus).
+// The title list lives in [Standalone.DLSSNR] TuningWindowTitles; the old
+// hardcoded "DLSS5" also matched unrelated windows that happened to use it.
+static bool ZhTuningTitleMatches(const wchar_t *title)
+{
+    if (title == nullptr || g_tuning_window_titles.empty())
+        return false;
+    const std::wstring &list = g_tuning_window_titles;
+    size_t start = 0;
+    for (;;)
+    {
+        size_t end = list.find(L'|', start);
+        if (end == std::wstring::npos) end = list.size();
+        size_t first = start, last = end;
+        while (first < last && (list[first] == L' ' || list[first] == L'\t')) ++first;
+        while (last > first && (list[last - 1] == L' ' || list[last - 1] == L'\t')) --last;
+        if (last > first)
+        {
+            const std::wstring token = list.substr(first, last - first);
+            if (wcsstr(title, token.c_str()) != nullptr)
+                return true;
+        }
+        if (end == list.size()) break;
+        start = end + 1;
+    }
+    return false;
+}
+
 static bool ZhTuningForeground(HWND foreground)
 {
     if (foreground == nullptr)
+        return false;
+    // Never treat our own windows as tuning tools: a matching output window
+    // would keep itself visible and defeat the focus-loss watchdog.
+    if (foreground == g_proxy_window || foreground == g_game_window ||
+        foreground == g_windowed_virtualization_window.load(std::memory_order_relaxed))
         return false;
     wchar_t window_class[64] = {};
     if (GetClassNameW(foreground, window_class, 64) != 0 &&
         wcscmp(window_class, L"Dlss5PanelWindow") == 0)
         return true;
     wchar_t title[160] = {};
-    // zh: WOW-335-NR 是本项目定名（2026-11-09）；DLSS5 保留兼容旧版调参工具。
-    return GetWindowTextW(foreground, title, 160) > 0 &&
-        (wcsstr(title, L"WOW-335-NR") != nullptr || wcsstr(title, L"DLSS5") != nullptr);
+    return GetWindowTextW(foreground, title, 160) > 0 && ZhTuningTitleMatches(title);
 }
 
 static LRESULT CALLBACK ProxyWindowProc(HWND hwnd, UINT message, WPARAM wparam, LPARAM lparam)
@@ -9983,7 +10017,7 @@ static DWORD WINAPI ProxyWindowThread(void *)
     return 0;
 }
 
-static bool RetireProxyPresentationForColorProfileChange()
+static bool RetireProxyPresentation(const char *reason)
 {
     if (g_proxy_present_thread != nullptr)
     {
@@ -9994,7 +10028,7 @@ static bool RetireProxyPresentationForColorProfileChange()
             return false;
         if (wait != WAIT_OBJECT_0)
         {
-            Log("color profile proxy-worker retirement failed: wait=%lu error=%lu",
+            Log("%s: proxy-worker retirement failed: wait=%lu error=%lu", reason,
                 wait, GetLastError());
             return false;
         }
@@ -10055,7 +10089,7 @@ static bool RetireProxyPresentationForColorProfileChange()
     g_proxy_initialized_early = false;
     g_proxy_failed = false;
     g_proxy_initializing = false;
-    Log("color profile transition retired the old proxy swapchain and presentation resources");
+    Log("%s retired the old proxy swapchain and presentation resources", reason);
     return true;
 }
 
@@ -10082,7 +10116,7 @@ static bool ApplyPendingColorProfileChange(UINT width, UINT height, DXGI_FORMAT 
             return false;
         g_color_profile_resources_retired = true;
     }
-    if (!RetireProxyPresentationForColorProfileChange())
+    if (!RetireProxyPresentation("color profile transition"))
         return false;
 
     const ColorProfile previous = g_active_color_profile;
@@ -10478,18 +10512,15 @@ static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
         g_proxy_present_stop_event == nullptr || g_proxy_present_thread == nullptr)
     {
         Log("native presentation initialization failed at %s: hr=0x%08X win32=%lu", failed_stage, static_cast<unsigned int>(hr), GetLastError());
+        // The previous block reset only the composition target and swapchain.
+        // The RTV/SRV heaps, pipeline, root signature, command lists and events
+        // survived, so a later attempt could bind a stale heap and fail again at
+        // a different stage. Use the same full teardown as the live transition.
+        if (!RetireProxyPresentation("native presentation initialization failure"))
+            Log("native presentation failure cleanup could not retire the presentation thread");
         g_proxy_failed = true;
         UpdateProxyCursorClip(false);
-        if (g_composition_target && g_composition_device)
-        {
-            g_composition_target->SetRoot(nullptr);
-            g_composition_device->Commit();
-        }
-        g_composition_effect.Reset(); g_composition_visual.Reset(); g_composition_target.Reset(); g_composition_device.Reset();
-        g_same_window_compositor = false;
-        g_composition_target_window = nullptr;
-        g_composition_retarget_pending = nullptr;
-        g_proxy_swapchain.Reset(); return false;
+        return false;
     }
     g_proxy_present_format = present_format;
     g_proxy_activation_frames = 0;
@@ -12995,6 +13026,11 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
 static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
 {
     if (!g_enabled || !fullscreen || swapchain == nullptr) return false;
+    // Deliberately applies to every API: an exclusive-fullscreen swapchain
+    // cannot coexist with the separate native-output window, so runtime requests
+    // are converted even when the game is not classic D3D9. The 32-bit wrapper's
+    // classic_d3d9_fullscreen_virtualization key only controls its startup
+    // rewrite; keep the menu/README text aligned with this behavior.
     HWND hwnd = static_cast<HWND>(swapchain->get_hwnd());
     if (hwnd == nullptr) return false;
     if (WindowedVirtualizationEnabled())
@@ -13920,6 +13956,14 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("DebugLog", "0", value, sizeof(value)); g_debug_log = strcmp(value, "0") != 0;
+        {
+            char titles[192] = {};
+            read_setting("TuningWindowTitles", "WOW-335-NR|DLSS5", titles, sizeof(titles));
+            wchar_t wide_titles[192] = {};
+            if (MultiByteToWideChar(CP_UTF8, 0, titles, -1, wide_titles,
+                    static_cast<int>(std::size(wide_titles))) > 0)
+                g_tuning_window_titles = wide_titles;
+        }
         // zh: 启动转储放在全部 read_setting 之后（20261109 审查修复：原先在
         // DebugLog/FrameGeneration/AsyncComputePipeline 读取之前，永远不触发）。
         DebugLog("startup settings: profile=%d source_res=%d preset=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f "

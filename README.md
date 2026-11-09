@@ -69,6 +69,15 @@ NVIDIA 运行时 `nvngx_dlssnr.dll`、`nvngx_dlss.dll`、`nvngx_dlssg.dll` 由�
 `dlss5-feed-host.log`（均在客户端目录）、面板 stdout.log（启动器重定向目录）、控制台
 `DLSS5控制台-debug.log`（exe 旁）、核心 `_scratch/dlss5-aio/logs/core-debug.log`。
 
+## 全屏与调参窗口
+
+- 独占全屏与独立输出窗口不兼容。运行时的独占全屏请求（任意图形 API）会被转换为无边框窗口；
+  `dlss5-aio-x86.cfg` 的 `classic_d3d9_fullscreen_virtualization` 只控制“经典 D3D9 启动时”
+  的改写，不控制运行时请求。
+- 悬浮面板/控制台在前台时，载体保持输出可见。标题白名单可用 `host64/ReShade.ini` 的
+  `[Standalone.DLSSNR] TuningWindowTitles=WOW-335-NR|DLSS5` 覆盖（竖线分隔子串；
+  面板窗口类 `Dlss5PanelWindow` 始终识别）。
+
 ## 载体血统对照
 
 载体 fork 自上游 v2.2.4（commit `5947a3d`），在其上按分支演进。本仓库以初始导入收编

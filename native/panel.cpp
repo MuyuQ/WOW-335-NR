@@ -13,6 +13,7 @@
 #include <tlhelp32.h>
 #include <shellapi.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -258,28 +259,43 @@ static Telemetry ReadTelemetry(DWORD host_pid)
         auto rd32 = [&](size_t off) { unsigned v; memcpy(&v, data + off, 4); return v; };
         auto rd64 = [&](size_t off) { unsigned long long v; memcpy(&v, data + off, 8); return v; };
         if (rd32(0) == 0x4f494144u && rd32(4) == 1 && rd32(8) >= 320 && rd32(12) == host_pid) {
-            const long long sequence = static_cast<long long>(rd64(16));
-            const long long qpc = static_cast<long long>(rd64(24));
-            const long long frequency = static_cast<long long>(rd64(32));
-            if ((sequence & 1) == 0 && static_cast<long long>(rd64(16)) == sequence && qpc > 0 && frequency > 0) {
+            // Seqlock: sample every field first, then require the sequence to be
+            // unchanged across the whole snapshot. The old code verified the
+            // sequence before reading flags/frames/sizes, so a torn snapshot
+            // could still reach the display.
+            for (int attempt = 0; attempt < 4; ++attempt) {
+                const long long before = static_cast<long long>(rd64(16));
+                std::atomic_thread_fence(std::memory_order_acquire);
+                if (before & 1) continue;
+                const long long qpc = static_cast<long long>(rd64(24));
+                const long long frequency = static_cast<long long>(rd64(32));
+                const unsigned flags = rd32(48);
+                const unsigned input_w = rd32(56), input_h = rd32(60);
+                const unsigned output_w = rd32(64), output_h = rd32(68);
+                const unsigned long long nr_frames = rd64(200), sr_frames = rd64(208);
+                const unsigned long long fg_frames = rd64(216), presented = rd64(224);
+                std::atomic_thread_fence(std::memory_order_acquire);
+                const long long after = static_cast<long long>(rd64(16));
+                if (before != after || (after & 1)) continue;
+                if (qpc <= 0 || frequency <= 0) break;
                 LARGE_INTEGER now{};
                 QueryPerformanceCounter(&now);
                 out.age = (now.QuadPart - qpc) / static_cast<double>(frequency);
                 if (out.age >= -0.1 && out.age <= 3.0) {
-                    const unsigned flags = rd32(48);
                     out.available = true;
                     out.nr_enabled = (flags & 2) != 0;
                     out.fg = (flags & 4) != 0;
                     out.pipeline_ready = (flags & 8) != 0;
-                    out.processed_visible = (flags & 32) != 0;
                     out.fg_failed = (flags & 16) != 0;
-                    out.nr_frames = rd64(200);
-                    out.sr_frames = rd64(208);
-                    out.fg_frames = rd64(216);
-                    out.presented = rd64(224);
-                    out.input_w = rd32(56); out.input_h = rd32(60);
-                    out.output_w = rd32(64); out.output_h = rd32(68);
+                    out.processed_visible = (flags & 32) != 0;
+                    out.nr_frames = nr_frames;
+                    out.sr_frames = sr_frames;
+                    out.fg_frames = fg_frames;
+                    out.presented = presented;
+                    out.input_w = input_w; out.input_h = input_h;
+                    out.output_w = output_w; out.output_h = output_h;
                 }
+                break;
             }
         }
         UnmapViewOfFile(view);
@@ -449,6 +465,10 @@ static HWND FindAioMainOutput(DWORD host_pid)
     return nullptr;
 }
 static HWND g_owned_output = nullptr;
+// zh: 跨进程 owner 保证面板始终压在 AIO 输出窗之上。Windows 在 owner 销毁时
+// 会级联销毁 owned 窗口，因此宿主重启或输出窗重建会连带结束面板；这是已知
+// 取舍，由控制中心的守护定时器重新拉起（10 秒级）兜底，不要改成父子窗口或
+// 轮询 SetWindowPos——那会破坏系统级 z 序保证。
 static void MaintainOutputOwnership(DWORD host_pid)
 {
     if (host_pid == 0) { g_owned_output = nullptr; return; }

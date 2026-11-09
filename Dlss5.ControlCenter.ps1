@@ -120,6 +120,7 @@ $actions2.Controls.Add($schemeLabel); $actions2.Controls.Add($schemeCombo); $act
 $actions2.Controls.Add($schemeName); $actions2.Controls.Add($saveScheme); $actions2.Controls.Add($readAdvanced)
 $actions2.Controls.Add($openPanel)
 $script:lastWatchLog = $null
+$script:lastPanelLog = $null
 
 $openPanel.Add_Click({ Invoke-Ui {
     $panelExe = Join-Path $PSScriptRoot 'bin/dlss5-panel.exe'
@@ -128,7 +129,7 @@ $openPanel.Add_Click({ Invoke-Ui {
     if ($running.Count -gt 0) { $output.Text = '面板已在运行。'; return }
     $logDir = Join-Path $project ('_scratch/dlss5-aio/panel-logs/' + [guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($logDir) | Out-Null
-    Start-Process -FilePath $panelExe -ArgumentList @('--game', (Join-Path $clientRow.Box.Text 'wow.exe')) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir 'stdout.log') -RedirectStandardError (Join-Path $logDir 'stderr.log')
+    Start-Process -FilePath $panelExe -ArgumentList @('--game', ('"' + (Join-Path $clientRow.Box.Text 'wow.exe') + '"')) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir 'stdout.log') -RedirectStandardError (Join-Path $logDir 'stderr.log')
     $script:lastPanelLog = $logDir
     $output.Text = '游戏内面板已启动：收起态在游戏右上角，点它或按 Alt+F10 展开。日志：' + $logDir
 } })
@@ -374,8 +375,9 @@ function Update-StatusStrip {
 }
 
 # 鼠标助手自动守护：刷新状态条；游戏在跑/独立输出/助手未启 → 自动拉起，防"忘启动/超时自退"导致鼠标失效。
+# 面板以 AIO 输出窗为跨进程 owner，输出窗重建会级联销毁面板；这里 10 秒轮询也负责把它拉回来。
 $watchTimer = [Windows.Forms.Timer]::new()
-$watchTimer.Interval = 25000
+$watchTimer.Interval = 10000
 $script:watchAutoNote = ''
 $watchTimer.Add_Tick({
     try { Update-StatusStrip } catch { return }
@@ -387,7 +389,7 @@ $watchTimer.Add_Tick({
         if (-not [IO.File]::Exists($panelExe)) { return }
         $logDir = Join-Path $project ('_scratch/dlss5-aio/panel-logs/' + [guid]::NewGuid().ToString('N'))
         [IO.Directory]::CreateDirectory($logDir) | Out-Null
-        Start-Process -FilePath $panelExe -ArgumentList @('--game', (Join-Path $clientRow.Box.Text 'wow.exe')) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir 'stdout.log') -RedirectStandardError (Join-Path $logDir 'stderr.log')
+        Start-Process -FilePath $panelExe -ArgumentList @('--game', ('"' + (Join-Path $clientRow.Box.Text 'wow.exe') + '"')) -WindowStyle Hidden -RedirectStandardOutput (Join-Path $logDir 'stdout.log') -RedirectStandardError (Join-Path $logDir 'stderr.log')
         $script:lastPanelLog = $logDir
         $script:watchAutoNote = ''
         $output.AppendText("[" + (Get-Date -Format 'HH:mm:ss') + "] 检测到游戏运行但面板未启动，已自动拉起。`r`n")
