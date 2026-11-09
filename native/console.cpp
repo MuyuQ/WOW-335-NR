@@ -624,6 +624,33 @@ static const char *SchemeName()
     return "自定义";
 }
 
+// zh: 自绘标题栏图标（最小化/最大化/关闭）。不用字体字形——默认字形范围里没有
+// "□"（U+25A1），会回退成缺字方框；绘制线条尺寸可控且随 DPI 缩放。
+static bool TitleBarIconButton(const char *id, ImVec2 size, int icon, bool close_button)
+{
+    const ImVec4 hover = close_button ? ImVec4(0.898f, 0.325f, 0.294f, 1.0f)
+                                      : ImVec4(0.145f, 0.192f, 0.244f, 1.0f);
+    const bool pressed = ImGui::InvisibleButton(id, size);
+    const bool hovered = ImGui::IsItemHovered();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
+    if (hovered) dl->AddRectFilled(mn, mx, ImGui::GetColorU32(hover), 4.0f * g_dpi_scale);
+    const ImVec2 c((mn.x + mx.x) * 0.5f, (mn.y + mx.y) * 0.5f);
+    const float half = 7.5f * g_dpi_scale;
+    const float thick = 2.0f * g_dpi_scale;
+    const ImU32 color = ImGui::GetColorU32(hovered ? ImVec4(0.98f, 0.98f, 0.98f, 1.0f) : kMuted);
+    if (icon == 0)
+        dl->AddLine(ImVec2(c.x - half, c.y), ImVec2(c.x + half, c.y), color, thick);
+    else if (icon == 1)
+        dl->AddRect(ImVec2(c.x - half, c.y - half), ImVec2(c.x + half, c.y + half),
+            color, 0.0f, 0, thick * 0.8f);
+    else {
+        dl->AddLine(ImVec2(c.x - half, c.y - half), ImVec2(c.x + half, c.y + half), color, thick);
+        dl->AddLine(ImVec2(c.x - half, c.y + half), ImVec2(c.x + half, c.y - half), color, thick);
+    }
+    return pressed;
+}
+
 static void RenderUi(bool game_running, DWORD host_pid)
 {
     RECT rc{};
@@ -647,17 +674,10 @@ static void RenderUi(bool game_running, DWORD host_pid)
     ImGui::TextColored(kAccent, "WOW-335-NR 控制台");
     ImGui::SetCursorPos(ImVec2(
         ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - 3 * btnw, btn_y));
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.145f, 0.192f, 0.244f, 1.0f));
-    if (ImGui::Button("-", ImVec2(btnw - btn_gap, btn_h)))
+    if (TitleBarIconButton("##title_min", ImVec2(btnw - btn_gap, btn_h), 0, false))
         ShowWindow(g_window, SW_MINIMIZE);
-    ImGui::PopStyleColor(3);
     ImGui::SameLine(0, 0);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.145f, 0.192f, 0.244f, 1.0f));
-    if (ImGui::Button("□", ImVec2(btnw - btn_gap, btn_h))) {
+    if (TitleBarIconButton("##title_max", ImVec2(btnw - btn_gap, btn_h), 1, false)) {
         static RECT pre_max{};
         static bool maxed = false;
         RECT cur{}, wa{};
@@ -675,14 +695,9 @@ static void RenderUi(bool game_running, DWORD host_pid)
             maxed = false;
         }
     }
-    ImGui::PopStyleColor(3);
     ImGui::SameLine(0, 0);
-    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
-    ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.898f, 0.325f, 0.294f, 1.0f));
-    if (ImGui::Button("×", ImVec2(btnw - btn_gap, btn_h)))
+    if (TitleBarIconButton("##title_close", ImVec2(btnw - btn_gap, btn_h), 2, true))
         g_running = false;
-    ImGui::PopStyleColor(3);
 
     // 游戏状态 + 启动按钮（内容首行；未指定目录时此行留空，由下方引导卡引导）
     ImGui::SetCursorPosY(tbh + ImGui::GetStyle().ItemSpacing.y);
