@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <string>
@@ -215,26 +216,30 @@ static std::wstring IniPath, ParamsPath;
 static void ReadIniParams(Params &p)
 {
     if (IniPath.empty()) return;
-    const int size = WideCharToMultiByte(CP_ACP, 0, IniPath.c_str(), -1, nullptr, 0, nullptr, nullptr);
-    if (size <= 1) return;
-    std::string ini_ansi(static_cast<size_t>(size) - 1, '\0');
-    WideCharToMultiByte(CP_ACP, 0, IniPath.c_str(), -1, ini_ansi.data(), size - 1, nullptr, nullptr);
-    const char *ini = ini_ansi.c_str();
-    char value[64]{};
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "NeuralRendering", "", value, sizeof value, ini) && value[0])
-        p.nr = value[0] != '0';
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "FrameGeneration", "", value, sizeof value, ini) && value[0])
-        p.fg = value[0] != '0';
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "Model", "", value, sizeof value, ini) && value[0])
-        p.model = std::clamp(atoi(value), 1, 3);
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "Intensity", "", value, sizeof value, ini) && value[0])
-        p.intensity = std::clamp(static_cast<float>(atof(value)), kNrIntensityMin, kNrIntensityMax);
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "LocalTone", "", value, sizeof value, ini) && value[0])
-        p.tone = std::clamp(static_cast<float>(atof(value)), kNrToneMin, kNrToneMax);
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "LocalStructure", "", value, sizeof value, ini) && value[0])
-        p.structure = std::clamp(static_cast<float>(atof(value)), kNrStructureMin, kNrStructureMax);
-    if (GetPrivateProfileStringA("Standalone.DLSSNR", "SkinStructure", "", value, sizeof value, ini) && value[0])
-        p.skin = std::clamp(static_cast<float>(atof(value)), kNrSkinMin, kNrSkinMax);
+    // zh: 用宽字符 API 直接读 wide IniPath，避免 CP_ACP 转换在中文路径下
+    // 静默失败；配置值本身是 ASCII 数字/开关。
+    const wchar_t *section = L"Standalone.DLSSNR";
+    wchar_t value[64]{};
+    auto read = [&](const wchar_t *key) -> const wchar_t * {
+        value[0] = L'\0';
+        GetPrivateProfileStringW(section, key, L"", value,
+            static_cast<DWORD>(sizeof(value) / sizeof(value[0])), IniPath.c_str());
+        return value;
+    };
+    const wchar_t *v = read(L"NeuralRendering");
+    if (v[0]) p.nr = v[0] != L'0';
+    v = read(L"FrameGeneration");
+    if (v[0]) p.fg = v[0] != L'0';
+    v = read(L"Model");
+    if (v[0]) p.model = std::clamp(_wtoi(v), 1, 3);
+    v = read(L"Intensity");
+    if (v[0]) p.intensity = std::clamp(static_cast<float>(_wtof(v)), kNrIntensityMin, kNrIntensityMax);
+    v = read(L"LocalTone");
+    if (v[0]) p.tone = std::clamp(static_cast<float>(_wtof(v)), kNrToneMin, kNrToneMax);
+    v = read(L"LocalStructure");
+    if (v[0]) p.structure = std::clamp(static_cast<float>(_wtof(v)), kNrStructureMin, kNrStructureMax);
+    v = read(L"SkinStructure");
+    if (v[0]) p.skin = std::clamp(static_cast<float>(_wtof(v)), kNrSkinMin, kNrSkinMax);
 }
 
 // ===== 遥测（共享内存直读，偏移与 performance/telemetry_reader.py 一致） =====
@@ -668,7 +673,15 @@ static void PageNr()
     if (ImGui::SliderFloat("皮肤结构", &g_params.skin, kNrSkinMin, kNrSkinMax, "%.2f"))
         g_params_dirty = true;
     ClampParams(g_params);
-    if (ImGui::Button("读取游戏配置")) { Params p; ReadIniParams(p); ClampParams(p); g_params = p; }
+    if (ImGui::Button("从载体 ini 重新读取")) {
+        Params p;
+        ReadIniParams(p);
+        ClampParams(p);
+        g_params = p;
+        DebugLine(L"carrier ReShade.ini re-read into the panel (display only)");
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("从 host64\\ReShade.ini 读取载体已保存的值；只同步显示，不写入载体。");
     if (g_tier_locked) ImGui::EndDisabled();
 }
 
