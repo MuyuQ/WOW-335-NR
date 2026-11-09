@@ -103,8 +103,17 @@ static void Warn(const char *fmt, ...)
     reshade::log::message(reshade::log::level::warning, tagged);
 }
 
+// zh: 详细诊断开关——cfg 的 debug 位的前置镜像（CfgReload 同步；标志需在
+// Breadcrumb/g_cfg 之前可用，20261109）。
+static int g_debug_verbose = 0;
+#define DebugLog(...) do { if (g_debug_verbose) Log(__VA_ARGS__); } while (0)
+
 static const char *volatile g_where = "starting up";
-static void Breadcrumb(const char *what) { g_where = what; }
+static void Breadcrumb(const char *what)
+{
+    g_where = what;
+    DebugLog("breadcrumb: %s", what);   // debug 开启时把足迹也写进日志（此前只写不读）
+}
 
 // ---------------------------------------------------------------------------
 // Configuration: same dlss5-feed.cfg as the 64-bit add-on (extra keys ignored)
@@ -125,11 +134,12 @@ struct Cfg
     int   classic_d3d9_cpu_fallback; // opt-in CPU readback when D3D9/D3D11 sharing is unsupported
     int   classic_d3d9_fullscreen_virtualization; // opt-in initial exclusive -> borderless rewrite
     float mv_scale_x, mv_scale_y;
+    int   debug;           // 1 = verbose diagnostics (breadcrumbs, host spawn, host --debug)
 };
 
 // The AIO wrapper must start in the full processing path. Mode 1 exists only
 // as a transport diagnostic and intentionally returns the unprocessed frame.
-static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 1, 100, 0, 0, 1.0f, 1.0f };
+static Cfg g_cfg = { 1, 2, -1, -1, -1, 0, 3, 0, 1, 100, 0, 0, 1.0f, 1.0f, 0 };
 static int       g_work_resolution_ui = 100;
 static int       g_pending_work_resolution = 0;
 static ULONGLONG g_work_resolution_apply_after = 0;
@@ -160,11 +170,11 @@ static void CfgWriteDefault()
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
                "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\n"
                "classic_d3d9_cpu_fallback=%d\nclassic_d3d9_fullscreen_virtualization=%d\n"
-               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "mv_scale_x=%.3f\nmv_scale_y=%.3f\ndebug=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
             g_cfg.classic_d3d9_cpu_fallback, g_cfg.classic_d3d9_fullscreen_virtualization,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.debug);
     fclose(f);
 }
 
@@ -180,11 +190,11 @@ static void CfgSave()
     fprintf(f, "enabled=%d\nmode=%d\nhdr=%d\ndepth_inverted=%d\nflags=%d\nreset_every=%d\nlog_frames=%d\n"
                "host_window=%d\nshow_processed_output=%d\nwork_resolution=%d\n"
                "classic_d3d9_cpu_fallback=%d\nclassic_d3d9_fullscreen_virtualization=%d\n"
-               "mv_scale_x=%.3f\nmv_scale_y=%.3f\n",
+               "mv_scale_x=%.3f\nmv_scale_y=%.3f\ndebug=%d\n",
             g_cfg.enabled, g_cfg.mode, g_cfg.hdr, g_cfg.depth_inverted, g_cfg.flags, g_cfg.reset_every,
             g_cfg.log_frames, g_cfg.host_window, g_cfg.show_processed_output, g_cfg.work_resolution,
             g_cfg.classic_d3d9_cpu_fallback, g_cfg.classic_d3d9_fullscreen_virtualization,
-            g_cfg.mv_scale_x, g_cfg.mv_scale_y);
+            g_cfg.mv_scale_x, g_cfg.mv_scale_y, g_cfg.debug);
     fclose(f);
 }
 
@@ -229,6 +239,7 @@ static bool CfgReload()   // true when a build-affecting value changed
         else if (_stricmp(key, "work_resolution")== 0) next.work_resolution = iv;
         else if (_stricmp(key, "classic_d3d9_cpu_fallback") == 0) next.classic_d3d9_cpu_fallback = iv;
         else if (_stricmp(key, "classic_d3d9_fullscreen_virtualization") == 0) next.classic_d3d9_fullscreen_virtualization = iv;
+        else if (_stricmp(key, "debug")           == 0) next.debug           = iv;
         else if (_stricmp(key, "mv_scale_x")     == 0) next.mv_scale_x     = val;
         else if (_stricmp(key, "mv_scale_y")     == 0) next.mv_scale_y     = val;
     }
@@ -237,6 +248,8 @@ static bool CfgReload()   // true when a build-affecting value changed
     next.classic_d3d9_cpu_fallback = next.classic_d3d9_cpu_fallback != 0 ? 1 : 0;
     next.classic_d3d9_fullscreen_virtualization =
         next.classic_d3d9_fullscreen_virtualization != 0 ? 1 : 0;
+    next.debug = next.debug != 0 ? 1 : 0;
+    g_debug_verbose = next.debug;   // zh: 热重载同步诊断开关（60 帧一次）
     const bool rebuild = next.mode != g_cfg.mode || next.hdr != g_cfg.hdr ||
                          next.depth_inverted != g_cfg.depth_inverted || next.flags != g_cfg.flags ||
                          next.classic_d3d9_cpu_fallback != g_cfg.classic_d3d9_cpu_fallback ||
@@ -846,9 +859,10 @@ static bool EnsureHost()
         }
     }
     const HWND game_window = g.runtime != nullptr ? static_cast<HWND>(g.runtime->get_hwnd()) : nullptr;
-    sprintf_s(cmd, "\"%s\" %lu --hwnd %llu%s", exe, GetCurrentProcessId(),
+    sprintf_s(cmd, "\"%s\" %lu --hwnd %llu%s%s", exe, GetCurrentProcessId(),
         static_cast<unsigned long long>(reinterpret_cast<uintptr_t>(game_window)),
-        g_cfg.host_window ? "" : " --hide");
+        g_cfg.host_window ? "" : " --hide",
+        g_cfg.debug ? " --debug" : "");
 
     STARTUPINFOA si = { sizeof(si) };
     PROCESS_INFORMATION pi = {};
@@ -4209,22 +4223,23 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         ImGui::Text("已传输帧数：%llu", static_cast<unsigned long long>(g.frames_done));
     ImGui::Separator();
 
-    // 档位区（存储域：NR 0/1，Model 0/1/2，其余 0-2 与 -1..1）
-    static const char *kTierNames[6] = {"原画", "轻触", "标准", "强结构", "柔和", "电影"};
-    static const float kTiers[6][5] = {
-        {0, 1.0f, 1.0f, 1.0f, -1.0f},
-        {1, 0.5f, 1.0f, 1.0f, -1.0f},
-        {1, 1.0f, 1.0f, 1.0f, -1.0f},
-        {1, 1.0f, 1.0f, 2.0f, -1.0f},
-        {1, 0.7f, 0.8f, 0.6f, -1.0f},
-        {1, 1.0f, 1.5f, 1.2f, -1.0f},
+    // 档位区（存储域：NR 0/1，强度/结构 0-1，色调 0-2，皮肤 -1..1——与 native/tiers.hpp 一致）
+    // 20261109 修复：旧表 6 行、选中判定按 model/intensity/... 错位一列读取且
+    // kTiers[t][5] 越界（每行只有 5 列），高亮永远不会正确匹配；现与面板/控制台
+    // 共用同一组出厂档位（nr/强度/色调/结构/皮肤），模型不参与档位。
+    static const char *kTierNames[4] = {"原画", "轻量", "均衡", "浓郁"};
+    static const float kTiers[4][5] = {
+        {0.0f, 1.0f,  1.0f, 1.0f,  -1.0f},
+        {1.0f, 0.20f, 1.0f, 0.10f, -1.0f},
+        {1.0f, 0.35f, 1.0f, 0.25f, -1.0f},
+        {1.0f, 0.60f, 1.3f, 0.50f, -1.0f},
     };
     ImGui::SeparatorText("档位");
-    for (int t = 0; t < 6; ++t) {
+    for (int t = 0; t < 4; ++t) {
         if (t % 3) ImGui::SameLine();
-        const bool active = g_nr[idx_nr] == kTiers[t][0] && g_nr[idx_model] == kTiers[t][1] &&
-            fabsf(g_nr[idx_int] - kTiers[t][2]) < 0.005f && fabsf(g_nr[idx_tone] - kTiers[t][3]) < 0.005f &&
-            fabsf(g_nr[idx_str] - kTiers[t][4]) < 0.005f && fabsf(g_nr[idx_skin] - kTiers[t][5]) < 0.005f;
+        const bool active = g_nr[idx_nr] == kTiers[t][0] &&
+            fabsf(g_nr[idx_int] - kTiers[t][1]) < 0.005f && fabsf(g_nr[idx_tone] - kTiers[t][2]) < 0.005f &&
+            fabsf(g_nr[idx_str] - kTiers[t][3]) < 0.005f && fabsf(g_nr[idx_skin] - kTiers[t][4]) < 0.005f;
         if (active) ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.45f, 0.28f, 1.0f));
         if (ImGui::Button(kTierNames[t], ImVec2(104, 0))) {
             g_nr[idx_nr] = kTiers[t][0];
@@ -4253,7 +4268,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_nr_touched[idx_model] = true;
         ApplyZhChange();
     }
-    if (ImGui::SliderFloat("强度", &g_nr[idx_int], 0.0f, 2.0f, "%.2f")) {
+    if (ImGui::SliderFloat("强度", &g_nr[idx_int], 0.0f, 1.0f, "%.2f")) {
         g_nr_touched[idx_int] = true;
         ApplyZhChange();
     }
@@ -4261,7 +4276,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         g_nr_touched[idx_tone] = true;
         ApplyZhChange();
     }
-    if (ImGui::SliderFloat("结构强度", &g_nr[idx_str], 0.0f, 2.0f, "%.2f")) {
+    if (ImGui::SliderFloat("结构强度", &g_nr[idx_str], 0.0f, 1.0f, "%.2f")) {
         g_nr_touched[idx_str] = true;
         ApplyZhChange();
     }

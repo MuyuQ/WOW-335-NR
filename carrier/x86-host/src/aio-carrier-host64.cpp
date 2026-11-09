@@ -39,6 +39,9 @@ static HWND g_game_window_hint = nullptr;
 static DWORD g_game_pid;
 static bool g_renodx_lazy = false;   // DLSS 5 add-on is v45+ (per-present rescan, lazy adoption)
 static bool g_renodx_v46  = false;   // DLSS 5 add-on is v4.6+ (global hotkeys, upscaling latch)
+// zh: --debug（由 wrapper32 的 cfg debug 位透传）：帧级采样与超时细节。
+static bool g_debug = false;
+#define DebugLog(...) do { if (g_debug) Log(__VA_ARGS__); } while (0)
 
 static void Log(const char *fmt, ...);
 
@@ -1194,8 +1197,12 @@ static int Serve(DWORD game_pid)
         {
             FeedFrameMsg fm = {};
             if (!ReadFull(pipe, &fm, sizeof(fm))) break;
+            const ULONGLONG wait_begin = GetTickCount64();
             if (!WaitFenceValue(h.fence_in, fm.n, 2000))
             { Log("[host] frame %llu: in-fence never arrived", (unsigned long long)fm.n); h.fence_out->Signal(fm.n); continue; }
+            if (g_debug && GetTickCount64() - wait_begin > 50)
+                Log("[host][debug] frame %llu in-fence CPU wait took %llu ms",
+                    (unsigned long long)fm.n, (unsigned long long)(GetTickCount64() - wait_begin));
             h.queue->Wait(h.fence_in, fm.n);   // belt and braces on the GPU timeline
 
             bool completion_queued = false;
@@ -1207,6 +1214,10 @@ static int Serve(DWORD game_pid)
                 Log("[carrier] frame %llu was released without a processed Present",
                     static_cast<unsigned long long>(fm.n));
 
+            if (g_debug && (fm.n % 300) == 1)
+                DebugLog("frame sample n=%llu done=%d completion_queued=%d fmt=%u %ux%u",
+                    (unsigned long long)fm.n, done ? 1 : 0, completion_queued ? 1 : 0,
+                    static_cast<unsigned>(h.color_fmt), h.width, h.height);
             if (fm.n <= 3 || (fm.n % 1800) == 0)
                 Log("[carrier] frame %llu presented to AIO", (unsigned long long)fm.n);
             PumpMessages();
@@ -1247,11 +1258,13 @@ int main(int argc, char **argv)
     {
         if      (strcmp(argv[i], "--test") == 0) test = true;
         else if (strcmp(argv[i], "--hide") == 0) hide = true;
+        else if (strcmp(argv[i], "--debug") == 0) g_debug = true;
         else if (strcmp(argv[i], "--hwnd") == 0 && i + 1 < argc)
             g_game_window_hint = reinterpret_cast<HWND>(
                 static_cast<uintptr_t>(_strtoui64(argv[++i], nullptr, 0)));
         else pid = static_cast<DWORD>(strtoul(argv[i], nullptr, 10));
     }
+    DebugLog("debug logging enabled via --debug");
     if (!test && pid == 0)
     {
         Log("usage: AIO DLSS5 32-bit Wrapper.exe <game pid> [--hwnd N] [--hide]");

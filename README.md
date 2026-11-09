@@ -52,6 +52,23 @@ NVIDIA 运行时 `nvngx_dlssnr.dll`、`nvngx_dlss.dll`、`nvngx_dlssg.dll` 由�
 - 项目设计、执行依据与验收记录在主工作区 `doc/维护/`、`doc/记录/` 的 DLSS5-AIO 系列
   文档，本仓库不重复维护。
 
+## 诊断开关
+
+各组件默认不打详细日志；排查问题时按组件打开，验收后关掉：
+
+| 组件 | 开关 | 生效方式 |
+| --- | --- | --- |
+| 载体插件（addon64） | `host64/ReShade.ini` 的 `[Standalone.DLSSNR]` 加 `DebugLog=1`；或 Home→Add-ons 菜单页勾选 | 菜单切换即时生效 |
+| 32 位包装器（addon32） | 客户端根 `dlss5-aio-x86.cfg` 加 `debug=1` | 每 60 帧热重载，约 1 秒 |
+| 64 位载体（host64） | 包装器开启调试后自动传 `--debug` | 随包装器 |
+| 游戏内悬浮面板 | 桌面控制台开启调试后启动面板自动传 `--debug` | 重启面板 |
+| 桌面控制台 | exe 旁 `DLSS5控制台.ini` 加一行 `debug=1` | 重启控制台 |
+| PowerShell 核心 | 环境变量 `DLSS5_CORE_DEBUG=1` | 下次安装/恢复操作 |
+
+调试输出位置：载体插件 `standalone-dlssnr.log`、包装器 `dlss5-aio-x86.log`、64 位载体
+`dlss5-feed-host.log`（均在客户端目录）、面板 stdout.log（启动器重定向目录）、控制台
+`DLSS5控制台-debug.log`（exe 旁）、核心 `_scratch/dlss5-aio/logs/core-debug.log`。
+
 ## 载体血统对照
 
 载体 fork 自上游 v2.2.4（commit `5947a3d`），在其上按分支演进。本仓库以初始导入收编

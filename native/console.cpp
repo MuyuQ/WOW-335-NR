@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <cstdarg>
 #include <algorithm>
 
 #include "imgui.h"
@@ -60,6 +61,32 @@ static const struct { const char *name; Params p; } kSchemes[] = {
 
 
 static std::wstring IniPath;   // zh: host64\ReShade.ini（只读；调参写入由悬浮面板经 live-params 完成）
+// zh: 调试日志开关——DLSS5控制台.ini 加一行 debug=1（20261109）。GUI 程序没有
+// stdout，调试行写入 exe 旁的 DLSS5控制台-debug.log（ASCII 行 + UTF-8 片段），
+// 启动时截断。日志量低（秒级 tick 与状态转换），逐行开关文件即可。
+static bool g_debug_log = false;
+static std::wstring g_debug_log_path;
+
+static void DebugLogF(const char *format, ...)
+{
+    if (!g_debug_log || g_debug_log_path.empty()) return;
+    char message[1024];
+    va_list args;
+    va_start(args, format);
+    _vsnprintf_s(message, sizeof(message), _TRUNCATE, format, args);
+    va_end(args);
+    SYSTEMTIME now;
+    GetLocalTime(&now);
+    char line[1100];
+    _snprintf_s(line, sizeof(line), _TRUNCATE, "%02u:%02u:%02u.%03u %s\n",
+        now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, message);
+    HANDLE f = CreateFileW(g_debug_log_path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
+                           OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (f == INVALID_HANDLE_VALUE) return;
+    DWORD written = 0;
+    WriteFile(f, line, static_cast<DWORD>(std::strlen(line)), &written, nullptr);
+    CloseHandle(f);
+}
 static void ReadIniParams(Params &p)
 {
     if (IniPath.empty()) return;
@@ -243,6 +270,8 @@ static void EnsureOverlayPanel()
     HANDLE err_file = CreateFileW(err_log.c_str(), GENERIC_WRITE, FILE_SHARE_READ, &sa,
                                   CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     std::wstring cmdline = L"\"" + panel + L"\" --game \"" + g_game_exe + L"\"";
+    if (g_debug_log) cmdline += L" --debug";   // zh: 控制台调试开启时，面板也输出调试行
+    DebugLogF("panel spawn: %ls", cmdline.c_str());
     STARTUPINFOW si{sizeof(si)};
     si.dwFlags = STARTF_USESTDHANDLES;
     si.hStdOutput = out_file;
@@ -250,6 +279,7 @@ static void EnsureOverlayPanel()
     PROCESS_INFORMATION pi{};
     const bool ok = CreateProcessW(nullptr, cmdline.data(), nullptr, nullptr, TRUE,
                                    CREATE_NO_WINDOW, nullptr, g_client_dir.c_str(), &si, &pi);
+    DebugLogF("panel spawn %s (pid=%lu)", ok ? "ok" : "FAILED", ok ? pi.dwProcessId : 0);
     if (out_file) CloseHandle(out_file);
     if (err_file) CloseHandle(err_file);
     if (ok) {
@@ -319,12 +349,16 @@ static void WriteMaxFps(int fps, int bg)
     set_line("MaxFPSBackground", bg);
     file = CreateFileW(g_config_wtf.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                        FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
+    if (file == INVALID_HANDLE_VALUE) {
+        DebugLogF("maxfps save FAILED (path=%ls locked or missing)", g_config_wtf.c_str());
+        return;
+    }
     DWORD written = 0;
     WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
     CloseHandle(file);
     g_max_fps = fps;
     g_max_fps_background = bg;
+    DebugLogF("maxfps saved: foreground=%d background=%d (%ls)", fps, bg, g_config_wtf.c_str());
 }
 
 // ===== ImGui / D3D11 =====
@@ -385,6 +419,7 @@ static void RefreshClientPaths()
     const std::wstring host64 = JoinPath(g_client_dir, L"host64");
     IniPath = JoinPath(host64, L"ReShade.ini");
     g_config_wtf = JoinPath(JoinPath(g_client_dir, L"WTF"), L"Config.wtf");
+    DebugLogF("client paths refreshed: ini=%ls wtf=%ls", IniPath.c_str(), g_config_wtf.c_str());
 }
 
 // zh: 载入参数并重判档位锁定；启动时与选完目录后共用同一入口。
@@ -832,9 +867,20 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
                         g_client_dir = std::move(dir);
                     }
                 }
+                // zh: 调试开关：ini 里手工加一行 debug=1（行首或换行后），重启生效。
+                const char *dbg = std::strstr(buf, "debug=");
+                if (dbg && (dbg == buf || dbg[-1] == '\n' || dbg[-1] == '\r') && dbg[6] == '1')
+                    g_debug_log = true;
             }
             CloseHandle(f);
         }
+    }
+    g_debug_log_path = g_self_dir + L"DLSS5控制台-debug.log";
+    if (g_debug_log) {
+        HANDLE f = CreateFileW(g_debug_log_path.c_str(), GENERIC_WRITE, FILE_SHARE_READ, nullptr,
+                               CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (f != INVALID_HANDLE_VALUE) CloseHandle(f);
+        DebugLogF("console started with debug=1 (self=%ls)", g_self_dir.c_str());
     }
 
     if (!arg_game.empty()) {
@@ -912,6 +958,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             host_pid = FindPidByPath(host_exe.c_str());
             const bool now_running = game_pid != 0;
             game_running = now_running;   // 面板拉起统一由 5 秒守护负责（避免同秒双重拉起）
+            static bool prev_running = false;
+            if (now_running != prev_running) {
+                DebugLogF("game %s (pid=%lu), host pid=%lu", now_running ? "started" : "exited",
+                    static_cast<unsigned long>(game_pid), static_cast<unsigned long>(host_pid));
+                prev_running = now_running;
+            }
             // 游戏窗口（按类名匹配到游戏进程）
             HWND game_window = FindWindowExW(nullptr, nullptr, L"GxWindowClassD3d", nullptr);
             g_game_hwnd_seen = nullptr;
@@ -930,6 +982,19 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             last_tele = now;
             g_tele = host_pid ? ReadTelemetry(host_pid) : Telemetry{};
             g_layer = EvaluateLayerCover(host_pid);
+            {
+                static LayerState prev_layer = LayerState::NoHost;
+                if (g_layer != prev_layer) {
+                    DebugLogF("layer state -> %s", LayerShortName(g_layer));
+                    prev_layer = g_layer;
+                }
+                static DWORD last_dbg_tele = 0;
+                if (g_debug_log && !g_tele.available && host_pid && now - last_dbg_tele >= 10000) {
+                    last_dbg_tele = now;
+                    DebugLogF("telemetry unavailable (host=%lu; mapping missing or stale)",
+                        static_cast<unsigned long>(host_pid));
+                }
+            }
             if (g_tele.presented > 0 && g_last_presented_qpc) {
                 LARGE_INTEGER now_qpc{}, freq{};
                 QueryPerformanceCounter(&now_qpc);

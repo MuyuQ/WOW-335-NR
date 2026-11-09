@@ -4,6 +4,19 @@ $script:ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $script:ScratchRoot = [IO.Path]::GetFullPath((Join-Path $script:ProjectRoot '_scratch'))
 $script:OperationsRoot = [IO.Path]::GetFullPath((Join-Path $script:ScratchRoot 'dlss5-aio/control-operations'))
 $script:LockFile = Join-Path $PSScriptRoot 'payload-lock.json'
+# zh: 调试追踪——环境变量 DLSS5_CORE_DEBUG=1 时把事务关键步骤写入
+# _scratch/dlss5-aio/logs/core-debug.log（20261109）。日志文件不入库（logs/）。
+$script:DebugEnabled = ($env:DLSS5_CORE_DEBUG -eq '1')
+$script:DebugLogPath = [IO.Path]::GetFullPath((Join-Path $script:ScratchRoot 'dlss5-aio/logs/core-debug.log'))
+function Write-Dlss5CoreDebug {
+    param([Parameter(Mandatory)][string]$Message)
+    if (-not $script:DebugEnabled) { return }
+    try {
+        [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($script:DebugLogPath)) | Out-Null
+        $stamp = [DateTime]::Now.ToString('HH:mm:ss.fff')
+        [IO.File]::AppendAllText($script:DebugLogPath, "$stamp $Message`r`n", [Text.UTF8Encoding]::new($false))
+    } catch { }
+}
 if (-not ('Wow335.Dlss5.FileApi' -as [type])) {
     Add-Type -TypeDefinition @'
 using System;
@@ -196,6 +209,7 @@ function Invoke-Dlss5Install {
     Assert-ProcessesStopped
     $preview = Get-Dlss5InstallPreview -Client $Client -Stage $Stage
     if (-not $preview.CanInstall) { throw '安装预检未通过；请查看文件冲突和来源状态。' }
+    Write-Dlss5CoreDebug ("install begin: client={0} stage={1} members={2}" -f $preview.Client, $preview.Stage, @($preview.Items).Count)
     $lock = Get-Dlss5Lock
     Assert-NoReparse $script:OperationsRoot
     [IO.Directory]::CreateDirectory($script:OperationsRoot) | Out-Null
@@ -215,10 +229,12 @@ function Invoke-Dlss5Install {
     $pendingTemps = [Collections.Generic.List[object]]::new()
     try {
         Copy-Verified $original $backup $lock.original_d3d9_sha256
+        Write-Dlss5CoreDebug "original d3d9.dll backed up and verified"
         foreach ($item in $preview.Items) {
             $staged = Get-MemberPath $operation ('stage/' + $item.Target)
             Copy-Verified $item.Source $staged $item.Sha256
         }
+        Write-Dlss5CoreDebug ("staged {0} members; entering install phase" -f @($preview.Items).Count)
         $record.status = 'in_progress'
         Write-JsonAtomic $recordPath $record
         Assert-ProcessesStopped
@@ -252,12 +268,15 @@ function Invoke-Dlss5Install {
             if ((Get-Sha256 $dest) -ne $item.Sha256) { throw "安装回读不一致：$($item.Target)" }
             $record.applied = @($record.applied) + @($item.Target)
             Write-JsonAtomic $recordPath $record
+            Write-Dlss5CoreDebug ("installed {0}" -f $item.Target)
         }
         $record.status = 'completed'
         Write-JsonAtomic $recordPath $record
+        Write-Dlss5CoreDebug ("install completed: {0} members, operation {1}" -f $changed.Count, $operation)
         return [pscustomobject]@{ Status = 'completed'; Operation = $operation; Count = $changed.Count }
     } catch {
         $cause = $_.Exception.Message
+        Write-Dlss5CoreDebug ("install failed, rolling back: {0}" -f $cause)
         foreach ($tempInfo in $pendingTemps) {
             try {
                 if ([IO.File]::Exists($tempInfo.Path)) {
@@ -380,6 +399,7 @@ function Invoke-Dlss5Restore {
                 throw '安装暂存路径仍存在，已保留并需要人工检查。'
             }
             $report.restored = @($report.restored) + @([string]$member.target)
+            Write-Dlss5CoreDebug ("restored {0}" -f $member.target)
         } catch { $report.errors = @($report.errors) + @("$($member.target)：$($_.Exception.Message)") }
     }
     if (@($report.errors).Count) {

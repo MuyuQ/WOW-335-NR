@@ -289,6 +289,27 @@ static Telemetry ReadTelemetry(DWORD host_pid)
 }
 
 // ===== 状态 =====
+static bool g_debug_log = false;   // zh: --debug（控制台按自身开关透传）；输出到 stdout.log
+
+// zh: stdout 统一出口（此前是 wmain 里的 lambda；调试行在别的函数也要用，提为全局）。
+static void OutUtf8(const wchar_t *t)
+{
+    int size = WideCharToMultiByte(CP_UTF8, 0, t, -1, nullptr, 0, nullptr, nullptr);
+    if (size > 1) {
+        std::vector<char> bytes(size - 1);
+        WideCharToMultiByte(CP_UTF8, 0, t, -1, bytes.data(), size - 1, nullptr, nullptr);
+        fwrite(bytes.data(), 1, bytes.size(), stdout);
+        fflush(stdout);
+    }
+}
+static void DebugLine(const wchar_t *t)
+{
+    if (!g_debug_log) return;
+    OutUtf8(L"[debug] ");
+    OutUtf8(t);
+    OutUtf8(L"\n");
+}
+
 static HWND g_window = nullptr;
 static bool g_dragging = false;         // zh: WM_ENTERSIZEMOVE/EXITSIZEMOVE 之间
 static bool g_user_positioned = false;  // zh: 用户拖动过后：位置按用户偏移跟随游戏窗口
@@ -355,6 +376,7 @@ static void ApplyStyle()
 static void ToggleExpanded()
 {
     g_expanded = !g_expanded;
+    DebugLine(g_expanded ? L"panel expanded (interactive)" : L"panel collapsed (click-through strip)");
     // 立即预设目标尺寸，避免切换瞬间内容被旧尺寸裁切一帧
     LONG_PTR ex = GetWindowLongPtrW(g_window, GWL_EXSTYLE);
     if (g_expanded) ex &= ~WS_EX_TRANSPARENT;
@@ -434,9 +456,11 @@ static void MaintainOutputOwnership(DWORD host_pid)
     if (aio_output && aio_output != g_owned_output) {
         SetWindowLongPtrW(g_window, GWLP_HWNDPARENT, reinterpret_cast<LONG_PTR>(aio_output));
         g_owned_output = aio_output;
+        DebugLine(L"output owner attached (panel follows the AIO output window)");
     }
     else if (!aio_output && g_owned_output) {
         g_owned_output = nullptr;
+        DebugLine(L"output owner lost");
     }
 }
 
@@ -921,26 +945,27 @@ int wmain(int argc, wchar_t **argv)
     if (GetLastError() == ERROR_ALREADY_EXISTS) return 0;
 
     setvbuf(stdout, nullptr, _IONBF, 0);
-    auto out = [](const wchar_t *t) {
-        int size = WideCharToMultiByte(CP_UTF8, 0, t, -1, nullptr, 0, nullptr, nullptr);
-        if (size > 1) {
-            std::vector<char> bytes(size - 1);
-            WideCharToMultiByte(CP_UTF8, 0, t, -1, bytes.data(), size - 1, nullptr, nullptr);
-            fwrite(bytes.data(), 1, bytes.size(), stdout);
-            fflush(stdout);
-        }
-    };
+    auto out = [](const wchar_t *t) { OutUtf8(t); };
     auto out_line = [&](const wchar_t *t) { out(t); out(L"\n"); };
-    if (argc != 3 || std::wstring(argv[1]) != L"--game") {
-        out_line(L"用法：dlss5-panel.exe --game <wow.exe 绝对路径>");
+    // zh: 参数 --game <wow.exe 路径> [--debug]（20261109：控制台按自身开关透传调试行）
+    const wchar_t *game_arg = nullptr;
+    bool debug_arg = false;
+    for (int i = 1; argv && i < argc; ++i) {
+        if (wcscmp(argv[i], L"--game") == 0 && i + 1 < argc) game_arg = argv[++i];
+        else if (wcscmp(argv[i], L"--debug") == 0) debug_arg = true;
+    }
+    g_debug_log = debug_arg;
+    if (!game_arg) {
+        out_line(L"用法：dlss5-panel.exe --game <wow.exe 绝对路径> [--debug]");
         return 2;
     }
     fs::path game;
     try {
-        game = fs::path(argv[2]);
+        game = fs::path(game_arg);
         if (!game.is_absolute() || _wcsicmp(game.filename().c_str(), L"wow.exe") != 0) return 3;
         game = game.lexically_normal();
     } catch (const fs::filesystem_error &) { return 3; }
+    if (g_debug_log) out_line(L"[debug] panel started with --debug; diagnostics follow in stdout.log");
     const fs::path host = game.parent_path() / L"host64" / L"AIO DLSS5 32-bit Wrapper.exe";
     // zh: 结构校验（文件存在 + 无链接）——SHA 绑定只适用于单机私人部署，
     // 分发时目标客户端的哈希必然不同，写配置文件本身对任意 DLSS5-AIO 客户端无害。
@@ -1025,6 +1050,13 @@ int wmain(int argc, wchar_t **argv)
             if (!saw_game) out_line(L"已检测到游戏，面板显示。");
             saw_game = true;
             ShowWindow(g_window, SW_SHOWNA);
+            if (g_debug_log) {
+                wchar_t buf[128]{};
+                std::swprintf(buf, 128, L"procs: game=%lu host=%lu uncertain=%d",
+                    static_cast<unsigned long>(procs.game_pid),
+                    static_cast<unsigned long>(procs.host_pid), procs.uncertain ? 1 : 0);
+                DebugLine(buf);
+            }
         }
         // 游戏窗口矩形：按窗口类查找并校验属于已匹配的游戏进程
         HWND game_window = FindWindowExW(nullptr, nullptr, L"GxWindowClassD3d", nullptr);
@@ -1052,6 +1084,16 @@ int wmain(int argc, wchar_t **argv)
             g_last_host_pid = procs.host_pid;
             g_tele = g_last_host_pid ? ReadTelemetry(g_last_host_pid) : Telemetry{};
             g_layer = EvaluateLayerCover();
+            {
+                static DWORD last_dbg_tele = 0;
+                if (g_debug_log && !g_tele.available && now - last_dbg_tele >= 10000) {
+                    last_dbg_tele = now;
+                    wchar_t buf[160]{};
+                    std::swprintf(buf, 160, L"telemetry unavailable (host pid %lu; mapping not open or stale)",
+                        static_cast<unsigned long>(g_last_host_pid));
+                    DebugLine(buf);
+                }
+            }
             if (g_tele.presented > 0 && g_last_presented_qpc) {
                 LARGE_INTEGER now_qpc{}, freq{};
                 QueryPerformanceCounter(&now_qpc);
@@ -1092,6 +1134,7 @@ int wmain(int argc, wchar_t **argv)
             g_params_dirty = false;
             if (WriteParamsAtomic(ParamsPath, g_params)) {
                 SaveCustomTier(g_params);   // 自定义档位跟随最近一次调整
+                DebugLine(L"live-params.json written (params applied by the carrier within ~0.5s)");
             } else {
                 out_line(L"参数写入失败：live-params.json 不可写。");
             }

@@ -51,6 +51,10 @@ static wchar_t g_addon_directory[MAX_PATH];
 static char g_log_path[MAX_PATH];
 static char g_startup_recovery_path[MAX_PATH];
 static CRITICAL_SECTION g_log_lock;
+// zh: 调试日志开关——ReShade.ini [Standalone.DLSSNR] DebugLog，或载体插件菜单页
+// 即时切换（20261109）。默认关；开启后仅在状态转换与低频采样点输出详细行，
+// 常规日志路径保持不变。
+static std::atomic<bool> g_debug_log{false};
 static bool g_startup_recovery_detected;
 static bool g_startup_recovery_forced;
 static std::atomic<bool> g_startup_recovery_marker_cleared{false};
@@ -1079,6 +1083,7 @@ static NVSDK_NGX_Handle *g_nr_third_feature;
 static NVSDK_NGX_Handle *g_sr_feature;
 static NVSDK_NGX_Handle *g_fg_feature;
 static void Log(const char *format, ...);
+#define DebugLog(...) do { if (g_debug_log.load(std::memory_order_relaxed)) Log(__VA_ARGS__); } while (0)
 static void NVSDK_CONV DlssgSnippetLogCallback(const char *message, NVSDK_NGX_Logging_Level level, NVSDK_NGX_Feature source);
 static void SetStatus(const char *format, ...);
 static void RequestProxyVisibility(bool visible);
@@ -1283,13 +1288,18 @@ static void Log(const char *format, ...)
     va_end(args);
 
     EnterCriticalSection(&g_log_lock);
-    FILE *file = nullptr;
-    if (fopen_s(&file, g_log_path, "a") == 0 && file != nullptr)
+    // zh: 长驻句柄 + 每行 flush（20261109：此前每条日志开关一次文件，调试量级下
+    // 是每秒数百次 fopen/fclose；进程退出由操作系统统一回收句柄）。
+    static FILE *g_log_file = nullptr;
+    if (g_log_file == nullptr && g_log_path[0] != '\0' &&
+        fopen_s(&g_log_file, g_log_path, "a") != 0)
+        g_log_file = nullptr;
+    if (g_log_file != nullptr)
     {
         SYSTEMTIME now;
         GetLocalTime(&now);
-        fprintf(file, "%02u:%02u:%02u.%03u %s\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, message);
-        fclose(file);
+        fprintf(g_log_file, "%02u:%02u:%02u.%03u %s\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, message);
+        fflush(g_log_file);
     }
     LeaveCriticalSection(&g_log_lock);
     reshade::log::message(reshade::log::level::info, message);
@@ -3137,6 +3147,7 @@ static int FeatureFlags()
 
 static void RequestProxyVisibility(bool visible)
 {
+    DebugLog("proxy visibility requested: %s", visible ? "show" : "hide");
     if (g_same_window_compositor && g_composition_effect && g_composition_device)
     {
         const bool show = visible && !g_proxy_hidden && !g_proxy_failed &&
@@ -3530,6 +3541,7 @@ static bool RecreateFeatures()
         return false;
     }
     g_feature_recreate_requested = false;   // 提交点：此后的硬失败不再自动重试
+    DebugLog("pipeline switch committed: releasing live features (request cleared)");
     DWORD exception = 0;
     const char *release_failure = nullptr;
     unsigned int release_failure_code = 0;
@@ -6499,6 +6511,18 @@ static bool ExecuteOnPresentPipeline(ID3D12Resource *backbuffer, int prepared_pi
                 skipped, g_neural_fence ? g_neural_fence->GetCompletedValue() : 0, g_neural_fence_value,
                 g_proxy_fence ? g_proxy_fence->GetCompletedValue() : 0, g_proxy_fence_value.load(std::memory_order_relaxed));
         return false;
+    }
+    {
+        static std::atomic<unsigned long long> s_debug_frame_sample{0};
+        if (g_debug_log.load(std::memory_order_relaxed) && (s_debug_frame_sample.fetch_add(1) % 120) == 0)
+            Log("frame sample: slot=%d mailbox=%s fg=%s fg_mfg=%u nr_ready=%s failed=%s proxy_visible=%s",
+                pipeline_slot_index,
+                g_capture_mailbox_was_enabled.load(std::memory_order_acquire) ? "on" : "off",
+                EffectiveFramegenEnabled() ? "on" : "off",
+                EffectiveFgMfgCount(),
+                g_neural_ready.load(std::memory_order_acquire) ? "yes" : "no",
+                g_neural_failed.load(std::memory_order_acquire) ? "yes" : "no",
+                g_proxy_hidden.load(std::memory_order_acquire) ? "hidden" : "visible");
     }
     const UINT slot_index = static_cast<UINT>(pipeline_slot_index);
     if (slot_index >= kPipelineFrameSlotCount)
@@ -12069,6 +12093,7 @@ static void ApplyLiveParamsFromFile()
     const ULONGLONG mtime = (static_cast<ULONGLONG>(attr.ftLastWriteTime.dwHighDateTime) << 32) |
         attr.ftLastWriteTime.dwLowDateTime;
     if (mtime == s_last_mtime) return;
+    DebugLog("live-params.json changed on disk; reapplying");
     s_last_mtime = mtime;
     HANDLE file = CreateFileW(params_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -12093,11 +12118,17 @@ static void ApplyLiveParamsFromFile()
     const bool parsed = numbers_ok && has_nr;
     if (!parsed) { Log("live-params rejected: unparsable content"); return; }
     const int new_model = std::clamp(static_cast<int>(model), 1, 3);
-    g_nr_intensity = std::clamp(intensity, 0.0f, 2.0f);
+    // zh: 刻度与 native/tiers.hpp / 033 schema 一致——强度/结构 0–1（20261109 收敛，
+    // 旧 0–2 是 upstream 菜单的偏宽范围）。
+    g_nr_intensity = std::clamp(intensity, 0.0f, 1.0f);
     g_nr_local_tone = std::clamp(tone, 0.0f, 2.0f);
-    g_nr_local_structure = std::clamp(structure, 0.0f, 2.0f);
+    g_nr_local_structure = std::clamp(structure, 0.0f, 1.0f);
     g_nr_skin_structure = std::clamp(skin, -1.0f, 1.0f);
     g_nr_enabled = has_nr ? nr : g_nr_enabled;
+    DebugLog("live-params applied: nr=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f fg=%d mfg=%s",
+        g_nr_enabled ? 1 : 0, new_model, g_nr_intensity, g_nr_local_tone, g_nr_local_structure,
+        g_nr_skin_structure, g_framegen_enabled.load(std::memory_order_relaxed) ? 1 : 0,
+        has_fg_multiplier ? "requested" : "absent");
     if (has_fg_multiplier && fg_multiplier >= 2.0f)
     {
         // zh: UI 语义倍数（2/3/4）→ MultiFrameCount（每真实帧插值帧数 1/2/3）。
@@ -13490,6 +13521,17 @@ static void DrawOverlay(reshade::api::effect_runtime *)
             g_stable_sr_history ? "per-frame reset with zero motion" : "experimental temporal VORT motion");
     }
     ImGui::TextDisabled("Off by default; enable only as a per-frame SR-history diagnostic.");
+    {
+        bool debug_log_ui = g_debug_log.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox(dlss5_aio_menu::Label("DebugLog", "Verbose debug log"), &debug_log_ui))
+        {
+            g_debug_log = debug_log_ui;
+            reshade::set_config_value(nullptr, section, "DebugLog", debug_log_ui ? "1" : "0");
+            Log("debug logging changed to %s (state transitions and 120-frame samples)",
+                debug_log_ui ? "enabled" : "disabled");
+        }
+        ImGui::TextDisabled("Session diagnostics: state transitions, live-params applies, sampled frame state. Leave off for normal play.");
+    }
     bool fg_checkbox = g_framegen_enabled.load(std::memory_order_relaxed);
     if (ImGui::Checkbox(dlss5_aio_menu::Label("FrameGeneration", "Experimental DLSS Frame Generation (2x)"), &fg_checkbox))
     {
@@ -13845,6 +13887,16 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NvidiaOpticalFlowSubmitDepth", "0", value, sizeof(value)); g_nvof_submit_depth = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
+        DebugLog("startup settings: profile=%d source_res=%d preset=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f "
+                 "rejection_mask=%d flow=%d flow_res=%d flow_depth=%d vort=%d nr=%s fg=%s passes=%u async=%d",
+            static_cast<int>(g_color_profile), g_source_resolution_choice,
+            static_cast<int>(g_dlss_render_preset), g_nr_model, g_nr_intensity, g_nr_local_tone,
+            g_nr_local_structure, g_nr_skin_structure,
+            g_nr_rejection_mask_enabled ? 1 : 0, g_nvof_motion_enabled ? 1 : 0,
+            static_cast<int>(g_nvof_resolution_mode), g_nvof_depth_enabled ? 1 : 0,
+            g_vort_guides_enabled ? 1 : 0,
+            g_nr_enabled ? "on" : "off", g_framegen_enabled.load(std::memory_order_relaxed) ? "on" : "off",
+            g_nr_pass_count, g_async_compute_requested ? 1 : 0);
         // Multi-pass NR is deliberately session-only. Never inherit a risky
         // 2x/3x selection after a crash or normal restart.
         g_nr_pass_count = 1;
@@ -13860,6 +13912,7 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         g_nr_third_pass_failed = false;
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
+        read_setting("DebugLog", "0", value, sizeof(value)); g_debug_log = strcmp(value, "0") != 0;
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("AdaptivePressureGovernor", "1", value, sizeof(value)); g_adaptive_governor_enabled = strcmp(value, "0") != 0;
