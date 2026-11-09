@@ -16,6 +16,7 @@ DLSS5控制台.ini
 *.log
 logs/
 panel-logs/
+.zcode/
 
 # ---- 用户自备 NVIDIA 运行时（不入库、不分发） ----
 nvngx.dll
