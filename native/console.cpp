@@ -418,8 +418,8 @@ static ImFont *g_font_big = nullptr;
 static float g_dpi_scale = 1.0f;   // zh: DPI 缩放（窗口过程与界面共用）
 // zh: 沉浸式标题行与右上角窗口按钮尺寸（DIP）；绘制与 NCHITTEST 共用同一组
 // 常量，避免放大按钮后命中区域仍是旧尺寸。
-static constexpr float kTitleBarHeightDip = 44.0f;
-static constexpr float kTitleButtonWidthDip = 44.0f;
+static constexpr float kTitleBarHeightDip = 33.0f;
+static constexpr float kTitleButtonWidthDip = 32.0f;
 
 
 // 安全路径拼接：目录带不带结尾分隔符都可以
