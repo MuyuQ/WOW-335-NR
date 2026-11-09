@@ -416,6 +416,10 @@ static const ImVec4 kMuted(0.545f, 0.596f, 0.647f, 1.0f);      // #8B98A5
 static const ImVec4 kInk(0.020f, 0.049f, 0.039f, 1.0f);        // 强调按钮上的深字
 static ImFont *g_font_big = nullptr;
 static float g_dpi_scale = 1.0f;   // zh: DPI 缩放（窗口过程与界面共用）
+// zh: 沉浸式标题行与右上角窗口按钮尺寸（DIP）；绘制与 NCHITTEST 共用同一组
+// 常量，避免放大按钮后命中区域仍是旧尺寸。
+static constexpr float kTitleBarHeightDip = 44.0f;
+static constexpr float kTitleButtonWidthDip = 44.0f;
 
 
 // 安全路径拼接：目录带不带结尾分隔符都可以
@@ -632,23 +636,28 @@ static void RenderUi(bool game_running, DWORD host_pid)
         ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoResize);
 
     // 沉浸式标题行：拖拽区（HTCAPTION）+ 自绘窗口按钮（NCHITTEST 按此区域豁免）
-    const float tbh = 34.0f * g_dpi_scale;
-    const float btnw = 34.0f * g_dpi_scale;
+    const float dpi = g_dpi_scale;
+    const float tbh = kTitleBarHeightDip * dpi;
+    const float btnw = kTitleButtonWidthDip * dpi;
+    const float btn_gap = 4.0f * dpi;
+    const float btn_h = tbh - 8.0f * dpi;
+    const float btn_y = (tbh - btn_h) * 0.5f;
     ImGui::SetCursorPos(ImVec2(ImGui::GetStyle().WindowPadding.x,
         (tbh - ImGui::GetTextLineHeight()) * 0.5f));
     ImGui::TextColored(kAccent, "WOW-335-NR 控制台");
-    ImGui::SameLine(ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - 3 * btnw);
+    ImGui::SetCursorPos(ImVec2(
+        ImGui::GetWindowWidth() - ImGui::GetStyle().WindowPadding.x - 3 * btnw, btn_y));
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.145f, 0.192f, 0.244f, 1.0f));
-    if (ImGui::Button("-", ImVec2(btnw - 4, tbh - 8)))
+    if (ImGui::Button("-", ImVec2(btnw - btn_gap, btn_h)))
         ShowWindow(g_window, SW_MINIMIZE);
     ImGui::PopStyleColor(3);
     ImGui::SameLine(0, 0);
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.145f, 0.192f, 0.244f, 1.0f));
-    if (ImGui::Button("□", ImVec2(btnw - 4, tbh - 8))) {
+    if (ImGui::Button("□", ImVec2(btnw - btn_gap, btn_h))) {
         static RECT pre_max{};
         static bool maxed = false;
         RECT cur{}, wa{};
@@ -671,7 +680,7 @@ static void RenderUi(bool game_running, DWORD host_pid)
     ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0, 0, 0, 0));
     ImGui::PushStyleColor(ImGuiCol_Text, kMuted);
     ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.898f, 0.325f, 0.294f, 1.0f));
-    if (ImGui::Button("×", ImVec2(btnw - 4, tbh - 8)))
+    if (ImGui::Button("×", ImVec2(btnw - btn_gap, btn_h)))
         g_running = false;
     ImGui::PopStyleColor(3);
 
@@ -811,8 +820,8 @@ static LRESULT CALLBACK ConsoleWndProc(HWND window, UINT message, WPARAM wparam,
         if (at_r) return HTRIGHT;
         if (at_t) return HTTOP;
         if (at_b) return HTBOTTOM;
-        const float tbh = 34.0f * g_dpi_scale;
-        const float zone = 3.0f * 34.0f * g_dpi_scale;
+        const float tbh = kTitleBarHeightDip * g_dpi_scale;
+        const float zone = 3.0f * kTitleButtonWidthDip * g_dpi_scale;
         if (pt.y < tbh) {
             if (pt.x >= rc.right - static_cast<LONG>(zone)) return HTCLIENT;   // ─ □ × 按钮区
             return HTCAPTION;   // 标题行其余区域：拖拽/双击最大化/贴边分屏
