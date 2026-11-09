@@ -1,5 +1,9 @@
 # WOW-335-NR
 
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey)
+![Status](https://img.shields.io/badge/status-%E5%BC%80%E5%8F%91%E5%80%99%E9%80%89-orange)
+
 **WOW-335-NR** 为 WoW 3.3.5a HD（2008 年 32 位 D3D9 客户端）提供现代 NVIDIA 神经渲染管线：
 DLSS 神经渲染（NR）、DLSS 超分（SR）/ DLAA、DLSS-G 帧生成与多帧生成（MFG 2×/3×/4×），
 并配套中文桌面控制台、游戏内悬浮面板、状态遥测、恢复与诊断工具。
@@ -24,6 +28,12 @@ WOW-335 家族中，`WOW-335-CN` 是汉化工程，本仓库 `WOW-335-NR` 是神
 | 了解许可与上游 | [许可与署名](#许可与署名) · [参考项目](#参考项目) |
 
 ## 快速开始（开发 / 隔离测试）
+
+> [!IMPORTANT]
+> **本仓库不是独立可构建的。** 构建与安装脚本把仓库上两级视为工作区根：
+> `_scratch`（构建输出、隔离批次、安装事务）、回归测试与账本都在工作区，不在仓库内。
+> 独立克隆到任意目录时，构建产物会被写到仓库之外、工具脚本会直接报错。
+> 请按 `src/WOW-335-NR` 的工作区布局放置仓库。下文「工作区根」均指仓库上两级目录。
 
 1. 准备 32 位 ReShade、64 位 ReShade 和三个 NVIDIA 运行时 DLL（均需用户自备，见[运行时依赖](#运行时依赖)）。
 2. 按[构建](#构建)编译原生工具与载体。
@@ -288,6 +298,16 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build-WindowWatch.ps1
 - 当前工作区的日常部署件位于 `tools/dlss5/bin/`（仓库外）：`DLSS5控制台.exe`、
   `dlss5-panel.exe`、`window_watch.exe`。控制台从自身目录拉起面板，二者必须同目录。
 
+### 部署到日常运行位
+
+构建产物只落在 `_scratch/<guid>/`；日常运行件需要手动部署到工作区 `tools/dlss5/bin/`：
+
+1. `dlss5-console.exe` → 复制并重命名为 `DLSS5控制台.exe`（脚本不改名，部署时处理）。
+2. `dlss5-panel.exe`、`window_watch.exe` → 同名复制到同一目录（面板必须与控制台同目录）。
+3. 面板 / 窗口助手部署后核对：确认锁中源码 SHA-256 与当前源一致，再把新产物的
+   SHA-256 更新进 `panel-lock.json` / `watcher-lock.json`。
+4. 控制台没有独立锁文件；其部署来源以构建记录 `build.json` 的产物哈希追溯。
+
 ### 载体
 
 ```bat
@@ -389,6 +409,15 @@ DLSS5-ControlCenter.cmd
 | `watcher-lock.json` | `window_watch.exe`、`window_watch.cpp`、`window_layer.hpp` 的 SHA-256 |
 
 构建、部署或回读后发现哈希不一致时，先查明原因；**不要修改锁值来掩盖不匹配**。
+
+### 客户端版本匹配
+
+`payload-lock.json` 登记的 `game_sha256` 绑定当前开发所用 HD 客户端的 `wow.exe`；
+`prepare_stage.py` 与控制中心会**拒绝身份不符的客户端**——这是设计行为，不是故障。
+
+若你的客户端版本不同，需要按新客户端重建身份锁：核对新 `wow.exe`、原始 `d3d9.dll`
+与全部安装成员的 SHA-256 并重新登记。这是一次逐文件核验工作；只改哈希值凑数会让
+身份校验失去意义，属于明确禁止的做法。
 
 ## 使用
 
