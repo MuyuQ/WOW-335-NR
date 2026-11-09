@@ -137,7 +137,9 @@ static std::atomic<unsigned int> g_proxy_activation_frames{0};
 static constexpr unsigned int kProxyActivationStableFrames = 3;
 static std::atomic<bool> g_show_neural_output{true};
 static bool g_pending_proxy_frame;
-static bool g_composite_reshade_output = true;
+// zh: 20261109 审查补漏——这两个布尔在代理呈现线程读取（10924/10927）、菜单线程
+// 写入，与已原子化的那批同模式，纳入原子。
+static std::atomic<bool> g_composite_reshade_output{true};
 static std::atomic<unsigned long long> g_post_reshade_frames{0};
 static std::atomic<bool> g_reshade_overlay_open{false};
 static std::atomic<reshade::api::effect_runtime *> g_proxy_runtime{nullptr};
@@ -148,7 +150,7 @@ static std::atomic<bool> g_proxy_overlay_preview{false};
 static std::atomic<bool> g_proxy_cursor_clip_active{false};
 static std::atomic<unsigned long long> g_overlay_mouse_events{0};
 static unsigned long long g_last_logged_mouse_event;
-static bool g_show_proxy_fps = true;
+static std::atomic<bool> g_show_proxy_fps{true};
 static std::atomic<unsigned int> g_proxy_fps{0};
 static std::atomic<unsigned int> g_source_fps{0};
 static constexpr size_t kPipelineNoticeTextLength = 40;
@@ -1289,7 +1291,8 @@ static void Log(const char *format, ...)
 
     EnterCriticalSection(&g_log_lock);
     // zh: 长驻句柄 + 每行 flush（20261109：此前每条日志开关一次文件，调试量级下
-    // 是每秒数百次 fopen/fclose；进程退出由操作系统统一回收句柄）。
+    // 是每秒数百次 fopen/fclose）。写入失败自动关闭重开（路径恢复后自愈）；
+    // 句柄长驻到进程退出。
     static FILE *g_log_file = nullptr;
     if (g_log_file == nullptr && g_log_path[0] != '\0' &&
         fopen_s(&g_log_file, g_log_path, "a") != 0)
@@ -1299,7 +1302,11 @@ static void Log(const char *format, ...)
         SYSTEMTIME now;
         GetLocalTime(&now);
         fprintf(g_log_file, "%02u:%02u:%02u.%03u %s\n", now.wHour, now.wMinute, now.wSecond, now.wMilliseconds, message);
-        fflush(g_log_file);
+        if (fflush(g_log_file) != 0)
+        {
+            fclose(g_log_file);
+            g_log_file = nullptr;
+        }
     }
     LeaveCriticalSection(&g_log_lock);
     reshade::log::message(reshade::log::level::info, message);
@@ -3526,7 +3533,7 @@ static bool RecreateFeatures()
         if (g_neural_failed || (g_neural_ready && !g_sr_feature))
         {
             g_feature_recreate_requested = false;
-            SetStatus("pipeline switch unavailable: neural pipeline not ready; toggle the setting to retry");
+            SetStatus("pipeline switch unavailable: neural pipeline not live; restart the game to restore and retry");
             Log("pipeline switch requested but no live pipeline remains; request cleared");
         }
         return false;   // 初始化未完成时保留请求，就绪后自动应用
@@ -13392,9 +13399,9 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         char text[32]; sprintf_s(text, "%.4f", value);
         reshade::set_config_value(nullptr, section, key, static_cast<const char *>(text));
     };
-    if (ImGui::SliderFloat(dlss5_aio_menu::Label("Intensity", "NR intensity"), &g_nr_intensity, 0.0f, 2.0f, "%.2f")) save_float("Intensity", g_nr_intensity);
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("Intensity", "NR intensity"), &g_nr_intensity, 0.0f, 1.0f, "%.2f")) save_float("Intensity", g_nr_intensity);
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalTone", "Local tone strength"), &g_nr_local_tone, 0.0f, 2.0f, "%.2f")) save_float("LocalTone", g_nr_local_tone);
-    if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalStructure", "Local structure strength"), &g_nr_local_structure, 0.0f, 2.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
+    if (ImGui::SliderFloat(dlss5_aio_menu::Label("LocalStructure", "Local structure strength"), &g_nr_local_structure, 0.0f, 1.0f, "%.2f")) save_float("LocalStructure", g_nr_local_structure);
     if (ImGui::SliderFloat(dlss5_aio_menu::Label("SkinStructure", "Skin / character structure"), &g_nr_skin_structure, -1.0f, 1.0f, "%.2f")) save_float("SkinStructure", g_nr_skin_structure);
     if (ImGui::Checkbox(dlss5_aio_menu::Label("NvidiaOpticalFlowMotion", "NVIDIA Optical Flow motion (recommended)"), &g_nvof_motion_enabled))
     {
@@ -13556,10 +13563,20 @@ static void DrawOverlay(reshade::api::effect_runtime *)
         Log("overlay presentation A/B changed to %s",
             show_output_checkbox ? "processed native output" : "point-stretched raw pre-ReShade game frame");
     }
-    if (ImGui::Checkbox(dlss5_aio_menu::Label("CompositeReshade", "Composite ReShade menu while open"), &g_composite_reshade_output))
-        reshade::set_config_value(nullptr, section, "CompositeReshade", g_composite_reshade_output ? "1" : "0");
-    if (ImGui::Checkbox(dlss5_aio_menu::Label("ShowProxyFps", "Show native output FPS counter"), &g_show_proxy_fps))
-        reshade::set_config_value(nullptr, section, "ShowProxyFps", g_show_proxy_fps ? "1" : "0");
+    {
+        bool composite_ui = g_composite_reshade_output.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox(dlss5_aio_menu::Label("CompositeReshade", "Composite ReShade menu while open"), &composite_ui))
+        {
+            g_composite_reshade_output = composite_ui;
+            reshade::set_config_value(nullptr, section, "CompositeReshade", composite_ui ? "1" : "0");
+        }
+        bool fps_ui = g_show_proxy_fps.load(std::memory_order_relaxed);
+        if (ImGui::Checkbox(dlss5_aio_menu::Label("ShowProxyFps", "Show native output FPS counter"), &fps_ui))
+        {
+            g_show_proxy_fps = fps_ui;
+            reshade::set_config_value(nullptr, section, "ShowProxyFps", fps_ui ? "1" : "0");
+        }
+    }
     bool adaptive_governor = g_adaptive_governor_enabled;
     if (ImGui::Checkbox(dlss5_aio_menu::Label("AdaptivePressureGovernor", "Adaptive GPU pressure governor (prototype)"), &adaptive_governor))
     {
@@ -13868,9 +13885,9 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         default: g_dlss_render_preset = DlssRenderPreset::Default; break;
         }
         read_setting("Model", "1", value, sizeof(value)); g_nr_model = std::clamp(atoi(value), 1, 3);
-        read_setting("Intensity", "1.0", value, sizeof(value)); g_nr_intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+        read_setting("Intensity", "1.0", value, sizeof(value)); g_nr_intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("LocalTone", "1.0", value, sizeof(value)); g_nr_local_tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
-        read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+        read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
         read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
         read_setting("NrRejectionMask", "0", value, sizeof(value)); g_nr_rejection_mask_enabled = strcmp(value, "0") != 0;
         read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
@@ -13887,16 +13904,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("NvidiaOpticalFlowSubmitDepth", "0", value, sizeof(value)); g_nvof_submit_depth = strcmp(value, "0") != 0;
         read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
         read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
-        DebugLog("startup settings: profile=%d source_res=%d preset=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f "
-                 "rejection_mask=%d flow=%d flow_res=%d flow_depth=%d vort=%d nr=%s fg=%s passes=%u async=%d",
-            static_cast<int>(g_color_profile), g_source_resolution_choice,
-            static_cast<int>(g_dlss_render_preset), g_nr_model, g_nr_intensity, g_nr_local_tone,
-            g_nr_local_structure, g_nr_skin_structure,
-            g_nr_rejection_mask_enabled ? 1 : 0, g_nvof_motion_enabled ? 1 : 0,
-            static_cast<int>(g_nvof_resolution_mode), g_nvof_depth_enabled ? 1 : 0,
-            g_vort_guides_enabled ? 1 : 0,
-            g_nr_enabled ? "on" : "off", g_framegen_enabled.load(std::memory_order_relaxed) ? "on" : "off",
-            g_nr_pass_count, g_async_compute_requested ? 1 : 0);
         // Multi-pass NR is deliberately session-only. Never inherit a risky
         // 2x/3x selection after a crash or normal restart.
         g_nr_pass_count = 1;
@@ -13913,6 +13920,18 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
         read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
         read_setting("DebugLog", "0", value, sizeof(value)); g_debug_log = strcmp(value, "0") != 0;
+        // zh: 启动转储放在全部 read_setting 之后（20261109 审查修复：原先在
+        // DebugLog/FrameGeneration/AsyncComputePipeline 读取之前，永远不触发）。
+        DebugLog("startup settings: profile=%d source_res=%d preset=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f "
+                 "rejection_mask=%d flow=%d flow_res=%d flow_depth=%d vort=%d nr=%s fg=%s passes=%u async=%d",
+            static_cast<int>(g_color_profile), g_source_resolution_choice,
+            static_cast<int>(g_dlss_render_preset), g_nr_model, g_nr_intensity, g_nr_local_tone,
+            g_nr_local_structure, g_nr_skin_structure,
+            g_nr_rejection_mask_enabled ? 1 : 0, g_nvof_motion_enabled ? 1 : 0,
+            static_cast<int>(g_nvof_resolution_mode), g_nvof_depth_enabled ? 1 : 0,
+            g_vort_guides_enabled ? 1 : 0,
+            g_nr_enabled ? "on" : "off", g_framegen_enabled.load(std::memory_order_relaxed) ? "on" : "off",
+            g_nr_pass_count, g_async_compute_requested ? 1 : 0);
         read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
         read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
         read_setting("AdaptivePressureGovernor", "1", value, sizeof(value)); g_adaptive_governor_enabled = strcmp(value, "0") != 0;

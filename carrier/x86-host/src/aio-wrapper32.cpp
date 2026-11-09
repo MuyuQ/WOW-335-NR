@@ -980,6 +980,9 @@ static void ReadHostNR()
         GetPrivateProfileStringA(dlss5_aio_menu::kConfigSection, kNR[i].key, "\x01", buf, sizeof(buf), p);
         g_nr_present[i] = (buf[0] != '\x01');
         g_nr[i]         = g_nr_present[i] ? DecodeAioValue(i, static_cast<float>(atof(buf))) : kNR[i].def;
+        // 20261109 审查修复：旧版 ini 里可能存有超出当前量程的值（强度/结构曾允许 0-2），
+        // 载入时按 schema 边界钳制，避免"滑杆显示 1.0、实际仍是 1.5"的显示与生效不一致。
+        g_nr[i] = std::clamp(g_nr[i], kNR[i].lo, kNR[i].hi);
         g_nr_touched[i] = false;
     }
 }
@@ -4236,7 +4239,7 @@ static void DrawOverlay(reshade::api::effect_runtime *)
     };
     ImGui::SeparatorText("档位");
     for (int t = 0; t < 4; ++t) {
-        if (t % 3) ImGui::SameLine();
+        if (t) ImGui::SameLine();   // zh: 四档一行（沿用旧六档表的 %3 布局会把第四档挤到第二行）
         const bool active = g_nr[idx_nr] == kTiers[t][0] &&
             fabsf(g_nr[idx_int] - kTiers[t][1]) < 0.005f && fabsf(g_nr[idx_tone] - kTiers[t][2]) < 0.005f &&
             fabsf(g_nr[idx_str] - kTiers[t][3]) < 0.005f && fabsf(g_nr[idx_skin] - kTiers[t][4]) < 0.005f;

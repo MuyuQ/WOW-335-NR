@@ -30,7 +30,7 @@
       "target": "host64/AIO DLSS5 32-bit Wrapper.exe",
       "source_kind": "stage",
       "source": "host64/AIO DLSS5 32-bit Wrapper.exe",
-      "sha256": "ddaedcc7d15b75724bcd2b8e0b55244342b03bcb5ced92a3b42d4e3d7d42e8f2",
+      "sha256": "01d6f8de844bfc7e2706e6829a8afb5bf09afa79a97634c10c6a80c41b853168",
       "replaces_original": false
     },
     {
@@ -44,7 +44,7 @@
       "target": "host64/nvngx.dll",
       "source_kind": "stage",
       "source": "host64/nvngx.dll",
-      "sha256": "8ab24998a1cd67e59552c585ffdb814b48eb558e5f4f54e1b0637fba80e14415",
+      "sha256": "3c36a0c2438dd10f30f9ca465ed75d7bbd5f6304daa2a8df2e06435920cd48f3",
       "replaces_original": false
     },
     {
@@ -93,7 +93,7 @@
       "target": "host64/standalone-dlssnr.addon64",
       "source_kind": "stage",
       "source": "host64/standalone-dlssnr.addon64",
-      "sha256": "ca92ec115bfd2c37b29048823860886b640260cc050edae78bd8f290e2aa051c",
+      "sha256": "2ab87818d123294ca12fd23e1b8d2ff01fd1fab8569831a50c2f93ec45c8d748",
       "replaces_original": false
     },
     {
@@ -170,7 +170,7 @@
       "target": "standalone-dlssnr.addon32",
       "source_kind": "stage",
       "source": "standalone-dlssnr.addon32",
-      "sha256": "d53d1689e550b30b1b4de91bd31a2b97415de3e14994120d7a9f9828b581c10f",
+      "sha256": "7cea906ab11477ef805a6c3b50827133c621ad699f60ef41e165acc3f5ced791",
       "replaces_original": false
     },
     {

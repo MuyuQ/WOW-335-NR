@@ -89,7 +89,7 @@ inline constexpr NRSetting kSettings[] = {
     { "StableSrHistory", "Stable DLSS SR (no persistent SR history)", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
       "Off by default; enable only as a per-frame SR-history diagnostic.", Group::Neural },
     { "DebugLog", "Verbose debug log", NR_BOOL, 0, 0, 1, nullptr, nullptr, 0,
-      "Off by default. Logs state transitions, live-params applies, and sampled frame state for diagnostics.", Group::Neural },
+      "Off by default. Logs state transitions, live-params applies, and sampled frame state for diagnostics. Applies immediately from the carrier's own menu; toggles made in the 32-bit wrapper UI take effect at the next game start.", Group::Neural },
     { "FrameGeneration", "Experimental DLSS Frame Generation (2x)", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0,
       "Presents one generated frame followed by one reconstructed real frame.", Group::Neural },
     { "AsyncComputePipeline", "Asynchronous NGX compute (experimental)", NR_BOOL, 1, 0, 1, nullptr, nullptr, 0,
