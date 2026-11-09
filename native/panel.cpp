@@ -564,14 +564,32 @@ static bool NavItem(const char *label, int idx)
     return clicked;
 }
 
+// zh: 微调滑杆统一为 -1…+1 归一化刻度；参数原值仍按各 schema 边界存储
+// （强度/结构 0–1，色调 0–2，皮肤 -1…+1），只在 UI 层换算。
+static float ParamToUi(float value, float lo, float hi)
+{
+    return (value - lo) / (hi - lo) * 2.0f - 1.0f;
+}
+static float UiToParam(float ui, float lo, float hi)
+{
+    return lo + (ui + 1.0f) * 0.5f * (hi - lo);
+}
+static void HelpText(const char *text)
+{
+    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
+    ImGui::TextWrapped("%s", text);
+    ImGui::PopStyleColor();
+}
+
 static void PageStatus()
 {
     PageHeader("状态");
     if (g_game_fps > 0) ImGui::Text("真实帧率：%.1f → 输出帧率：%.1f FPS",
         g_src_fps > 0 ? g_src_fps : 0.0f, g_game_fps);
     if (g_tele.available) {
-        ImGui::Text("模型：%s   强度：%.0f%%   管线：%s", kModelNames[g_params.model - 1],
-            g_params.intensity * 100.0f, g_tele.pipeline_ready ? "就绪" : "未就绪");
+        ImGui::Text("模型：%s   强度：%+.2f   管线：%s", kModelNames[g_params.model - 1],
+            ParamToUi(g_params.intensity, kNrIntensityMin, kNrIntensityMax),
+            g_tele.pipeline_ready ? "就绪" : "未就绪");
         if (!g_tele.fg)
             ImGui::TextDisabled("补帧：关（配置未开启）");
         else if (g_tele.fg_failed)
@@ -643,27 +661,41 @@ static void PageNr()
 
     ImGui::Spacing();
     ImGui::TextColored(kAccent, "微调");
+    ImGui::TextDisabled("滑杆统一为 -1…+1 归一化刻度；写入时自动换算为各参数原始范围。");
     if (g_tier_locked) ImGui::TextDisabled("出厂档位锁定。点「自定义」解锁微调。");
     if (g_tier_locked) ImGui::BeginDisabled(true);
-    // 强度/结构用百分比显示（0–1 刻度，1.0=100%）
     {
-        float pct = g_params.intensity * 100.0f;
-        if (ImGui::SliderFloat("强度", &pct, 0.0f, 100.0f, "%.0f%%")) {
-            g_params.intensity = pct / 100.0f;
+        float ui = ParamToUi(g_params.intensity, kNrIntensityMin, kNrIntensityMax);
+        HelpText("整体重绘幅度：-1 最弱，+1 最强；过高会放大锐化与伪影。");
+        if (ImGui::SliderFloat("强度", &ui, -1.0f, 1.0f, "%+.2f")) {
+            g_params.intensity = UiToParam(ui, kNrIntensityMin, kNrIntensityMax);
             g_params_dirty = true;
         }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("整体重绘幅度（社区参考 20–35%）");
-        pct = g_params.structure * 100.0f;
-        if (ImGui::SliderFloat("结构强度", &pct, 0.0f, 100.0f, "%.0f%%")) {
-            g_params.structure = pct / 100.0f;
-            g_params_dirty = true;
-        }
-        if (ImGui::IsItemHovered()) ImGui::SetTooltip("边缘与细节的保持程度（社区参考 10–25%）");
     }
-    if (ImGui::SliderFloat("色调结构", &g_params.tone, 0.0f, 2.0f, "%.2f")) g_params_dirty = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("色彩与明暗关系的保持程度（1.0 为中性）");
-    if (ImGui::SliderFloat("皮肤结构", &g_params.skin, -1.0f, 1.0f, "%.2f")) g_params_dirty = true;
-    if (ImGui::IsItemHovered()) ImGui::SetTooltip("人物皮肤的处理倾向：负值偏平滑，正值保留纹理");
+    {
+        float ui = ParamToUi(g_params.tone, kNrToneMin, kNrToneMax);
+        HelpText("色彩与明暗层次的保持：-1 最少，0 为中性，+1 最多。");
+        if (ImGui::SliderFloat("色调结构", &ui, -1.0f, 1.0f, "%+.2f")) {
+            g_params.tone = UiToParam(ui, kNrToneMin, kNrToneMax);
+            g_params_dirty = true;
+        }
+    }
+    {
+        float ui = ParamToUi(g_params.structure, kNrStructureMin, kNrStructureMax);
+        HelpText("边缘与细节的保持：-1 最平滑，+1 细节最多；过高会放大噪点。");
+        if (ImGui::SliderFloat("结构强度", &ui, -1.0f, 1.0f, "%+.2f")) {
+            g_params.structure = UiToParam(ui, kNrStructureMin, kNrStructureMax);
+            g_params_dirty = true;
+        }
+    }
+    {
+        float ui = ParamToUi(g_params.skin, kNrSkinMin, kNrSkinMax);
+        HelpText("人物皮肤处理倾向：负值更平滑，正值保留更多皮肤纹理。");
+        if (ImGui::SliderFloat("皮肤结构", &ui, -1.0f, 1.0f, "%+.2f")) {
+            g_params.skin = UiToParam(ui, kNrSkinMin, kNrSkinMax);
+            g_params_dirty = true;
+        }
+    }
     ClampParams(g_params);
     if (ImGui::Button("读取游戏配置")) { Params p; ReadIniParams(p); ClampParams(p); g_params = p; }
     if (g_tier_locked) ImGui::EndDisabled();

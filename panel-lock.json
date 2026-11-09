@@ -1,8 +1,8 @@
 {
  "schema": 1,
  "files": {
-  "dlss5-panel.exe": "c31151f953f47b256b3ab1a718a89749d5bc0a150e3807b8d671d458059ee47f",
-  "panel.cpp": "cd75dc4531d9e95b88c987a8d5296f699ee5622eef8de18b894ac3078b46fd68",
+  "dlss5-panel.exe": "6a1c0610ea82d5f405787fd4e8c3764e07f32c9bc1c8588fd445e0cf832da246",
+  "panel.cpp": "6606756d7d70e9a057ae406ee97c05b8f4972c5acc9067ac58c1a0e91ad4660d",
   "imgui_version": "1.92.5 (vendored)"
  }
 }
