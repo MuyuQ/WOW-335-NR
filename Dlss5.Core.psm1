@@ -4,6 +4,14 @@ $script:ProjectRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '../..'))
 $script:ScratchRoot = [IO.Path]::GetFullPath((Join-Path $script:ProjectRoot '_scratch'))
 $script:OperationsRoot = [IO.Path]::GetFullPath((Join-Path $script:ScratchRoot 'dlss5-aio/control-operations'))
 $script:LockFile = Join-Path $PSScriptRoot 'payload-lock.json'
+# zh: 安装清单——「哪些文件会进入客户端目录、装到哪、装前该是什么状态」的唯一事实源。
+# 先于安装建立并随组件维护；与 payload-lock.json 的成员一一对应，缺项/多项直接报错（20261112）。
+$script:ManifestFile = Join-Path $PSScriptRoot 'install-manifest.json'
+# zh: 只读基准——安装器拒绝把组件写进原版分发基准与 reference。
+$script:ProtectedRoots = @(
+    (Join-Path $script:ProjectRoot 'zhcn-case-v2/14-template/original-distribution-baseline-202604'),
+    (Join-Path $script:ProjectRoot 'reference')
+)
 # zh: 调试追踪——环境变量 DLSS5_CORE_DEBUG=1 时把事务关键步骤写入
 # _scratch/dlss5-aio/logs/core-debug.log（20261109）。日志文件不入库（logs/）。
 $script:DebugEnabled = ($env:DLSS5_CORE_DEBUG -eq '1')
@@ -91,7 +99,7 @@ function Move-AtomicReplace([string]$Source, [string]$Target) {
 
 function Get-Dlss5Lock {
     $lock = [IO.File]::ReadAllText($script:LockFile, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-    # zh: 成员数量不设硬编码——数量随锁内容走，结构性校验在此处完成（20261109 修复 dlssg runtime 类别加入后整体失效）。
+    # zh: 成员数量不设硬编码——数量随锁内容走，结构性校验在此处完成（20261109）。
     if ($lock.schema -ne 1 -or @($lock.members).Count -lt 1) { throw '组件清单格式不受支持。' }
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($member in $lock.members) {
@@ -104,21 +112,150 @@ function Get-Dlss5Lock {
             throw '组件清单触及受保护目录。'
         }
     }
+    # zh: 不再要求 game_sha256 / original_d3d9_sha256 匹配（20261112 用户决定）。
+    # 理由：存在官方与第三方修改过的 wow.exe，哈希锁定会把这类客户端整体拒掉。
+    # 当前身份口径：wow.exe 只校验存在 + x86 架构；d3d9.dll 在安装时按实际内容快照
+    # （存在则备份，不存在则记为 absent），卸载按该快照恢复或删除。
     $replaced = @($lock.members | Where-Object { $_.replaces_original })
-    if ($replaced.Count -ne 1 -or $replaced[0].target -ne 'd3d9.dll') { throw '原件替换清单无效。' }
+    if ($replaced.Count -gt 1 -or ($replaced.Count -eq 1 -and [string]$replaced[0].target -ne 'd3d9.dll')) {
+        throw '原件替换清单无效。'
+    }
     return $lock
 }
 
-function Assert-Client([string]$Client, $Lock, [bool]$ScratchOnly = $true) {
+function Get-ManifestField($Entry, [string]$Name) {
+    # zh: 清单条目字段可能缺失（手写 JSON）；Set-StrictMode 下直接访问缺失属性会抛错，
+    # 统一从 PSObject.Properties 安全取值，缺失返回 $null（20261112）。
+    if ($null -eq $Entry) { return $null }
+    $property = $Entry.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    return $property.Value
+}
+
+function Get-Dlss5Manifest {
+    # zh: 安装清单是「哪些文件进客户端、装到哪个目录、装前该是什么状态、卸载删哪些残留」的唯一事实源。
+    # 先于安装建立并随组件维护；必须与 payload-lock.json 的成员一一对应，缺项/多项直接报错。
+    $lock = Get-Dlss5Lock
+    if (-not [IO.File]::Exists($script:ManifestFile)) { throw '缺少 install-manifest.json：安装清单必须先于安装建立。' }
+    $manifest = [IO.File]::ReadAllText($script:ManifestFile, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+    if ($manifest.schema -ne 1 -or @($manifest.entries).Count -lt 1) { throw '安装清单格式不受支持。' }
+    $problems = [Collections.Generic.List[string]]::new()
+    $entries = @{}
+    foreach ($entry in $manifest.entries) {
+        $target = [string]$entry.target
+        if ($entries.ContainsKey($target)) { $problems.Add("清单重复目标：$target") | Out-Null; continue }
+        $entries[$target] = $entry
+        $member = @($lock.members | Where-Object { [string]$_.target -eq $target })
+        if ($member.Count -ne 1) { $problems.Add("清单目标不在组件锁中：$target") | Out-Null; continue }
+        if ([string](Get-ManifestField $entry "source_kind") -ne [string]$member[0].source_kind) { $problems.Add("来源类别与组件锁不一致：$target") | Out-Null }
+        if ([bool](Get-ManifestField $entry "replaces_original") -ne [bool]$member[0].replaces_original) { $problems.Add("原件替换标记与组件锁不一致：$target") | Out-Null }
+        if (-not (Get-ManifestField $entry "folder") -or -not (Get-ManifestField $entry "purpose")) { $problems.Add("清单条目缺少目录或用途：$target") | Out-Null }
+    }
+    foreach ($member in $lock.members) {
+        if (-not $entries.ContainsKey([string]$member.target)) { $problems.Add("组件锁成员未列入安装清单：$($member.target)") | Out-Null }
+    }
+    if ($problems.Count) { throw ('安装清单与组件锁不一致：' + ((@($problems) | Select-Object -Unique) -join '；')) }
+    return [pscustomobject]@{ Version = [string]$manifest.updated; Entries = $entries;
+        Order = @($manifest.entries); Residue = @($manifest.residue) }
+}
+
+function Get-Dlss5ClientRecordPath([string]$Client) {
+    return Get-MemberPath $Client 'host64/dlss5-install-record.json'
+}
+
+function Test-Dlss5ClientRecord([string]$Client) {
+    # zh: 客户端内安装记录——放在客户端里而不是只写 _scratch，清理草稿区或换机后仍可卸载。
+    $path = Get-Dlss5ClientRecordPath $Client
+    if (-not [IO.File]::Exists($path)) { return $null }
+    try {
+        $record = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+        if ($record.schema -ne 1 -or -not $record.entries) { return $null }
+        return [pscustomobject]@{ Path = $path; Record = $record;
+            BackupRoot = (Get-MemberPath $Client 'host64/dlss5-backup') }
+    } catch { return $null }
+}
+
+function Export-Dlss5ManifestList {
+    # zh: 把安装清单渲染成「要往客户端目录移入什么」的清单文件，供用户核对或随包分发。
+    [CmdletBinding()]
+    param([string]$Client, [string]$Destination)
+    $manifest = Get-Dlss5Manifest
+    $lock = Get-Dlss5Lock
+    $clientFull = if ($Client) { Get-CanonicalPath $Client } else { $null }
+    $lines = [Collections.Generic.List[string]]::new()
+    $lines.Add('# WOW-335-NR 客户端安装清单')
+    $lines.Add('')
+    $lines.Add('本清单先于安装建立并随组件维护；实际安装按本清单逐项执行、逐项回读。目标路径相对客户端根目录。')
+    $lines.Add('安装时逐项记录安装前状态：不存在的记为「新建」，存在的先备份再替换；卸载按该记录恢复或删除。')
+    $lines.Add('')
+    if ($clientFull) {
+        $lines.Add('当前比对客户端：' + $clientFull)
+        $lines.Add('')
+        $lines.Add('| 状态 | 目标 | 目录 | 来源 | 必需 | 用途 |')
+        $lines.Add('| --- | --- | --- | --- | --- | --- |')
+    } else {
+        $lines.Add('| 目标 | 目录 | 来源 | 必需 | 用途 |')
+        $lines.Add('| --- | --- | --- | --- | --- |')
+    }
+    foreach ($member in $lock.members) {
+        $target = [string]$member.target
+        $entry = $manifest.Entries[$target]
+        $originValue = Get-ManifestField $entry "origin"
+        $origin = if ($originValue) { [string]$originValue } else { [string]$member.source_kind }
+        $requiredValue = Get-ManifestField $entry "required"
+        $required = if ($null -ne $requiredValue) { if ([bool]$requiredValue) { '必需' } else { '可选' } } else { '必需' }
+        $purposeValue = Get-ManifestField $entry "purpose"
+        $purpose = if ($purposeValue) { [string]$purposeValue } else { '' }
+        $folderValue = Get-ManifestField $entry "folder"
+        $folder = if ($folderValue) { [string]$folderValue } else { '' }
+        if ($clientFull) {
+            $path = Get-MemberPath $clientFull $target
+            $state = if ([IO.Directory]::Exists($path)) { '目录冲突' }
+                     elseif (-not [IO.File]::Exists($path)) { '待移入' }
+                     elseif ((Get-Sha256 $path) -eq [string]$member.sha256) { '已就位' }
+                     else { '已存在（内容不同）' }
+            $lines.Add("| $state | ``$target`` | $folder | $origin | $required | $purpose |")
+        } else {
+            $lines.Add("| ``$target`` | $folder | $origin | $required | $purpose |")
+        }
+    }
+    $lines.Add('')
+    $lines.Add('## 卸载时会删除的运行产物')
+    $lines.Add('')
+    foreach ($item in $manifest.Residue) {
+        $action = if ([string]$item.policy -eq 'delete') { '删除' } else { '只报告，不删除' }
+        $lines.Add(('- `{0}`（{1}）：{2}' -f $item.path, $action, $item.note))
+    }
+    $lines.Add('')
+    $lines.Add('安装器另在客户端写入 `host64\dlss5-install-record.json` 与 `host64\dlss5-backup\`；卸载完成后一并清除。')
+    $body = ($lines -join "`r`n") + "`r`n"
+    if (-not $Destination) { return $body }
+    $target = Get-CanonicalPath $Destination
+    if ([IO.File]::Exists($target) -or [IO.Directory]::Exists($target)) { throw '输出文件已存在。' }
+    Assert-NoReparse $target
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($body)
+    $stream = [IO.File]::Open($target, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) } finally { $stream.Dispose() }
+    return $target
+}
+
+function Assert-Client([string]$Client, $Lock, [bool]$ScratchOnly = $false) {
     $clientFull = Get-CanonicalPath $Client
     if ($ScratchOnly -and (-not (Test-Within $clientFull $script:ScratchRoot) -or
             $clientFull.Equals($script:ScratchRoot, [StringComparison]::OrdinalIgnoreCase))) {
-        throw '当前候选只允许操作 _scratch 中的隔离客户端。'
+        throw '当前操作只允许 _scratch 中的隔离客户端。'
     }
     Assert-NoReparse $clientFull
+    foreach ($root in $script:ProtectedRoots) {
+        if (Test-Within $clientFull $root) { throw '拒绝操作原版分发基准或只读参考目录。' }
+    }
     $exe = Get-MemberPath $clientFull 'wow.exe'
-    if (-not [IO.File]::Exists($exe) -or (Get-Sha256 $exe) -ne $Lock.game_sha256) {
-        throw 'wow.exe 不存在或身份与锁定版本不符。'
+    if (-not [IO.File]::Exists($exe)) { throw '所选目录下没有 wow.exe。' }
+    # zh: 不比对 wow.exe 哈希（20261112）——存在官方与第三方修改过的客户端。
+    # 只确认是 32 位程序，避免把 64 位客户端当成 WoW 3.3.5a 装进去。
+    $machine = Get-PeMachine $exe
+    if ($machine -ne 'x86') {
+        throw "wow.exe 不是 32 位程序（检测到：$machine）。请选择 WoW 3.3.5a 32 位客户端根目录。"
     }
     return $clientFull
 }
@@ -133,35 +270,55 @@ function Get-Dlss5InstallPreview {
     [CmdletBinding()]
     param([Parameter(Mandatory)][string]$Client, [Parameter(Mandatory)][string]$Stage)
     $lock = Get-Dlss5Lock
+    $manifest = Get-Dlss5Manifest
     $clientFull = Assert-Client $Client $lock
     $stageFull = Get-CanonicalPath $Stage
-    if (-not (Test-Within $stageFull $script:ScratchRoot) -or -not [IO.Directory]::Exists($stageFull)) {
-        throw '组件来源须为 _scratch 中已准备的目录。'
-    }
+    if (-not [IO.Directory]::Exists($stageFull)) { throw '组件来源目录不存在。' }
     Assert-NoReparse $stageFull
     if (Test-Within $script:OperationsRoot $clientFull) { throw '备份目录不能位于客户端内。' }
     $items = @()
     foreach ($member in $lock.members) {
+        $targetName = [string]$member.target
+        $entry = $manifest.Entries[$targetName]
+        $requiredValue = Get-ManifestField $entry "required"
+        $required = if ($null -ne $requiredValue) { [bool]$requiredValue } else { $true }
         $root = if ($member.source_kind -in @('stage', 'runtime')) { $stageFull } else { Join-Path $script:ModuleRoot 'templates' }
         $source = Get-MemberPath $root ([string]$member.source)
-        $target = Get-MemberPath $clientFull ([string]$member.target)
+        $target = Get-MemberPath $clientFull $targetName
         $issue = $null
-        if (-not [IO.File]::Exists($source) -or (Get-Sha256 $source) -ne $member.sha256) {
-            $issue = '来源文件缺失或哈希不符'
+        $preState = 'absent'
+        $existingSha = $null
+        if (-not [IO.File]::Exists($source)) {
+            if ($required) { $issue = '来源文件缺失' } else { $preState = 'missing-optional' }
+        } elseif ((Get-Sha256 $source) -ne [string]$member.sha256) {
+            $issue = '来源文件哈希与组件锁不一致'
         } elseif ([IO.Directory]::Exists($target)) {
             $issue = '目标位置是目录'
-        } elseif ($member.replaces_original) {
-            if (-not [IO.File]::Exists($target) -or (Get-Sha256 $target) -ne $lock.original_d3d9_sha256) {
-                $issue = '原始 d3d9.dll 缺失或身份不符'
-            }
         } elseif ([IO.File]::Exists($target)) {
-            $issue = '目标文件已存在'
+            $existingSha = Get-Sha256 $target
+            if ($existingSha -eq [string]$member.sha256) { $preState = 'same' }
+            elseif ([bool]$member.replaces_original) { $preState = 'present' }
+            else { $issue = '目标文件已存在且内容不同' }
         }
-        $items += [pscustomobject]@{ Target = [string]$member.target; Source = $source; TargetPath = $target;
-            Sha256 = [string]$member.sha256; ReplacesOriginal = [bool]$member.replaces_original; Issue = $issue }
+        $items += [pscustomobject]@{
+            Target = $targetName; Source = $source; TargetPath = $target;
+            Sha256 = [string]$member.sha256; ReplacesOriginal = [bool]$member.replaces_original;
+            PreState = $preState; ExistingSha256 = $existingSha; Issue = $issue; Required = $required;
+            Folder = [string](Get-ManifestField $entry 'folder');
+            Label = if (Get-ManifestField $entry 'label') { [string](Get-ManifestField $entry 'label') } else { $targetName };
+            Origin = if (Get-ManifestField $entry 'origin') { [string](Get-ManifestField $entry 'origin') } else { [string]$member.source_kind };
+            Purpose = [string](Get-ManifestField $entry 'purpose');
+            UserAction = [string](Get-ManifestField $entry 'user_action');
+            Note = [string](Get-ManifestField $entry 'note')
+        }
     }
     return [pscustomobject]@{ Client = $clientFull; Stage = $stageFull; Items = $items;
-        CanInstall = @($items | Where-Object { $null -ne $_.Issue }).Count -eq 0 }
+        ManifestVersion = $manifest.Version;
+        CanInstall = @($items | Where-Object { $null -ne $_.Issue }).Count -eq 0;
+        Replaced = @($items | Where-Object { $_.PreState -eq 'present' }).Count;
+        NewFiles = @($items | Where-Object { $_.PreState -eq 'absent' }).Count;
+        SameFiles = @($items | Where-Object { $_.PreState -eq 'same' }).Count;
+        SkippedOptional = @($items | Where-Object { $_.PreState -eq 'missing-optional' }).Count }
 }
 
 function Write-JsonAtomic([string]$Path, $Value) {
@@ -209,8 +366,12 @@ function Invoke-Dlss5Install {
     Assert-ProcessesStopped
     $preview = Get-Dlss5InstallPreview -Client $Client -Stage $Stage
     if (-not $preview.CanInstall) { throw '安装预检未通过；请查看文件冲突和来源状态。' }
-    Write-Dlss5CoreDebug ("install begin: client={0} stage={1} members={2}" -f $preview.Client, $preview.Stage, @($preview.Items).Count)
-    $lock = Get-Dlss5Lock
+    $items = @($preview.Items | Where-Object { $_.PreState -notin @('same', 'missing-optional') })
+    if ($items.Count -eq 0) {
+        return [pscustomobject]@{ Status = 'already_current'; Operation = $null; Count = 0;
+            Client = $preview.Client; Record = (Get-Dlss5ClientRecordPath $preview.Client) }
+    }
+    $manifest = Get-Dlss5Manifest
     Assert-NoReparse $script:OperationsRoot
     [IO.Directory]::CreateDirectory($script:OperationsRoot) | Out-Null
     $operation = Join-Path $script:OperationsRoot ([guid]::NewGuid().ToString('N'))
@@ -218,62 +379,76 @@ function Invoke-Dlss5Install {
     [IO.Directory]::CreateDirectory($operation) | Out-Null
     Assert-NoReparse $operation
     $recordPath = Join-Path $operation 'transaction.json'
-    $backup = Get-MemberPath $operation 'backup/d3d9.dll'
-    $original = Get-MemberPath $preview.Client 'd3d9.dll'
-    $record = [ordered]@{ schema = 1; status = 'preparing'; client = $preview.Client;
-        stage = $preview.Stage; backup_sha256 = $lock.original_d3d9_sha256;
-        members = @($preview.Items | ForEach-Object { [ordered]@{ target = $_.Target; sha256 = $_.Sha256;
-                    replaces_original = $_.ReplacesOriginal } }); applied = @(); errors = @() }
+    # zh: 原件备份也放客户端内（host64\dlss5-backup）——
+    # 卸载时即使草稿区已清理、换机，也能按客户端内记录还原（20261112）。
+    $backupRoot = Get-MemberPath $preview.Client 'host64/dlss5-backup'
+    [IO.Directory]::CreateDirectory($backupRoot) | Out-Null
+    Assert-NoReparse $backupRoot
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($item in $items) {
+        $backupRel = $null
+        if ($item.PreState -eq 'present') {
+            $backupRel = [string]$item.Target
+            $backupPath = Get-MemberPath $backupRoot $backupRel
+            Copy-Verified $item.TargetPath $backupPath ([string]$item.ExistingSha256)
+            Copy-Verified $item.TargetPath (Get-MemberPath $operation ('backup/' + $backupRel)) ([string]$item.ExistingSha256)
+        }
+        $entries.Add([ordered]@{ target = [string]$item.Target; sha256 = [string]$item.Sha256;
+            replaces_original = [bool]$item.ReplacesOriginal; pre_state = [string]$item.PreState;
+            previous_sha256 = $item.ExistingSha256; backup = $backupRel })
+    }
+    $record = [ordered]@{ schema = 2; status = 'preparing'; client = $preview.Client; stage = $preview.Stage;
+        manifest_version = $preview.ManifestVersion; tool = 'WOW-335-NR';
+        entries = @($entries); applied = @(); errors = @() }
     Write-JsonAtomic $recordPath $record
     $changed = [Collections.Generic.List[object]]::new()
     $pendingTemps = [Collections.Generic.List[object]]::new()
     try {
-        Copy-Verified $original $backup $lock.original_d3d9_sha256
-        Write-Dlss5CoreDebug "original d3d9.dll backed up and verified"
-        foreach ($item in $preview.Items) {
+        foreach ($item in $items) {
             $staged = Get-MemberPath $operation ('stage/' + $item.Target)
-            Copy-Verified $item.Source $staged $item.Sha256
+            Copy-Verified $item.Source $staged ([string]$item.Sha256)
         }
-        Write-Dlss5CoreDebug ("staged {0} members; entering install phase" -f @($preview.Items).Count)
+        Write-Dlss5CoreDebug ("staged {0} members; entering install phase" -f $items.Count)
         $record.status = 'in_progress'
         Write-JsonAtomic $recordPath $record
         Assert-ProcessesStopped
-        foreach ($item in $preview.Items) {
+        foreach ($item in $items) {
             Assert-ProcessesStopped
-            $dest = Get-MemberPath $preview.Client $item.Target
-            $src = Get-MemberPath $operation ('stage/' + $item.Target)
-            if ((Get-Sha256 $src) -ne $item.Sha256) { throw "暂存文件身份变化：$($item.Target)" }
-            if ($item.ReplacesOriginal) {
-                if (-not [IO.File]::Exists($dest) -or (Get-Sha256 $dest) -ne $lock.original_d3d9_sha256) {
-                    throw '原始 d3d9.dll 已变化。'
-                }
-            } elseif ([IO.File]::Exists($dest) -or [IO.Directory]::Exists($dest)) {
-                throw "目标文件已出现：$($item.Target)"
+            $dest = Get-MemberPath $preview.Client ([string]$item.Target)
+            $src = Get-MemberPath $operation ('stage/' + [string]$item.Target)
+            if ((Get-Sha256 $src) -ne [string]$item.Sha256) { throw "暂存文件身份变化：$($item.Target)" }
+            if ([IO.Directory]::Exists($dest)) { throw "目标位置是目录：$($item.Target)" }
+            if ([IO.File]::Exists($dest)) {
+                if ((Get-Sha256 $dest) -ne [string]$item.ExistingSha256) { throw "目标文件在安装前被改动：$($item.Target)" }
             }
             [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dest)) | Out-Null
             Assert-NoReparse $dest
             $temp = "$dest.dlss5-installing"
             if ([IO.File]::Exists($temp) -or [IO.Directory]::Exists($temp)) { throw "暂存路径已存在：$temp" }
-            try { Copy-Verified $src $temp $item.Sha256 }
+            try { Copy-Verified $src $temp ([string]$item.Sha256) }
             catch {
                 if ([IO.File]::Exists($temp) -or [IO.Directory]::Exists($temp)) {
                     $record.errors = @($record.errors) + @("暂存文件需要检查：$temp")
                 }
                 throw
             }
-            $pendingTemps.Add([pscustomobject]@{ Path = $temp; Sha256 = $item.Sha256 })
-            if ($item.ReplacesOriginal) { Move-AtomicReplace $temp $dest }
-            else { [IO.File]::Move($temp, $dest) }
+            $pendingTemps.Add([pscustomobject]@{ Path = $temp; Sha256 = [string]$item.Sha256 })
+            if ([IO.File]::Exists($dest)) { Move-AtomicReplace $temp $dest } else { [IO.File]::Move($temp, $dest) }
             $changed.Add($item)
-            if ((Get-Sha256 $dest) -ne $item.Sha256) { throw "安装回读不一致：$($item.Target)" }
-            $record.applied = @($record.applied) + @($item.Target)
+            if ((Get-Sha256 $dest) -ne [string]$item.Sha256) { throw "安装回读不一致：$($item.Target)" }
+            $record.applied = @($record.applied) + @([string]$item.Target)
             Write-JsonAtomic $recordPath $record
-            Write-Dlss5CoreDebug ("installed {0}" -f $item.Target)
         }
         $record.status = 'completed'
         Write-JsonAtomic $recordPath $record
+        $clientRecord = [ordered]@{ schema = 1; status = 'installed';
+            installed_utc = [DateTime]::UtcNow.ToString('o'); client = $preview.Client;
+            manifest_version = $preview.ManifestVersion; tool = 'WOW-335-NR'; operation = $operation;
+            entries = @($entries); residue = @($manifest.Residue) }
+        Write-JsonAtomic (Get-Dlss5ClientRecordPath $preview.Client) $clientRecord
         Write-Dlss5CoreDebug ("install completed: {0} members, operation {1}" -f $changed.Count, $operation)
-        return [pscustomobject]@{ Status = 'completed'; Operation = $operation; Count = $changed.Count }
+        return [pscustomobject]@{ Status = 'completed'; Operation = $operation; Count = $changed.Count;
+            Client = $preview.Client; Record = (Get-Dlss5ClientRecordPath $preview.Client) }
     } catch {
         $cause = $_.Exception.Message
         Write-Dlss5CoreDebug ("install failed, rolling back: {0}" -f $cause)
@@ -285,20 +460,17 @@ function Invoke-Dlss5Install {
                 }
             } catch { $record.errors = @($record.errors) + @("暂存文件：$($_.Exception.Message)") }
         }
-        for ($index = $changed.Count - 1; $index -ge 0; $index--) {
-            $item = $changed[$index]
+        $rollbackEntries = @($changed | ForEach-Object { [ordered]@{ target = [string]$_.Target;
+            sha256 = [string]$_.Sha256; previous_sha256 = $_.ExistingSha256;
+            pre_state = [string]$_.PreState; backup = [string]$_.Target } })
+        if ($rollbackEntries.Count) {
+            $rollbackReport = Join-Path $operation 'rollback.json'
+            $null = Invoke-Dlss5Teardown -ClientFull $preview.Client -Entries $rollbackEntries `
+                -BackupRoot $backupRoot -SaveRoot (Join-Path $operation 'rollback-modified') -ReportPath $rollbackReport
             try {
-                $dest = Get-MemberPath $preview.Client $item.Target
-                if (-not [IO.File]::Exists($dest) -or (Get-Sha256 $dest) -ne $item.Sha256) {
-                    throw '已安装文件变化，保留现状。'
-                }
-                if ($item.ReplacesOriginal) {
-                    $temp = "$dest.dlss5-rollback"
-                    Copy-Verified $backup $temp $lock.original_d3d9_sha256
-                    Move-AtomicReplace $temp $dest
-                    if ((Get-Sha256 $dest) -ne $lock.original_d3d9_sha256) { throw '原件恢复回读失败。' }
-                } else { [IO.File]::Delete($dest) }
-            } catch { $record.errors = @($record.errors) + @("$($item.Target)：$($_.Exception.Message)") }
+                $saved = [IO.File]::ReadAllText($rollbackReport, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
+                $record.errors = @($record.errors) + @($saved.errors)
+            } catch { }
         }
         $record.status = if (@($record.errors).Count) { 'rollback_incomplete' } else { 'rolled_back' }
         $record.errors = @($record.errors) + @("安装错误：$cause")
@@ -317,24 +489,47 @@ function Get-VerifiedOperation([string]$Operation) {
     Assert-NoReparse $operationFull
     $recordPath = Get-MemberPath $operationFull 'transaction.json'
     $record = [IO.File]::ReadAllText($recordPath, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-    if ($record.schema -ne 1 -or $record.status -notin @('completed', 'in_progress', 'rollback_incomplete') -or
-        @($record.members).Count -ne @($lock.members).Count) {
+    if ($record.schema -notin @(1, 2) -or $record.status -notin @('completed', 'in_progress', 'rollback_incomplete')) {
         throw '安装记录不受支持或已还原。'
     }
-    $client = Assert-Client ([string]$record.client) $lock
-    foreach ($expected in $lock.members) {
-        $actual = @($record.members | Where-Object { $_.target -eq $expected.target })
-        if ($actual.Count -ne 1 -or $actual[0].sha256 -ne $expected.sha256 -or
-            [bool]$actual[0].replaces_original -ne [bool]$expected.replaces_original) {
-            throw '安装记录与组件清单不一致。'
+    $client = Assert-Client ([string](Get-ManifestField $record 'client')) $lock
+    # zh: 不再要求记录成员数等于当前锁成员数（20261112）——锁新增成员（例如 nvngx_dlssg.dll）
+    # 不应让此前的安装记录变成「不可卸载」。只要求记录里每一项都能在锁中找到同哈希同类型的成员。
+    $entries = @()
+    # zh: schema 1 只有 members，schema 2 只有 entries；StrictMode 下访问缺失属性会抛错，
+    # 统一用 PSObject.Properties 安全取值（20261112）。
+    $rawItems = @()
+    foreach ($name in @('members', 'entries')) {
+        $property = $record.PSObject.Properties[$name]
+        if ($null -ne $property -and $null -ne $property.Value) { $rawItems += @($property.Value) }
+    }
+    $raw = @($rawItems | Where-Object { $null -ne $_ })
+    foreach ($item in $raw) {
+        $target = [string]$item.target
+        $expected = @($lock.members | Where-Object { [string]$_.target -eq $target })
+        if ($expected.Count -ne 1) { throw "安装记录含未知成员：$target" }
+        if ([string]$item.sha256 -ne [string]$expected[0].sha256) { throw "安装记录与组件锁哈希不一致：$target" }
+        if (@($entries | Where-Object { $_.target -eq $target }).Count -gt 0) { continue }
+        $previous = if ($record.schema -eq 2) { $item.previous_sha256 } else { $null }
+        $backupRel = if ($record.schema -eq 2) { $item.backup }
+                     elseif ([bool]$item.replaces_original) { 'd3d9.dll' } else { $null }
+        $preState = if ($record.schema -eq 2) { [string]$item.pre_state }
+                    elseif ([bool]$item.replaces_original) { 'present' } else { 'absent' }
+        $entries += [ordered]@{ target = $target; sha256 = [string]$item.sha256;
+            previous_sha256 = $previous; pre_state = $preState; backup = $backupRel }
+    }
+    $backupRoot = Join-Path $operationFull 'backup'
+    foreach ($entry in $entries) {
+        if ($entry.pre_state -ne 'present') { continue }
+        if (-not $entry.backup) { throw "安装记录缺少原件备份路径：$($entry.target)" }
+        $backup = Get-MemberPath $operationFull ('backup/' + [string]$entry.backup)
+        if (-not [IO.File]::Exists($backup)) { throw "原件备份缺失：$($entry.target)" }
+        if ($entry.previous_sha256 -and (Get-Sha256 $backup) -ne [string]$entry.previous_sha256) {
+            throw "原件备份身份不符：$($entry.target)"
         }
     }
-    $backup = Get-MemberPath $operationFull 'backup/d3d9.dll'
-    if (-not [IO.File]::Exists($backup) -or (Get-Sha256 $backup) -ne $lock.original_d3d9_sha256) {
-        throw '原始 d3d9.dll 备份缺失或身份不符。'
-    }
-    return [pscustomobject]@{ Directory = $operationFull; RecordPath = $recordPath;
-        Record = $record; Client = $client; Backup = $backup; Lock = $lock }
+    return [pscustomobject]@{ Directory = $operationFull; RecordPath = $recordPath; Record = $record;
+        Client = $client; BackupRoot = $backupRoot; Entries = $entries; Lock = $lock }
 }
 
 function Get-Dlss5Operations {
@@ -362,57 +557,76 @@ function Invoke-Dlss5Restore {
     $verified = Get-VerifiedOperation $Operation
     $runId = [guid]::NewGuid().ToString('N')
     $reportPath = Get-MemberPath $verified.Directory ("restore-$runId.json")
-    $conflictRoot = Get-MemberPath $verified.Directory ("modified-$runId")
-    $report = [ordered]@{ status = 'in_progress'; saved_modified = @(); restored = @(); errors = @() }
-    Write-JsonAtomic $reportPath $report
-    $members = @($verified.Lock.members)
-    [array]::Reverse($members)
-    foreach ($member in $members) {
-        try {
-            Assert-ProcessesStopped
-            $dest = Get-MemberPath $verified.Client ([string]$member.target)
-            if ([IO.Directory]::Exists($dest)) { throw '目标位置是目录，保留现状。' }
-            $exists = [IO.File]::Exists($dest)
-            $current = if ($exists) { Get-Sha256 $dest } else { $null }
-            if ($verified.Record.status -ne 'completed' -and $exists -and $current -ne $member.sha256 -and
-                (-not $member.replaces_original -or $current -ne $verified.Lock.original_d3d9_sha256) -and
-                $member.target -notin @($verified.Record.applied)) {
-                throw '文件不在已应用记录中且身份不符，保留现状。'
-            }
-            if ($exists -and $current -ne $member.sha256) {
-                $saved = Get-MemberPath $conflictRoot ([string]$member.target)
-                Copy-Verified $dest $saved $current
-                $report.saved_modified = @($report.saved_modified) + @([string]$member.target)
-            }
-            if ($exists -and (Get-Sha256 $dest) -ne $current) { throw '文件在恢复期间变化，保留现状。' }
-            if ($member.replaces_original) {
-                $temp = "$dest.dlss5-restoring-$runId"
-                Copy-Verified $verified.Backup $temp $verified.Lock.original_d3d9_sha256
-                if ($exists) { Move-AtomicReplace $temp $dest }
-                else { [IO.File]::Move($temp, $dest) }
-                if ((Get-Sha256 $dest) -ne $verified.Lock.original_d3d9_sha256) { throw '原件回读失败。' }
-            } elseif ($exists) {
-                [IO.File]::Delete($dest)
-            }
-            $pending = "$dest.dlss5-installing"
-            if ([IO.File]::Exists($pending) -or [IO.Directory]::Exists($pending)) {
-                throw '安装暂存路径仍存在，已保留并需要人工检查。'
-            }
-            $report.restored = @($report.restored) + @([string]$member.target)
-            Write-Dlss5CoreDebug ("restored {0}" -f $member.target)
-        } catch { $report.errors = @($report.errors) + @("$($member.target)：$($_.Exception.Message)") }
-    }
-    if (@($report.errors).Count) {
-        $report.status = 'rollback_incomplete'
-    } else {
-        $report.status = 'rolled_back'
+    $saveRoot = Get-MemberPath $verified.Directory ("modified-$runId")
+    $report = Invoke-Dlss5Teardown -ClientFull $verified.Client -Entries @($verified.Entries) `
+        -BackupRoot $verified.BackupRoot -SaveRoot $saveRoot -ReportPath $reportPath
+    if ($report.status -eq 'rolled_back') {
         $verified.Record.status = 'rolled_back'
         $verified.Record | Add-Member -NotePropertyName restore_record -NotePropertyValue $reportPath -Force
         Write-JsonAtomic $verified.RecordPath $verified.Record
+        # zh: 恢复成功后同步清掉客户端内安装记录与原件备份——否则「已恢复」的客户端
+        # 仍会被 Get-Dlss5Status 报成「已安装」，卸载也会按过期记录再跑一遍（20261112）。
+        try {
+            $clientRecord = Get-Dlss5ClientRecordPath $verified.Client
+            $clientBackup = Get-MemberPath $verified.Client 'host64/dlss5-backup'
+            if ([IO.Directory]::Exists($clientBackup)) { [IO.Directory]::Delete($clientBackup, $true) }
+            if ([IO.File]::Exists($clientRecord)) { [IO.File]::Delete($clientRecord) }
+        } catch { $report.errors = @($report.errors) + @("清理客户端内安装记录：$($_.Exception.Message)") }
     }
-    Write-JsonAtomic $reportPath $report
     return [pscustomobject]@{ Status = $report.status; Report = $reportPath;
         SavedModified = @($report.saved_modified).Count; Errors = @($report.errors) }
+}
+
+function Invoke-Dlss5Uninstall {
+    # zh: 卸载读客户端内的安装记录（host64\dlss5-install-record.json），不依赖 _scratch 事务记录。
+    # 按记录逐项：安装前存在 → 还原原件；安装前不存在 → 删除新增文件；然后清运行产物。
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][string]$Client, [switch]$KeepRecord)
+    Assert-ProcessesStopped
+    $lock = Get-Dlss5Lock
+    $null = Get-Dlss5Manifest
+    $clientFull = Assert-Client $Client $lock
+    $recordInfo = Test-Dlss5ClientRecord $clientFull
+    if ($null -eq $recordInfo) {
+        throw '客户端内没有安装记录（host64\dlss5-install-record.json），无法按清单卸载。若还保留 _scratch 事务记录，可改用「恢复安装前文件」。'
+    }
+    $runId = [guid]::NewGuid().ToString('N')
+    Assert-NoReparse $script:OperationsRoot
+    [IO.Directory]::CreateDirectory($script:OperationsRoot) | Out-Null
+    $reportPath = Join-Path $script:OperationsRoot ("uninstall-$runId.json")
+    $saveRoot = Join-Path $script:OperationsRoot ("uninstall-modified-$runId")
+    $entries = @(@($recordInfo.Record.entries) | ForEach-Object { [ordered]@{ target = [string]$_.target;
+        sha256 = [string]$_.sha256; previous_sha256 = $_.previous_sha256;
+        pre_state = [string]$_.pre_state; backup = $_.backup } })
+    $report = Invoke-Dlss5Teardown -ClientFull $clientFull -Entries $entries `
+        -BackupRoot $recordInfo.BackupRoot -SaveRoot $saveRoot -ReportPath $reportPath
+    $removed = @(); $reported = @()
+    if ($report.status -eq 'rolled_back') {
+        foreach ($item in @($recordInfo.Record.residue)) {
+            $rel = [string](Get-ManifestField $item 'path')
+            if (-not $rel) { continue }
+            if ([string](Get-ManifestField $item 'policy') -ne 'delete') { $reported += $rel; continue }
+            if ($rel -like '%*%') { $reported += $rel; continue }
+            try {
+                $path = Get-MemberPath $clientFull $rel
+                if ([IO.Directory]::Exists($path)) { [IO.Directory]::Delete($path, $true); $removed += $rel }
+                elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path); $removed += $rel }
+            } catch { $report.errors = @($report.errors) + @("残留 $rel：$($_.Exception.Message)") }
+        }
+        try {
+            if ([IO.Directory]::Exists($recordInfo.BackupRoot)) { [IO.Directory]::Delete($recordInfo.BackupRoot, $true) }
+            if (-not $KeepRecord -and [IO.File]::Exists($recordInfo.Path)) { [IO.File]::Delete($recordInfo.Path) }
+        } catch { $report.errors = @($report.errors) + @("清理安装记录：$($_.Exception.Message)") }
+    }
+    $status = if (@($report.errors).Count) { 'rollback_incomplete' } else { 'uninstalled' }
+    $summary = [ordered]@{ status = $status; client = $clientFull; restored = @($report.restored);
+        deleted = @($report.deleted); saved_modified = @($report.saved_modified);
+        residue_removed = @($removed); residue_reported = @($reported); errors = @($report.errors); report = $reportPath }
+    Write-JsonAtomic $reportPath $summary
+    return [pscustomobject]@{ Status = $status; Report = $reportPath;
+        Restored = @($report.restored).Count; Deleted = @($report.deleted).Count;
+        SavedModified = @($report.saved_modified).Count; ResidueRemoved = @($removed).Count;
+        ResidueReported = @($reported); Errors = @($report.errors) }
 }
 
 function Invoke-Dlss5Repair {
@@ -425,12 +639,8 @@ function Invoke-Dlss5Repair {
     $reportPath = Get-MemberPath $verified.Directory ("repair-$runId.json")
     $conflictRoot = Get-MemberPath $verified.Directory ("repair-modified-$runId")
     $report = [ordered]@{ status = 'in_progress'; repaired = @(); preserved = @(); errors = @() }
-    foreach ($member in $verified.Lock.members) {
-        $staged = Get-MemberPath $verified.Directory ('stage/' + $member.target)
-        if (-not [IO.File]::Exists($staged) -or (Get-Sha256 $staged) -ne $member.sha256) {
-            throw "修复来源缺失或身份不符：$($member.target)"
-        }
-    }
+    # zh: 可选运行库（nvngx_dlssg.dll）未在本次安装中时，暂存里本来就没有它；
+    # 修复跳过这类成员，不再整体报错（20261112）。
     Write-JsonAtomic $reportPath $report
     foreach ($member in $verified.Lock.members) {
         try {
@@ -452,6 +662,7 @@ function Invoke-Dlss5Repair {
             Assert-NoReparse $dest
             $temp = "$dest.dlss5-repair-$runId"
             $staged = Get-MemberPath $verified.Directory ('stage/' + $member.target)
+            if (-not [IO.File]::Exists($staged) -or (Get-Sha256 $staged) -ne $member.sha256) { continue }
             Copy-Verified $staged $temp ([string]$member.sha256)
             if ($exists) {
                 if ((Get-Sha256 $dest) -ne $current) { throw '文件在修复期间变化，保留现状。' }
@@ -689,7 +900,14 @@ function Get-Dlss5Status {
         $files += [pscustomobject]@{ Name = [string]$member.target; Status = $state; Machine = $machine; Version = $version }
     }
     $exe = Get-MemberPath $clientFull 'wow.exe'
-    $gameIdentity = if ([IO.File]::Exists($exe) -and (Get-Sha256 $exe) -eq $lock.game_sha256) { '匹配' } else { '缺失或不匹配' }
+    # zh: 不再报告「与锁定哈希匹配」——身份口径已改为 存在 + x86 架构（20261112）。
+    $gameIdentity = '缺失'
+    if ([IO.File]::Exists($exe)) {
+        $machine = Get-PeMachine $exe
+        $size = (Get-Item -LiteralPath $exe).Length
+        $gameIdentity = if ($machine -eq 'x86') { "存在（x86，$size 字节；不比对哈希）" }
+                        else { "存在但架构为 $machine（应为 x86）" }
+    }
     $configPath = Get-MemberPath $clientFull 'host64/ReShade.ini'
     $config = [ordered]@{ NeuralRendering = $null; Model = $null; Intensity = $null; FrameGeneration = $null;
         NvidiaOpticalFlowMotion = $null; DetachedPresentation = $null; WindowedInputScaling = $null; PipelineEnabled = $null;
@@ -725,7 +943,11 @@ function Get-Dlss5Status {
     $graphics = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
         [pscustomobject]@{ Name = $_.Name; DriverVersion = $_.DriverVersion }
     })
+    $recordInfo = Test-Dlss5ClientRecord $clientFull
+    $installRecord = if ($null -eq $recordInfo) { '没有（首次安装或已卸载）' }
+                     else { "存在（$(@($recordInfo.Record.entries).Count) 项，$($recordInfo.Record.installed_utc)）" }
     return [pscustomobject]@{ GameIdentity = $gameIdentity; Files = $files; Config = [pscustomobject]$config;
+        InstallRecord = $installRecord;
         GameProcesses = $games.Count; HostProcesses = $hosts.Count; UnidentifiedProcesses = $unknown;
         GraphicsDevices = $graphics; Telemetry = $telemetry }
 }
@@ -925,7 +1147,68 @@ function Apply-Dlss5Scheme {
         -SkinStructure ([double]$v.skinStructure) -NeuralRendering ([bool]$v.neuralRendering)
 }
 
-Export-ModuleMember -Function Get-Dlss5InstallPreview, Invoke-Dlss5Install, Get-Dlss5Operations,
-    Invoke-Dlss5Restore, Invoke-Dlss5Repair, Get-Dlss5Status, Set-Dlss5Settings, Set-Dlss5Pipeline,
-    Export-Dlss5Diagnostics, Start-Dlss5WindowWatch, Get-Dlss5AdvancedSettings, Set-Dlss5AdvancedSettings,
-    Get-Dlss5Schemes, Save-Dlss5Scheme, Apply-Dlss5Scheme
+function Invoke-Dlss5Teardown {
+    # zh: 安装回退与卸载共用的逆向处理核心。按条目逐项：安装前存在 → 还原原件（先留用户改动副本）；
+    # 安装前不存在 → 删除新增文件。任何一项失败都不中断其余项，结果按 rolled_back /
+    # rollback_incomplete 如实记录，不把失败写成完成（20261112）。
+    param([Parameter(Mandatory)][string]$ClientFull, [Parameter(Mandatory)][object[]]$Entries,
+          [string]$BackupRoot, [string]$SaveRoot, [string]$ReportPath)
+    $report = [ordered]@{ status = 'in_progress'; saved_modified = @(); restored = @(); deleted = @(); errors = @() }
+    if ($ReportPath) { Write-JsonAtomic $ReportPath $report }
+    $list = @($Entries)
+    [array]::Reverse($list)
+    foreach ($entry in $list) {
+        $target = [string]$entry.target
+        try {
+            Assert-ProcessesStopped
+            $dest = Get-MemberPath $ClientFull $target
+            if ([IO.Directory]::Exists($dest)) { throw '目标位置是目录，保留现状。' }
+            $exists = [IO.File]::Exists($dest)
+            $preState = [string]$entry.pre_state
+            if ($preState -eq 'present') {
+                $previous = [string]$entry.previous_sha256
+                if ($exists -and $previous -and (Get-Sha256 $dest) -eq $previous) {
+                    $report.restored = @($report.restored) + @($target); continue
+                }
+                if (-not $BackupRoot -or -not $entry.backup) { throw '缺少原件备份位置。' }
+                $backupPath = Get-MemberPath $BackupRoot ([string]$entry.backup)
+                if (-not [IO.File]::Exists($backupPath)) { throw '原件备份缺失。' }
+                if ($previous -and (Get-Sha256 $backupPath) -ne $previous) { throw '原件备份身份不符。' }
+                if ($exists -and $SaveRoot) {
+                    $current = Get-Sha256 $dest
+                    $saved = Get-MemberPath $SaveRoot $target
+                    Copy-Verified $dest $saved $current
+                    $report.saved_modified = @($report.saved_modified) + @($target)
+                }
+                $temp = "$dest.dlss5-restoring"
+                if ([IO.File]::Exists($temp) -or [IO.Directory]::Exists($temp)) { throw "还原暂存路径已存在：$temp" }
+                $expect = if ($previous) { $previous } else { Get-Sha256 $backupPath }
+                Copy-Verified $backupPath $temp $expect
+                [IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($dest)) | Out-Null
+                if ($exists) { Move-AtomicReplace $temp $dest } else { [IO.File]::Move($temp, $dest) }
+                if ((Get-Sha256 $dest) -ne $expect) { throw '原件还原回读失败。' }
+                $report.restored = @($report.restored) + @($target)
+            } else {
+                if (-not $exists) { continue }
+                if ((Get-Sha256 $dest) -ne [string]$entry.sha256) {
+                    if (-not $SaveRoot) { throw '文件安装后被修改，缺少保存位置。' }
+                    $current = Get-Sha256 $dest
+                    $saved = Get-MemberPath $SaveRoot $target
+                    Copy-Verified $dest $saved $current
+                    $report.saved_modified = @($report.saved_modified) + @($target)
+                }
+                [IO.File]::Delete($dest)
+                $report.deleted = @($report.deleted) + @($target)
+            }
+        } catch { $report.errors = @($report.errors) + @("$($target)：$($_.Exception.Message)") }
+    }
+    $report.status = if (@($report.errors).Count) { 'rollback_incomplete' } else { 'rolled_back' }
+    if ($ReportPath) { Write-JsonAtomic $ReportPath $report }
+    return [pscustomobject]$report
+}
+
+Export-ModuleMember -Function Get-Dlss5InstallPreview, Invoke-Dlss5Install, Invoke-Dlss5Uninstall,
+    Get-Dlss5Operations, Invoke-Dlss5Restore, Invoke-Dlss5Repair, Get-Dlss5Status, Set-Dlss5Settings,
+    Set-Dlss5Pipeline, Export-Dlss5Diagnostics, Start-Dlss5WindowWatch, Get-Dlss5AdvancedSettings,
+    Set-Dlss5AdvancedSettings, Get-Dlss5Schemes, Save-Dlss5Scheme, Apply-Dlss5Scheme,
+    Get-Dlss5Manifest, Export-Dlss5ManifestList, Test-Dlss5ClientRecord

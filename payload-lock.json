@@ -3,6 +3,8 @@
   "aio_version": "2.2.4",
   "reshade_version": "6.8.0",
   "game_sha256": "4c459de64d38b5795becc6c01a03ba00d34686598fae707c442446722617868a",
+  "game_sha256_note": "仅供追溯，不再参与校验：存在官方与第三方修改过的 wow.exe（20261112）。安装只校验 wow.exe 存在且为 x86。",
+  "original_d3d9_sha256_note": "仅供追溯，不再作为安装前置条件：d3d9.dll 在安装时按实际内容快照（存在则备份、不存在记为 absent），卸载按该快照恢复或删除。",
   "original_d3d9_sha256": "cc556331fc3388989749620bceead4c2da95c3932ed38cf5cc24f3f0a878866e",
   "members": [
     {
