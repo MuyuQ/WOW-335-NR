@@ -752,6 +752,42 @@ bool NvofMotionProvider::Initialize(ID3D12Device *device,
     return true;
 }
 
+void NvofMotionProvider::AbandonForProcessExit() noexcept
+{
+    ready_ = false;
+    session_ = nullptr;
+    module_ = nullptr;
+    log_ = nullptr;
+    for (auto &slot : slots_) {
+        slot.prep_allocator.Detach();
+        slot.prep_list.Detach();
+        slot.input.Detach();
+        slot.forward.Detach();
+        slot.backward.Detach();
+        slot.forward_cost.Detach();
+        slot.backward_cost.Detach();
+        slot.motion.Detach();
+        slot.history_mask.Detach();
+        slot.geometry_depth.Detach();
+        slot.consumer_fence.Detach();
+    }
+    device_.Detach();
+    compute_queue_.Detach();
+    neural_fence_.Detach();
+    prep_fence_.Detach();
+    completion_fence_.Detach();
+    registration_fence_.Detach();
+    prep_root_.Detach();
+    prep_pipeline_.Detach();
+    prep_descriptors_.Detach();
+    conversion_root_.Detach();
+    conversion_pipeline_.Detach();
+    conversion_descriptors_.Detach();
+    visualization_root_.Detach();
+    visualization_pipeline_.Detach();
+    visualization_descriptors_.Detach();
+}
+
 void NvofMotionProvider::Shutdown()
 {
     ready_ = false;

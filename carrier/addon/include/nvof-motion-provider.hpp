@@ -39,6 +39,9 @@ public:
         unsigned int flow_width, unsigned int flow_height,
         DXGI_FORMAT source_format, LogCallback log);
     void Shutdown();
+    // Process termination only: abandon handles without calling the driver.
+    // Windows reclaims them after every other process thread has been stopped.
+    void AbandonForProcessExit() noexcept;
     void ResetHistory();
 
     // The caller must have queued any dependency which makes 'source' readable

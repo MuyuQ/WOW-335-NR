@@ -40,6 +40,8 @@
 #include "performance-telemetry.h"
 #include "aio-menu-schema.hpp"
 #include "nvof-motion-provider.hpp"
+#include "shutdown.hpp"
+#include <new>
 
 #define ADDON_VERSION "2.2.4"
 
@@ -48,6 +50,14 @@ extern "C" __declspec(dllexport) const char *DESCRIPTION =
     "Standalone D3D9/D3D11/D3D12/Vulkan DLSS Neural Rendering, Super Resolution, and Frame Generation.";
 
 static HMODULE g_self;
+static HMODULE g_lifetime_module, g_lifetime_reshade;
+static nr_shutdown::Admission g_admission;
+static SRWLOCK g_shutdown_lock = SRWLOCK_INIT;
+static std::atomic<bool> g_initialized{false}, g_shutdown_complete{false}, g_unregistered{false};
+static bool g_callback_code_retained;
+static bool g_runtime_log_callback_registered;
+static DWORD ShutdownResources(DWORD timeout_ms, unsigned owned_entries = 0);
+static FILE *g_log_file;
 // Set by the 64-bit carrier used for 32-bit games. The ReShade runtime lives
 // in the carrier process, but foreground/input ownership must remain with the
 // real game process.
@@ -1314,7 +1324,6 @@ static void Log(const char *format, ...)
     // zh: 长驻句柄 + 每行 flush（20261109：此前每条日志开关一次文件，调试量级下
     // 是每秒数百次 fopen/fclose）。写入失败自动关闭重开（路径恢复后自愈）；
     // 句柄长驻到进程退出。
-    static FILE *g_log_file = nullptr;
     if (g_log_file == nullptr && g_log_path[0] != '\0' &&
         fopen_s(&g_log_file, g_log_path, "a") != 0)
         g_log_file = nullptr;
@@ -1331,6 +1340,36 @@ static void Log(const char *format, ...)
     }
     LeaveCriticalSection(&g_log_lock);
     reshade::log::message(reshade::log::level::info, message);
+}
+
+struct ShutdownWork { LPTHREAD_START_ROUTINE function; void *parameter; HMODULE module; };
+static void WINAPI RunShutdownWork(PTP_CALLBACK_INSTANCE instance, void *parameter)
+{
+    nr_shutdown::Reservation reservation{g_admission};
+    const ShutdownWork work = *static_cast<ShutdownWork *>(parameter);
+    delete static_cast<ShutdownWork *>(parameter);
+    // The rundown counter reaches zero in this callback's epilogue. Keep its
+    // code mapped until Windows has actually returned from the callback.
+    FreeLibraryWhenCallbackReturns(instance, work.module);
+    if (!g_admission.Closing()) work.function(work.parameter);
+}
+static BOOL QueueShutdownWork(LPTHREAD_START_ROUTINE function, void *parameter, ULONG)
+{
+    if (!g_admission.Enter()) return FALSE;
+    HMODULE module = nullptr;
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(RunShutdownWork), &module)) {
+        g_admission.Leave();
+        return FALSE;
+    }
+    auto *work = new (std::nothrow) ShutdownWork{function, parameter, module};
+    if (!work || !TrySubmitThreadpoolCallback(RunShutdownWork, work, nullptr)) {
+        delete work;
+        g_admission.Leave();
+        FreeLibrary(module);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void LogNvof(const char *message)
@@ -3150,6 +3189,9 @@ static bool InitializeNgx()
         // params (binary-string scan: "Minimum.Logging.Level"/"Log.Callback");
         // setting them only on the create/evaluate blobs never armed the callback.
         g_ngx_params->Set("Log.Callback", reinterpret_cast<void *>(DlssgSnippetLogCallback));
+        // The private provider may retain this callback beyond feature release.
+        // Without a documented unregister/rundown contract its code stays mapped.
+        g_runtime_log_callback_registered = true;
         g_ngx_params->Set("Minimum.Logging.Level", 2u);
         result = bridge_init(dlssg_init, kGenericCustomCoreId, dlssg_path, g_neural_device.Get(), NVSDK_NGX_Version_API, g_ngx_params);
         Log("DLSS-G snippet Init_Ext = 0x%08X (%s)", static_cast<unsigned int>(result), ResultName(result));
@@ -5724,6 +5766,9 @@ static DWORD WINAPI ProxyPresentationThread(void *);
 
 static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     if (runtime == nullptr) return;
     const HWND runtime_window = static_cast<HWND>(runtime->get_hwnd());
     const auto runtime_backbuffer = runtime->get_current_back_buffer();
@@ -5802,9 +5847,15 @@ static void OnInitEffectRuntime(reshade::api::effect_runtime *runtime)
     }
     ResolveHandles(runtime);
 }
-static void OnReloadedEffects(reshade::api::effect_runtime *runtime) { if (!g_runtime || runtime == g_runtime) ResolveHandles(runtime); }
+static void OnReloadedEffects(reshade::api::effect_runtime *runtime) {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+ if (!g_runtime || runtime == g_runtime) ResolveHandles(runtime); }
 static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     if (runtime == g_proxy_runtime.load())
     {
         g_proxy_runtime = nullptr;
@@ -5852,6 +5903,9 @@ static void OnDestroyEffectRuntime(reshade::api::effect_runtime *runtime)
 static void OnRenderTechnique(reshade::api::effect_runtime *runtime, reshade::api::effect_technique technique,
     reshade::api::command_list *, reshade::api::resource_view rtv, reshade::api::resource_view)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     using namespace reshade::api;
     if (!g_enabled || g_neural_failed || runtime != g_runtime || !g_feed_technique.handle ||
         technique.handle != g_feed_technique.handle) return;
@@ -8257,7 +8311,7 @@ static bool EnsureWindowedLogicalSizeSubclass(HWND game_window)
     return true;
 }
 
-static void RestoreWindowedLogicalSizeSubclass()
+static void RestoreWindowedLogicalSizeSubclass(bool preserve_callbacks = false)
 {
     HWND hwnd = g_windowed_subclassed_window;
     WNDPROC original = g_windowed_original_wndproc;
@@ -8265,8 +8319,12 @@ static void RestoreWindowedLogicalSizeSubclass()
         reinterpret_cast<WNDPROC>(GetWindowLongPtrW(hwnd, GWLP_WNDPROC)) == WindowedVirtualizationWndProc)
         SetWindowLongPtrW(hwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(original));
     g_windowed_subclassed_window = nullptr;
-    g_windowed_original_wndproc = nullptr;
-    RemoveWindowQueryHooks();
+    // An already-dispatched subclass call or another subclass's saved chain can
+    // still call us. Shutdown preserves its original target and hook trampolines.
+    if (!preserve_callbacks) {
+        g_windowed_original_wndproc = nullptr;
+        RemoveWindowQueryHooks();
+    }
 }
 
 static void ApplyDeferredWindowedVirtualization(HWND game_window)
@@ -8376,7 +8434,7 @@ static void QueueWindowedVirtualization(HWND game_window)
     if (game_window == nullptr || !IsWindow(game_window) ||
         g_windowed_virtualization_pending.exchange(true))
         return;
-    if (!QueueUserWorkItem(DeferredWindowedVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
+    if (!QueueShutdownWork(DeferredWindowedVirtualizationWorker, game_window, WT_EXECUTEDEFAULT))
     {
         g_windowed_virtualization_pending = false;
         Log("windowed virtualization worker could not be queued: error=%lu", GetLastError());
@@ -8456,7 +8514,7 @@ static void QueueDetachedFallbackWindowRepair(HWND game_window)
     if (game_window == nullptr || !IsWindow(game_window) ||
         g_detached_window_repair_pending.exchange(true))
         return;
-    if (!QueueUserWorkItem(DetachedFallbackWindowRepairWorker, game_window, WT_EXECUTEDEFAULT))
+    if (!QueueShutdownWork(DetachedFallbackWindowRepairWorker, game_window, WT_EXECUTEDEFAULT))
     {
         g_detached_window_repair_pending = false;
         Log("detached fallback physical-window repair could not be queued: error=%lu", GetLastError());
@@ -10189,6 +10247,7 @@ static bool ApplyPendingColorProfileChange(UINT width, UINT height, DXGI_FORMAT 
 
 static bool InitializeProxyPresentation(ID3D12Resource *source, bool early)
 {
+    if (g_admission.Closing()) return false;
     if ((!early && source == nullptr) || g_command_queue == nullptr || g_game_window == nullptr)
         return false;
 
@@ -10617,6 +10676,9 @@ static bool EnsureProxy(ID3D12Resource *source)
 
 static void OnInitCommandQueue(reshade::api::command_queue *queue)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     if (queue == nullptr || queue->get_device()->get_api() != reshade::api::device_api::d3d12 ||
         (queue->get_type() & reshade::api::command_queue_type::graphics) != reshade::api::command_queue_type::graphics) return;
     Log("observed D3D12 graphics queue: reshade=%p native=%p", queue, queue->get_native());
@@ -11603,14 +11665,14 @@ static DWORD WINAPI ProxyPresentationThread(void *)
 {
     const HANDLE waits[2] = {g_proxy_present_stop_event, g_proxy_present_event};
     Log("async proxy presentation worker started");
-    while (true)
+    while (!g_admission.Closing())
     {
         const DWORD wait = WaitForMultipleObjects(2, waits, FALSE,
             NextAsyncPresentationDeadlineTimeoutMs());
         if (wait == WAIT_OBJECT_0) break;
         if (wait != WAIT_OBJECT_0 + 1 && wait != WAIT_TIMEOUT) continue;
 
-        while (true)
+        while (!g_admission.Closing())
         {
             ReclaimPresentationFrameSlots();
             const int direct_slot_index = ClaimOldestReadyPresentationSlot();
@@ -11970,7 +12032,7 @@ static DWORD WINAPI NeuralDispatchThread(void *)
         g_nvof_dispatch_completion_event};
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
     Log("completion-driven D3D11 neural dispatcher started");
-    while (true)
+    while (!g_admission.Closing())
     {
         const DWORD wait = WaitForMultipleObjects(5, waits, FALSE, INFINITE);
         if (wait == WAIT_OBJECT_0) break;
@@ -12071,6 +12133,7 @@ static DWORD WINAPI NeuralDispatchThread(void *)
 
 static bool EnsureNeuralDispatchThread()
 {
+    if (g_admission.Closing()) return false;
     if (g_neural_dispatch_thread) return true;
     if (!g_capture_ready_event) return false;
     g_neural_dispatch_stop_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
@@ -12107,24 +12170,6 @@ static bool EnsureNeuralDispatchThread()
     return true;
 }
 
-static void StopNeuralDispatchThread()
-{
-    if (g_neural_dispatch_stop_event) SetEvent(g_neural_dispatch_stop_event);
-    if (g_neural_dispatch_thread)
-    {
-        WaitForSingleObject(g_neural_dispatch_thread, 2000);
-        CloseHandle(g_neural_dispatch_thread);
-    }
-    if (g_neural_dispatch_completion_event) CloseHandle(g_neural_dispatch_completion_event);
-    if (g_nvof_dispatch_completion_event) CloseHandle(g_nvof_dispatch_completion_event);
-    if (g_neural_dispatch_wake_event) CloseHandle(g_neural_dispatch_wake_event);
-    if (g_neural_dispatch_stop_event) CloseHandle(g_neural_dispatch_stop_event);
-    g_neural_dispatch_thread = nullptr;
-    g_neural_dispatch_completion_event = nullptr;
-    g_nvof_dispatch_completion_event = nullptr;
-    g_neural_dispatch_wake_event = nullptr;
-    g_neural_dispatch_stop_event = nullptr;
-}
 
 static bool EnsureStandaloneResources(ID3D12Resource *backbuffer)
 {
@@ -12164,6 +12209,9 @@ static bool CapturePostReshadeFrame(ID3D12Resource *source)
 
 static void OnReshadePresent(reshade::api::effect_runtime *runtime)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     if (runtime == nullptr) return;
     if (runtime == g_proxy_runtime.load())
     {
@@ -12238,6 +12286,9 @@ static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
     reshade::api::command_list *commands, reshade::api::resource_view rtv,
     reshade::api::resource_view)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     if (!runtime || runtime != g_runtime || !commands || !g_vulkan_waiting_for_effects ||
         runtime->get_device()->get_api() != reshade::api::device_api::vulkan)
         return;
@@ -12282,6 +12333,9 @@ static void OnReshadeFinishEffects(reshade::api::effect_runtime *runtime,
 
 static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool open, reshade::api::input_source source)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return false;
+
     if (runtime == g_proxy_runtime.load())
     {
         // Once focused, the proxy runtime is the input authority. Propagate a
@@ -12502,6 +12556,9 @@ static void ApplyLiveParamsFromFile()
 static void OnPresent(reshade::api::command_queue *queue, reshade::api::swapchain *swapchain,
     const reshade::api::rect *, const reshade::api::rect *, uint32_t, const reshade::api::rect *)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     ApplyLiveParamsFromFile();
     if (!queue || !swapchain) return;
     const HWND present_window = static_cast<HWND>(swapchain->get_hwnd());
@@ -13046,6 +13103,9 @@ static void BeginPrimarySwapchainTransition(HWND hwnd, UINT requested_width,
 static bool OnCreateSwapchain(reshade::api::device_api api,
     reshade::api::swapchain_desc &desc, void *window)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return false;
+
     if (!g_enabled || window == nullptr ||
         (api != reshade::api::device_api::d3d9 &&
          api != reshade::api::device_api::d3d11 &&
@@ -13157,6 +13217,9 @@ static bool OnCreateSwapchain(reshade::api::device_api api,
 
 static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     if (swapchain == nullptr) return;
     const auto resource = swapchain->get_current_back_buffer();
     const auto desc = swapchain->get_device()->get_resource_desc(resource);
@@ -13324,6 +13387,9 @@ static void OnInitSwapchain(reshade::api::swapchain *swapchain, bool)
 
 static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullscreen, void *)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return false;
+
     if (!g_enabled || !fullscreen || swapchain == nullptr) return false;
     // Deliberately applies to every API: an exclusive-fullscreen swapchain
     // cannot coexist with the separate native-output window, so runtime requests
@@ -13346,7 +13412,7 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
         if (g_proxy_window != nullptr)
             PostMessageW(g_proxy_window, kProxyVirtualizeFullscreenMessage,
                 reinterpret_cast<WPARAM>(hwnd), 0);
-        else if (!QueueUserWorkItem(DeferredFullscreenWorker, hwnd, WT_EXECUTEDEFAULT))
+        else if (!QueueShutdownWork(DeferredFullscreenWorker, hwnd, WT_EXECUTEDEFAULT))
         {
             g_fullscreen_virtualization_pending = false;
             Log("exclusive fullscreen virtualization worker could not be queued: error=%lu", GetLastError());
@@ -13359,6 +13425,9 @@ static bool OnSetFullscreenState(reshade::api::swapchain *swapchain, bool fullsc
 
 static void DrawOverlay(reshade::api::effect_runtime *)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+
     constexpr const char *section = dlss5_aio_menu::kConfigSection;
     ImGui::TextUnformatted("Standalone DLSS-NR + Super Resolution");
     const char *api_name = g_present_api == reshade::api::device_api::d3d9 ? "D3D9 -> D3D11 -> D3D12" :
@@ -14098,394 +14167,722 @@ static void DrawOverlay(reshade::api::effect_runtime *)
 
 static void OnDestroyDevice(reshade::api::device *device)
 {
-    if (device && device->get_api() == reshade::api::device_api::d3d11)
-        UpdateLegacyCaptureMailboxMode(false);
-    for (const BackbufferView &entry : g_backbuffer_views)
-        if (entry.rtv.handle) device->destroy_resource_view(entry.rtv);
-    g_backbuffer_views.clear();
-    if (g_neural_device && reinterpret_cast<ID3D12Device *>(device->get_native()) == g_neural_device.Get())
-    {
-        Log("game D3D12 device is being destroyed; standalone session ending");
-        g_neural_ready = false;
-        g_neural_failed = true;
-        SetStatus("D3D12 device destroyed");
-    }
-    else if ((device->get_api() == reshade::api::device_api::d3d11 ||
-              device->get_api() == reshade::api::device_api::d3d9) && g_present_api == device->get_api())
-    {
-        Log("game legacy graphics device is being destroyed; standalone session ending");
-        g_neural_ready = false;
-        g_neural_failed = true;
-        SetStatus("legacy graphics device destroyed");
-    }
-    else if (device->get_api() == reshade::api::device_api::vulkan && device == g_vulkan_reshade_device)
-    {
-        Log("game Vulkan device is being destroyed; releasing imported shared objects");
-        if (g_rs_queue) g_rs_queue->wait_idle();
-        ReleaseLegacyFrameResources();
-        if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)
-            g_vulkan.DestroySemaphore(g_vulkan.dev, g_vulkan_semaphore, nullptr);
-        g_vulkan_semaphore = VK_NULL_HANDLE;
-        g_vulkan_fence = {};
-        if (g_vulkan.lib) FreeLibrary(g_vulkan.lib);
-        g_vulkan = {};
-        g_vulkan_reshade_device = nullptr;
-        g_neural_ready = false;
-        g_neural_failed = true;
-        SetStatus("Vulkan device destroyed");
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return;
+    if (!device || !g_initialized || g_shutdown_complete) return;
+    const bool primary = (g_rs_queue && device == g_rs_queue->get_device()) ||
+        device == g_vulkan_reshade_device ||
+        (g_neural_device && reinterpret_cast<ID3D12Device *>(device->get_native()) == g_neural_device.Get());
+    if (primary) {
+        const DWORD result = ShutdownResources(5000, 1);
+        if (result != ERROR_SUCCESS)
+            Log("device teardown: explicit shutdown incomplete (%lu); resources and module retained", result);
     }
 }
 
 static bool OnCreateDevice(reshade::api::device_api api, uint32_t &)
 {
+    nr_shutdown::Lease admission(g_admission);
+    if (!admission) return false;
+
     if (api == reshade::api::device_api::vulkan)
         FeedVkHookInstall();
     return false;
 }
 
-BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
+// ReShade calls AddonInit/AddonUninit outside this DLL's loader callback.
+// Callers of NRShutdown must hold their own module reference until it returns.
+struct ShutdownQueue {
+    Microsoft::WRL::ComPtr<ID3D12CommandQueue> queue;
+    Microsoft::WRL::ComPtr<ID3D12Fence> fence;
+};
+static std::array<ShutdownQueue, 3> g_shutdown_queues;
+static size_t g_shutdown_queue_count;
+static Microsoft::WRL::ComPtr<ID3D11Query> g_shutdown_d3d11_query;
+static Microsoft::WRL::ComPtr<IDirect3DQuery9> g_shutdown_d3d9_query;
+
+// Keep the complete owner inventory in one place for normal release and
+// process-exit abandonment. Neither traversal allocates or acquires a lock.
+template<class Visit> static void VisitResourceOwners(Visit visit)
 {
-    if (reason == DLL_PROCESS_ATTACH)
+    visit(g_screenshot_readback);
+    visit(g_proxy_swapchain);
+    visit(g_composition_device);
+    visit(g_composition_target);
+    visit(g_composition_visual);
+    visit(g_composition_effect);
+    for (auto &owner : g_proxy_allocators) visit(owner);
+    for (auto &owner : g_proxy_lists) visit(owner);
+    visit(g_proxy_fence);
+    visit(g_proxy_rtv_heap);
+    visit(g_proxy_srv_heap);
+    visit(g_proxy_root_signature);
+    visit(g_proxy_pipeline);
+    visit(g_guide_telemetry_query_heap);
+    visit(g_guide_telemetry_readback);
+    visit(g_guide_telemetry_fence);
+    visit(g_proxy_telemetry_query_heap);
+    visit(g_proxy_telemetry_readback);
+    visit(g_neural_device);
+    visit(g_neural_allocator);
+    visit(g_neural_list);
+    visit(g_async_compute_queue);
+    visit(g_async_fg_queue);
+    visit(g_async_fg_fence);
+    visit(g_async_input_fence);
+    visit(g_neural_fence);
+    visit(g_packed_color);
+    visit(g_post_reshade_color);
+    visit(g_nr_stage);
+    visit(g_nr_second_stage);
+    visit(g_nr_third_stage);
+    visit(g_sr_stage);
+    visit(g_fg_stage);
+    visit(g_fallback_motion);
+    visit(g_fallback_depth);
+    visit(g_captured_motion);
+    visit(g_captured_depth);
+    visit(g_captured_mask);
+    visit(g_captured_nr_mask);
+    visit(g_downsample_root_signature);
+    visit(g_downsample_pipeline);
+    visit(g_downsample_srv_heap);
+    visit(g_downsample_rtv_heap);
+    visit(g_legacy_device11);
+    visit(g_legacy_context11);
+    visit(g_legacy_context4);
+    visit(g_legacy_fence11);
+    visit(g_legacy_fence12);
+    visit(g_capture_ready_fence11);
+    visit(g_capture_ready_fence12);
+    visit(g_legacy_input11);
+    visit(g_legacy_post11);
+    visit(g_legacy_post12);
+    visit(g_legacy_motion11);
+    visit(g_legacy_depth11);
+    visit(g_legacy_mask11);
+    visit(g_legacy_nr_mask11);
+    visit(g_legacy_source_motion11);
+    visit(g_legacy_source_depth11);
+    visit(g_legacy_source_mask11);
+    visit(g_legacy_source_nr_mask11);
+    visit(g_legacy_downsample_source11);
+    visit(g_legacy_downsample_source_srv);
+    visit(g_legacy_downsample_vs);
+    visit(g_legacy_downsample_ps);
+    visit(g_legacy_downsample_sampler);
+    visit(g_legacy_post_rtv);
+    visit(g_legacy_device9);
+    visit(g_legacy_input9);
+    visit(g_legacy_post9);
+    visit(g_legacy_input9_11);
+    visit(g_legacy_post9_11);
+    visit(g_legacy_query9);
+    visit(g_guide_rtv_heap);
+    visit(g_shutdown_d3d11_query);
+    visit(g_shutdown_d3d9_query);
+    for (auto &slot : g_pipeline_slots) {
+        visit(slot.allocator);
+        visit(slot.list);
+        visit(slot.capture_allocator);
+        visit(slot.capture_list);
+        visit(slot.real_output);
+        visit(slot.generated_output);
+        visit(slot.generated_output_2);
+        visit(slot.generated_output_3);
+        visit(slot.original_input);
+        visit(slot.capture_input);
+        visit(slot.legacy_input11);
+        visit(slot.legacy_input_rtv);
+        visit(slot.telemetry_query_heap);
+        visit(slot.telemetry_readback);
+    }
+    for (auto &slot : g_legacy_capture_slots) {
+        visit(slot.input12);
+        visit(slot.input11);
+        visit(slot.input_rtv);
+    }
+    for (auto &slot : g_presentation_slots) {
+        visit(slot.fg_allocator);
+        visit(slot.fg_list);
+        visit(slot.real_output);
+        visit(slot.generated_output);
+        visit(slot.generated_output_2);
+        visit(slot.generated_output_3);
+        visit(slot.original_input);
+        visit(slot.fg_telemetry_query_heap);
+        visit(slot.fg_telemetry_readback);
+    }
+    for (auto &entry : g_shutdown_queues) { visit(entry.queue); visit(entry.fence); }
+}
+
+static DWORD ShutdownFailure(DWORD error, const char *stage)
+{
+    Log("shutdown incomplete: stage=%s error=%lu active_callbacks_or_work=%u; retaining resources and module for retry",
+        stage, error, g_admission.Active());
+    return error;
+}
+static void RequestWorkerStop()
+{
+    if (g_neural_dispatch_stop_event) SetEvent(g_neural_dispatch_stop_event);
+    if (g_neural_dispatch_wake_event) SetEvent(g_neural_dispatch_wake_event);
+    if (g_proxy_present_stop_event) SetEvent(g_proxy_present_stop_event);
+    if (g_proxy_present_event) SetEvent(g_proxy_present_event);
+}
+static bool DrainShutdownQueues(const nr_shutdown::Deadline &deadline)
+{
+    if (g_rs_queue && g_vulkan_fence.handle && g_present_api == reshade::api::device_api::vulkan) {
+        const UINT64 value = ++g_legacy_fence_value;
+        if (!g_rs_queue->signal(g_vulkan_fence, value)) return false;
+        g_legacy_d3d12_done_value = value;
+    }
+    if (g_legacy_device11 && g_legacy_context11 && !g_shutdown_d3d11_query) {
+        const D3D11_QUERY_DESC query = {D3D11_QUERY_EVENT, 0};
+        if (FAILED(g_legacy_device11->CreateQuery(&query, &g_shutdown_d3d11_query))) return false;
+        g_legacy_context11->End(g_shutdown_d3d11_query.Get());
+        g_legacy_context11->Flush();
+    }
+    if (g_legacy_device9 && !g_shutdown_d3d9_query) {
+        if (FAILED(g_legacy_device9->CreateQuery(D3DQUERYTYPE_EVENT, &g_shutdown_d3d9_query)) ||
+            FAILED(g_shutdown_d3d9_query->Issue(D3DISSUE_END))) return false;
+    }
+    for (ID3D12CommandQueue *queue : {g_command_queue, g_async_compute_queue.Get(), g_async_fg_queue.Get()}) {
+        if (!queue) continue;
+        bool found = false;
+        for (const auto &entry : g_shutdown_queues) found |= entry.queue.Get() == queue;
+        if (found) continue;
+        Microsoft::WRL::ComPtr<ID3D12Device> device;
+        ShutdownQueue entry;
+        entry.queue = queue;
+        if (FAILED(queue->GetDevice(IID_PPV_ARGS(&device))) ||
+            FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&entry.fence))) ||
+            FAILED(queue->Signal(entry.fence.Get(), 1))) return false;
+        // Persist markers on timeout; do not release fences still owned by the GPU.
+        if (g_shutdown_queue_count == g_shutdown_queues.size()) return false;
+        g_shutdown_queues[g_shutdown_queue_count++] = std::move(entry);
+    }
+    for (;;) {
+        bool idle = true;
+        for (const auto &entry : g_shutdown_queues) {
+            if (!entry.queue) continue;
+            const UINT64 completed = entry.fence->GetCompletedValue();
+            if (completed == UINT64_MAX) return false; // Device removal is a failed drain, not successful work.
+            idle &= completed >= 1;
+        }
+        idle &= !g_capture_ready_fence12 ||
+            g_capture_ready_fence12->GetCompletedValue() >= g_capture_ready_fence_value;
+        idle &= !g_legacy_fence12 ||
+            g_legacy_fence12->GetCompletedValue() >= g_legacy_d3d12_done_value;
+        if (g_shutdown_d3d11_query) {
+            const HRESULT status = g_legacy_context11->GetData(g_shutdown_d3d11_query.Get(), nullptr, 0, 0);
+            if (FAILED(status)) return false;
+            idle &= status == S_OK;
+        }
+        if (g_shutdown_d3d9_query) {
+            const HRESULT status = g_shutdown_d3d9_query->GetData(nullptr, 0, D3DGETDATA_FLUSH);
+            if (FAILED(status)) return false;
+            idle &= status == S_OK;
+        }
+        idle &= g_nvof_motion.IsIdle();
+        if (idle) return true;
+        if (!deadline.Remaining()) return false;
+        Sleep(1);
+    }
+}
+static bool ReleaseShutdownFeatures()
+{
+    struct Feature { NVSDK_NGX_Handle **handle; NgxReleaseFeature release; };
+    for (auto feature : {Feature{&g_fg_feature, g_fg_via_core ? g_core_release : g_fg_release},
+            Feature{&g_sr_feature, g_sr_release}, Feature{&g_nr_third_feature, g_nr_release},
+            Feature{&g_nr_second_feature, g_nr_release}, Feature{&g_nr_feature, g_nr_release}}) {
+        if (!*feature.handle) continue;
+        DWORD exception = 0;
+        if (!feature.release || NVSDK_NGX_FAILED(SafeRelease(feature.release, *feature.handle, &exception)) || exception)
+            return false;
+        *feature.handle = nullptr;
+    }
+    return true;
+}
+static bool DisableShutdownHooks()
+{
+    // Disabled hooks may have in-flight callers using their trampolines. Keep
+    // this DLL and the trampolines until process exit rather than guessing a grace period.
+    g_callback_code_retained |= g_runtime_log_callback_registered || g_window_query_hooks_installed ||
+        g_windowed_subclassed_window != nullptr || g_vk_create_device_target != nullptr;
+    g_windowed_virtualization_active = false;
+    RestoreWindowedLogicalSizeSubclass(true);
+    for (void *target : {g_get_client_rect_target, g_screen_to_client_target, g_client_to_screen_target,
+            g_set_cursor_target, g_get_cursor_pos_target, g_set_cursor_pos_target,
+            g_clip_cursor_target, g_get_clip_cursor_target, g_set_window_pos_target,
+            g_move_window_target, g_vk_create_device_target}) {
+        if (!target) continue;
+        const MH_STATUS status = MH_DisableHook(target);
+        if (status != MH_OK && status != MH_ERROR_DISABLED) return false;
+    }
+    return true;
+}
+static void CloseShutdownHandle(HANDLE &handle)
+{
+    if (handle) CloseHandle(handle);
+    handle = nullptr;
+}
+static DWORD ShutdownResources(DWORD timeout_ms, unsigned owned_entries)
+{
+    if (!g_initialized || g_shutdown_complete) return ERROR_SUCCESS;
+    if (!TryAcquireSRWLockExclusive(&g_shutdown_lock)) return ERROR_BUSY;
+    struct Unlock { ~Unlock() { ReleaseSRWLockExclusive(&g_shutdown_lock); } } unlock;
+    if (g_shutdown_complete) return ERROR_SUCCESS;
+    const nr_shutdown::Deadline deadline(timeout_ms);
+    g_admission.Close();
+    RequestWorkerStop();
+    if (!nr_shutdown::WaitIdle(g_admission, deadline, owned_entries))
+        return ShutdownFailure(ERROR_TIMEOUT, "callback and queued work rundown");
+    // An entrant admitted before Close may have just created a worker/event.
+    RequestWorkerStop();
+    for (HANDLE thread : {g_neural_dispatch_thread, g_proxy_present_thread}) {
+        const DWORD result = nr_shutdown::Join(thread, deadline);
+        if (result != ERROR_SUCCESS) return ShutdownFailure(result, "render worker join");
+    }
+    if (g_proxy_window) PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
+    else if (g_proxy_window_thread) {
+        const DWORD id = GetThreadId(g_proxy_window_thread);
+        if (id) PostThreadMessageW(id, WM_QUIT, 0, 0);
+    }
+    const DWORD window_join = nr_shutdown::Join(g_proxy_window_thread, deadline);
+    if (window_join != ERROR_SUCCESS) return ShutdownFailure(window_join, "window worker join");
+    // A registered window class keeps a callback address even after its last
+    // window is gone. Remove that address before permitting module unload.
+    WNDCLASSEXW window_class = {sizeof(window_class)};
+    if (GetClassInfoExW(g_self, L"StandaloneDLSSNRNativeOutput", &window_class) &&
+        !UnregisterClassW(L"StandaloneDLSSNRNativeOutput", g_self))
+        return ShutdownFailure(GetLastError(), "output window class removal");
+    if (!DrainShutdownQueues(deadline))
+        return ShutdownFailure(ERROR_TIMEOUT, "GPU completion");
+    if (!DisableShutdownHooks())
+        return ShutdownFailure(ERROR_INVALID_STATE, "native callback disable");
+    if (!ReleaseShutdownFeatures())
+        return ShutdownFailure(ERROR_INVALID_STATE, "NGX feature release");
+    g_nvof_motion.Shutdown();
+    if (g_runtime) {
+        auto *device = g_runtime->get_device();
+        for (const auto &view : g_backbuffer_views)
+            if (view.rtv.handle) device->destroy_resource_view(view.rtv);
+    }
+    g_backbuffer_views.clear();
+    g_runtime = nullptr;
+    g_proxy_runtime = nullptr;
+    // All producers and GPU users have ended. Only this section closes handles
+    // or resets resources; every failure above leaves them available for retry.
+    CloseShutdownHandle(g_neural_dispatch_thread);
+    CloseShutdownHandle(g_proxy_present_thread);
+    CloseShutdownHandle(g_proxy_window_thread);
+    CloseShutdownHandle(g_neural_dispatch_completion_event);
+    CloseShutdownHandle(g_nvof_dispatch_completion_event);
+    CloseShutdownHandle(g_neural_dispatch_wake_event);
+    CloseShutdownHandle(g_neural_dispatch_stop_event);
+    CloseShutdownHandle(g_proxy_frame_latency_waitable);
+    UpdateProxyCursorClip(false);
+    if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
+    if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
+    if (g_proxy_pacing_timer) CloseHandle(g_proxy_pacing_timer);
+    if (g_adaptive_governor_timer) CloseHandle(g_adaptive_governor_timer);
+    if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
+    g_proxy_pacing_timer = nullptr;
+    g_adaptive_governor_timer = nullptr;
+    g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
+    for (UINT index = 0; index < kProxyCommandSlotCount; ++index)
     {
+        g_proxy_lists[index].Reset();
+        g_proxy_allocators[index].Reset();
+        g_proxy_command_fence_values[index] = 0;
+    }
+    g_proxy_telemetry_readback.Reset(); g_proxy_telemetry_query_heap.Reset();
+    g_proxy_fence.Reset();
+    if (g_composition_target && g_composition_device)
+    {
+        g_composition_target->SetRoot(nullptr);
+        g_composition_device->Commit();
+    }
+    g_composition_effect.Reset(); g_composition_visual.Reset();
+    g_composition_target.Reset(); g_composition_device.Reset();
+    g_same_window_compositor = false;
+    g_composition_target_window = nullptr;
+    g_composition_retarget_pending = nullptr;
+    g_proxy_swapchain.Reset();
+    UpdateProxyCursorClip(false);
+    if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
+    if (g_nr_output) g_nr_output->Release();
+    g_nr_output = nullptr;
+    g_screenshot_readback.Reset();
+    g_screenshot_pending = false;
+    g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
+    g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
+    ReleaseLegacyFrameResources();
+    if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)
+        g_vulkan.DestroySemaphore(g_vulkan.dev, g_vulkan_semaphore, nullptr);
+    g_vulkan_semaphore = VK_NULL_HANDLE;
+    if (g_vulkan.lib) FreeLibrary(g_vulkan.lib);
+    g_vulkan = {};
+    g_legacy_query9.Reset(); g_legacy_device9.Reset();
+    g_capture_ready_fence11.Reset(); g_capture_ready_fence12.Reset();
+    if (g_capture_ready_event) CloseHandle(g_capture_ready_event);
+    g_capture_ready_event = nullptr;
+    g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
+    g_legacy_context11.Reset(); g_legacy_device11.Reset();
+    g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
+    g_nr_second_stage.Reset(); g_nr_third_stage.Reset();
+    g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
+    g_packed_color.Reset();
+    g_downsample_pipeline.Reset(); g_downsample_root_signature.Reset();
+    g_downsample_srv_heap.Reset(); g_downsample_rtv_heap.Reset();
+    g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
+    g_guide_telemetry_query_heap.Reset();
+    for (PipelineFrameSlot &slot : g_pipeline_slots)
+    {
+        slot.generated_output.Reset();
+        slot.generated_output_2.Reset();
+        slot.generated_output_3.Reset();
+        slot.real_output.Reset();
+        slot.original_input.Reset();
+        slot.capture_input.Reset();
+        slot.legacy_input_rtv.Reset();
+        slot.list.Reset();
+        slot.allocator.Reset();
+        slot.capture_list.Reset();
+        slot.capture_allocator.Reset();
+        slot.telemetry_readback.Reset();
+        slot.telemetry_query_heap.Reset();
+        slot.telemetry_fence_value = 0;
+        slot.telemetry_pending = false;
+        slot.staged_nvof = {};
+        slot.staged_nvof_qpc = {};
+        slot.staged_nvof_reset = false;
+        slot.staged_capture_slot_index = -1;
+        slot.state.store(PipelineSlotFree, std::memory_order_release);
+    }
+    for (PresentationFrameSlot &slot : g_presentation_slots)
+    {
+        slot.generated_output.Reset();
+        slot.generated_output_2.Reset();
+        slot.generated_output_3.Reset();
+        slot.real_output.Reset();
+        slot.original_input.Reset();
+        slot.fg_telemetry_readback.Reset();
+        slot.fg_telemetry_query_heap.Reset();
+        slot.fg_list.Reset();
+        slot.fg_allocator.Reset();
+        slot.state.store(PresentationSlotFree, std::memory_order_release);
+    }
+    g_active_neural_list = nullptr;
+    g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
+    if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
+    if (g_async_input_fence_event) CloseHandle(g_async_input_fence_event);
+    g_async_input_fence_event = nullptr;
+    g_async_input_fence.Reset();
+    g_async_fg_fence.Reset();
+    g_async_fg_queue.Reset();
+    g_async_compute_queue.Reset();
+    g_async_compute_active = false;
+    if (g_command_queue) g_command_queue->Release();
+    g_command_queue = nullptr;
+    g_rs_queue = nullptr;
+    CloseSharedPerformanceTelemetry();
+
+    VisitResourceOwners([](auto &owner) { owner.Reset(); });
+    g_shutdown_queue_count = 0;
+    g_shutdown_complete = true;
+    ClearStartupRecoveryMarker("explicit shutdown completed");
+    Log("explicit shutdown complete: workers joined, GPU drained, resources released; external_callback_module_retained=%u",
+        g_callback_code_retained ? 1u : 0u);
+    return ERROR_SUCCESS;
+}
+extern "C" __declspec(dllexport) DWORD WINAPI NRShutdown(DWORD timeout_ms)
+{
+    // This is a resource shutdown, not a request to unload the caller's module.
+    return ShutdownResources(timeout_ms);
+}
+extern "C" __declspec(dllexport) bool AddonInit(HMODULE module, HMODULE reshade_module)
+{
+    if (g_initialized) return !g_admission.Closing();
+    g_self = module;
+    InitializeCriticalSection(&g_log_lock);
+    GetModuleFileNameW(module, g_addon_directory, MAX_PATH);
+    wchar_t *slash = wcsrchr(g_addon_directory, L'\\');
+    if (slash) slash[1] = L'\0';
+    wchar_t external_pid[32] = {};
+    if (GetEnvironmentVariableW(L"DLSS5_AIO_EXTERNAL_GAME_PID", external_pid,
+        static_cast<DWORD>(std::size(external_pid))) != 0)
+    {
+        const unsigned long parsed = wcstoul(external_pid, nullptr, 10);
+        g_external_game_process_id = static_cast<DWORD>(parsed);
+    }
+    if (g_external_game_process_id != 0)
+    {
+        wchar_t external_show_processed[8] = {};
+        if (GetEnvironmentVariableW(L"DLSS5_AIO_SHOW_PROCESSED", external_show_processed,
+            static_cast<DWORD>(std::size(external_show_processed))) != 0)
+            g_show_neural_output = _wtoi(external_show_processed) != 0;
+    }
+    char local[MAX_PATH] = {};
+    if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) != 0)
+    {
+        sprintf_s(g_log_path, "%s\\RHI\\Logs", local);
+        CreateDirectoryA(g_log_path, nullptr);
+        strcat_s(g_log_path, "\\standalone-dlssnr.log");
+    }
+    else strcpy_s(g_log_path, "standalone-dlssnr.log");
+    { FILE *file = nullptr; if (fopen_s(&file, g_log_path, "w") == 0 && file) fclose(file); }
+
+    g_startup_recovery_detected = BeginStartupRecoveryTracking(local);
+    // An unclean prior shutdown is useful diagnostic information, but must not
+    // silently change the present path. Serialized startup is an explicit F8
+    // recovery action only.
+    g_startup_recovery_forced = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+
+    if (!reshade::register_addon(module, reshade_module))
+    {
+        if (g_startup_recovery_path[0] != '\0') DeleteFileA(g_startup_recovery_path);
+        DeleteCriticalSection(&g_log_lock);
+        return false;
+    }
+    if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(module), &g_lifetime_module) ||
+        !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+            reinterpret_cast<LPCWSTR>(reshade_module), &g_lifetime_reshade)) {
+        reshade::unregister_addon(module);
+        if (g_lifetime_module) FreeLibrary(g_lifetime_module);
+        g_lifetime_module = nullptr;
+        DeleteCriticalSection(&g_log_lock);
+        return false;
+    }
+    constexpr const char *section = dlss5_aio_menu::kConfigSection;
+    char enabled[8] = "1"; size_t enabled_size = sizeof(enabled);
+    reshade::get_config_value(nullptr, section, "Enabled", enabled, &enabled_size);
+    g_enabled = strcmp(enabled, "0") != 0;
+    auto read_setting = [section](const char *key, const char *fallback, char *buffer, size_t capacity)
+    {
+        strcpy_s(buffer, capacity, fallback);
+        size_t size = capacity;
+        reshade::get_config_value(nullptr, section, key, buffer, &size);
+    };
+    char value[32];
+    // InputColorProfile is intentionally a new key. Older builds defaulted
+    // ColorProfile to HDR10 globally, so importing that value would retain
+    // the cross-game color bug instead of migrating installations to Auto.
+    read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
+    read_setting("SourceResolutionOverride", "0", value, sizeof(value));
+    g_source_resolution_choice = std::clamp(atoi(value), 0,
+        static_cast<int>(std::size(kSourceResolutionChoices)) - 1);
+    g_pending_color_profile = static_cast<int>(ColorProfile::Srgb);
+    g_color_profile_reconfigure_requested = false;
+    g_color_profile_redetect_requested = false;
+    g_color_profile_resources_retired = false;
+    read_setting("DlssRenderPreset", "12", value, sizeof(value));
+    switch (atoi(value))
+    {
+    case 10: g_dlss_render_preset = DlssRenderPreset::J; break;
+    case 11: g_dlss_render_preset = DlssRenderPreset::K; break;
+    case 12: g_dlss_render_preset = DlssRenderPreset::L; break;
+    case 13: g_dlss_render_preset = DlssRenderPreset::M; break;
+    default: g_dlss_render_preset = DlssRenderPreset::Default; break;
+    }
+    read_setting("Model", "1", value, sizeof(value)); g_nr_model = std::clamp(atoi(value), 1, 3);
+    read_setting("Intensity", "1.0", value, sizeof(value)); g_nr_intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+    read_setting("LocalTone", "1.0", value, sizeof(value)); g_nr_local_tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
+    read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+    read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
+    read_setting("NrRejectionMask", "0", value, sizeof(value)); g_nr_rejection_mask_enabled = strcmp(value, "0") != 0;
+    read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+    read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
+    read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
+    read_setting("NvidiaOpticalFlowMotion", "1", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
+    read_setting("NvidiaOpticalFlowResolution", "0", value, sizeof(value));
+    g_nvof_resolution_mode = static_cast<NvofResolutionMode>(
+        std::clamp(atoi(value), 0, 6));
+    read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
+    read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
+    read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
+    read_setting("NvidiaOpticalFlowMotionRepair", "1.0", value, sizeof(value)); g_nvof_motion_repair_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
+    read_setting("NvidiaOpticalFlowSubmitDepth", "0", value, sizeof(value)); g_nvof_submit_depth = strcmp(value, "0") != 0;
+    read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
+    read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
+    // Multi-pass NR is deliberately session-only. Never inherit a risky
+    // 2x/3x selection after a crash or normal restart.
+    g_nr_pass_count = 1;
+    if (g_external_game_process_id != 0)
+    {
+        wchar_t external_pass_count[8] = {};
+        if (GetEnvironmentVariableW(L"DLSS5_AIO_NR_PASSES", external_pass_count,
+            static_cast<DWORD>(std::size(external_pass_count))) != 0)
+            g_nr_pass_count = static_cast<unsigned int>(
+                std::clamp(_wtoi(external_pass_count), 1, 3));
+    }
+    g_nr_second_pass_failed = false;
+    g_nr_third_pass_failed = false;
+    read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
+    read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
+    read_setting("FgMultiplier", "2", value, sizeof(value));
+    g_fg_mfg_count.store(static_cast<unsigned int>(std::clamp(atoi(value), 2, 4) - 1));
+    read_setting("DebugLog", "0", value, sizeof(value)); g_debug_log = strcmp(value, "0") != 0;
+    {
+        char titles[192] = {};
+        read_setting("TuningWindowTitles", "WOW-335-NR|DLSS5", titles, sizeof(titles));
+        wchar_t wide_titles[192] = {};
+        if (MultiByteToWideChar(CP_UTF8, 0, titles, -1, wide_titles,
+                static_cast<int>(std::size(wide_titles))) > 0)
+            g_tuning_window_titles = wide_titles;
+    }
+    // zh: 启动转储放在全部 read_setting 之后（20261109 审查修复：原先在
+    // DebugLog/FrameGeneration/AsyncComputePipeline 读取之前，永远不触发）。
+    DebugLog("startup settings: profile=%d source_res=%d preset=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f "
+             "rejection_mask=%d flow=%d flow_res=%d flow_depth=%d vort=%d nr=%s fg=%s passes=%u async=%d",
+        static_cast<int>(g_color_profile), g_source_resolution_choice,
+        static_cast<int>(g_dlss_render_preset), g_nr_model, g_nr_intensity, g_nr_local_tone,
+        g_nr_local_structure, g_nr_skin_structure,
+        g_nr_rejection_mask_enabled ? 1 : 0, g_nvof_motion_enabled ? 1 : 0,
+        static_cast<int>(g_nvof_resolution_mode), g_nvof_depth_enabled ? 1 : 0,
+        g_vort_guides_enabled ? 1 : 0,
+        g_nr_enabled ? "on" : "off", g_framegen_enabled.load(std::memory_order_relaxed) ? "on" : "off",
+        g_nr_pass_count, g_async_compute_requested ? 1 : 0);
+    read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
+    read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
+    read_setting("AdaptivePressureGovernor", "1", value, sizeof(value)); g_adaptive_governor_enabled = strcmp(value, "0") != 0;
+    read_setting("SuppressQueuePressureWarning", "0", value, sizeof(value)); g_suppress_queue_pressure_warning = strcmp(value, "0") != 0;
+    read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
+    read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
+    read_setting("AutoWindowedVirtualization", "1", value, sizeof(value)); g_auto_windowed_virtualization = strcmp(value, "0") != 0;
+    read_setting("WindowedVirtualization", "0", value, sizeof(value)); g_windowed_virtualization_enabled = strcmp(value, "0") != 0;
+    read_setting("WindowedLogicalSizeMessages", "0", value, sizeof(value)); g_windowed_logical_size_messages = strcmp(value, "0") != 0;
+    read_setting("WindowedInputScaling", "0", value, sizeof(value)); g_windowed_input_scaling = strcmp(value, "0") != 0;
+    read_setting("DpiPhysicalOutputCorrection", "0", value, sizeof(value)); g_dpi_physical_output_correction = strcmp(value, "0") != 0;
+    if (g_windowed_input_scaling && !g_windowed_virtualization_enabled)
+    {
+        g_windowed_virtualization_enabled = true;
+        reshade::set_config_value(nullptr, section, "WindowedVirtualization", "1");
+    }
+    read_setting("DetachedPresentation", "0", value, sizeof(value)); g_detached_presentation = strcmp(value, "0") != 0;
+    read_setting("HideDetachedSystemCursor", "0", value, sizeof(value)); g_hide_detached_system_cursor = strcmp(value, "0") != 0;
+    read_setting("OpaqueComposition", "0", value, sizeof(value)); g_opaque_composition = strcmp(value, "0") != 0;
+    read_setting("SynchronousProxyPresentation", "0", value, sizeof(value)); g_synchronous_proxy_presentation = strcmp(value, "0") != 0;
+    if (g_startup_recovery_forced)
+    {
+        g_synchronous_proxy_presentation = true;
+        reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
+    }
+    g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
+    Log("Standalone DLSS-NR + SR %s attached; requested profile=%s source_override=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s dpi_physical_output=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
+        ADDON_VERSION, ProfileName(g_color_profile), RequestedSourceResolution().label,
+        DlssRenderPresetName(g_dlss_render_preset),
+        g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
+        g_nr_pass_count,
+        g_async_compute_requested ? "requested" : "disabled",
+        g_adaptive_governor_enabled ? "enabled" : "disabled",
+        g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
+        g_vort_guides_enabled ? "enabled" : "disabled",
+        g_early_proxy_initialization ? "enabled" : "disabled",
+        g_auto_windowed_virtualization ? "enabled" : "disabled",
+        g_windowed_virtualization_enabled ? "enabled" : "disabled",
+        g_windowed_logical_size_messages ? "enabled" : "disabled",
+        g_windowed_input_scaling ? "scaled-to-render" : "native-client",
+        g_dpi_physical_output_correction ? "enabled" : "disabled",
+        g_detached_presentation ? "enabled" : "disabled",
+        g_hide_detached_system_cursor ? "hidden-during-gameplay" : "visible",
+        g_opaque_composition ? "enabled" : "disabled",
+        g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
+        g_performance_telemetry_enabled ? "enabled" : "disabled");
+    Log("NVIDIA Optical Flow prototype: requested=%s resolution=%s consistency=%.1fpx cost=%.2f (default on)",
+        g_nvof_motion_enabled ? "enabled" : "disabled",
+        NvofResolutionModeName(g_nvof_resolution_mode),
+        g_nvof_consistency_threshold, g_nvof_cost_threshold);
+    if (g_startup_recovery_detected)
+        Log("previous game session did not shut down cleanly; preserving configured presentation mode (automatic serialized recovery disabled): state=%s",
+            g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
+    if (g_startup_recovery_forced)
+        Log("serialized safe startup forced before first Present: reason=F8 held during launch state=%s",
+            g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
+    reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
+    reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
+    reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+    reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+    reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+    reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+    reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+    reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+    reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+    reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+    reshade::register_event<reshade::addon_event::present>(OnPresent);
+    reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
+    reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+    reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
+    reshade::register_overlay(nullptr, DrawOverlay);
+    g_initialized = true;
+    return true;
+
+}
+extern "C" __declspec(dllexport) void AddonUninit(HMODULE module, HMODULE)
+{
+    if (!g_initialized || g_unregistered) return;
+    const nr_shutdown::Deadline deadline(5000);
+    if (ShutdownResources(deadline.Remaining()) != ERROR_SUCCESS) return;
+    // A destroy-device callback may have completed resource teardown while its
+    // admission lease is still returning to ReShade. Do not unload its code.
+    if (!nr_shutdown::WaitIdle(g_admission, deadline)) return;
+    if (!TryAcquireSRWLockExclusive(&g_shutdown_lock)) return;
+    struct UnlockUninit { ~UnlockUninit() { ReleaseSRWLockExclusive(&g_shutdown_lock); } } unlock_uninit;
+    if (g_unregistered) return;
+    reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
+    reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
+    reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
+    reshade::unregister_overlay(nullptr, DrawOverlay);
+    reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
+    reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
+    reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
+    reshade::unregister_event<reshade::addon_event::present>(OnPresent);
+    reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
+    reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
+    reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
+    reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
+    reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
+    reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
+    reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
+
+    reshade::unregister_addon(module);
+    g_unregistered = true;
+    if (g_callback_code_retained) {
+        Log("retaining external callback code and hook trampolines until process exit");
+        return;
+    }
+    // ReShade owns a load reference until this callback returns; explicit callers
+    // must likewise hold their own reference while calling AddonUninit.
+    if (g_log_file) { fclose(g_log_file); g_log_file = nullptr; }
+    DeleteCriticalSection(&g_log_lock);
+    HMODULE addon = g_lifetime_module, reshade = g_lifetime_reshade;
+    g_lifetime_module = g_lifetime_reshade = nullptr;
+    if (reshade) FreeLibrary(reshade);
+    if (addon) FreeLibrary(addon);
+}
+// Called only for process termination, after Windows has stopped other threads.
+// Detach performs no COM Release, GPU wait, hook removal, or driver call. This
+// also prevents the CRT's later global destructors from doing that work under
+// the loader lock after a timed-out shutdown. Kernel process cleanup owns it.
+static void AbandonForProcessExit() noexcept
+{
+    g_nvof_motion.AbandonForProcessExit();
+    g_command_queue = nullptr;
+    g_nr_output = nullptr;
+    VisitResourceOwners([](auto &owner) noexcept { owner.Detach(); });
+}
+BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
+{
+    if (reason == DLL_PROCESS_ATTACH) {
         g_self = module;
         DisableThreadLibraryCalls(module);
-        InitializeCriticalSection(&g_log_lock);
-        GetModuleFileNameW(module, g_addon_directory, MAX_PATH);
-        wchar_t *slash = wcsrchr(g_addon_directory, L'\\');
-        if (slash) slash[1] = L'\0';
-        wchar_t external_pid[32] = {};
-        if (GetEnvironmentVariableW(L"DLSS5_AIO_EXTERNAL_GAME_PID", external_pid,
-            static_cast<DWORD>(std::size(external_pid))) != 0)
-        {
-            const unsigned long parsed = wcstoul(external_pid, nullptr, 10);
-            g_external_game_process_id = static_cast<DWORD>(parsed);
-        }
-        if (g_external_game_process_id != 0)
-        {
-            wchar_t external_show_processed[8] = {};
-            if (GetEnvironmentVariableW(L"DLSS5_AIO_SHOW_PROCESSED", external_show_processed,
-                static_cast<DWORD>(std::size(external_show_processed))) != 0)
-                g_show_neural_output = _wtoi(external_show_processed) != 0;
-        }
-        char local[MAX_PATH] = {};
-        if (GetEnvironmentVariableA("LOCALAPPDATA", local, MAX_PATH) != 0)
-        {
-            sprintf_s(g_log_path, "%s\\RHI\\Logs", local);
-            CreateDirectoryA(g_log_path, nullptr);
-            strcat_s(g_log_path, "\\standalone-dlssnr.log");
-        }
-        else strcpy_s(g_log_path, "standalone-dlssnr.log");
-        { FILE *file = nullptr; if (fopen_s(&file, g_log_path, "w") == 0 && file) fclose(file); }
-
-        g_startup_recovery_detected = BeginStartupRecoveryTracking(local);
-        // An unclean prior shutdown is useful diagnostic information, but must not
-        // silently change the present path. Serialized startup is an explicit F8
-        // recovery action only.
-        g_startup_recovery_forced = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
-
-        if (!reshade::register_addon(module))
-        {
-            if (g_startup_recovery_path[0] != '\0') DeleteFileA(g_startup_recovery_path);
-            return FALSE;
-        }
-        constexpr const char *section = dlss5_aio_menu::kConfigSection;
-        char enabled[8] = "1"; size_t enabled_size = sizeof(enabled);
-        reshade::get_config_value(nullptr, section, "Enabled", enabled, &enabled_size);
-        g_enabled = strcmp(enabled, "0") != 0;
-        auto read_setting = [section](const char *key, const char *fallback, char *buffer, size_t capacity)
-        {
-            strcpy_s(buffer, capacity, fallback);
-            size_t size = capacity;
-            reshade::get_config_value(nullptr, section, key, buffer, &size);
-        };
-        char value[32];
-        // InputColorProfile is intentionally a new key. Older builds defaulted
-        // ColorProfile to HDR10 globally, so importing that value would retain
-        // the cross-game color bug instead of migrating installations to Auto.
-        read_setting("InputColorProfile", "0", value, sizeof(value)); g_color_profile = static_cast<ColorProfile>(std::clamp(atoi(value), 0, 4));
-        read_setting("SourceResolutionOverride", "0", value, sizeof(value));
-        g_source_resolution_choice = std::clamp(atoi(value), 0,
-            static_cast<int>(std::size(kSourceResolutionChoices)) - 1);
-        g_pending_color_profile = static_cast<int>(ColorProfile::Srgb);
-        g_color_profile_reconfigure_requested = false;
-        g_color_profile_redetect_requested = false;
-        g_color_profile_resources_retired = false;
-        read_setting("DlssRenderPreset", "12", value, sizeof(value));
-        switch (atoi(value))
-        {
-        case 10: g_dlss_render_preset = DlssRenderPreset::J; break;
-        case 11: g_dlss_render_preset = DlssRenderPreset::K; break;
-        case 12: g_dlss_render_preset = DlssRenderPreset::L; break;
-        case 13: g_dlss_render_preset = DlssRenderPreset::M; break;
-        default: g_dlss_render_preset = DlssRenderPreset::Default; break;
-        }
-        read_setting("Model", "1", value, sizeof(value)); g_nr_model = std::clamp(atoi(value), 1, 3);
-        read_setting("Intensity", "1.0", value, sizeof(value)); g_nr_intensity = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
-        read_setting("LocalTone", "1.0", value, sizeof(value)); g_nr_local_tone = std::clamp(static_cast<float>(atof(value)), 0.0f, 2.0f);
-        read_setting("LocalStructure", "1.0", value, sizeof(value)); g_nr_local_structure = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
-        read_setting("SkinStructure", "-1.0", value, sizeof(value)); g_nr_skin_structure = std::clamp(static_cast<float>(atof(value)), -1.0f, 1.0f);
-        read_setting("NrRejectionMask", "0", value, sizeof(value)); g_nr_rejection_mask_enabled = strcmp(value, "0") != 0;
-        read_setting("NrRejectionStrength", "1.0", value, sizeof(value)); g_nr_rejection_mask_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
-        read_setting("ResetEveryFrame", "0", value, sizeof(value)); g_reset_every_frame = strcmp(value, "0") != 0;
-        read_setting("StableSrHistory", "0", value, sizeof(value)); g_stable_sr_history = strcmp(value, "0") != 0;
-        read_setting("NvidiaOpticalFlowMotion", "1", value, sizeof(value)); g_nvof_motion_enabled = strcmp(value, "0") != 0;
-        read_setting("NvidiaOpticalFlowResolution", "0", value, sizeof(value));
-        g_nvof_resolution_mode = static_cast<NvofResolutionMode>(
-            std::clamp(atoi(value), 0, 6));
-        read_setting("NvidiaOpticalFlowDepth", "0", value, sizeof(value)); g_nvof_depth_enabled = strcmp(value, "0") != 0;
-        read_setting("NvidiaOpticalFlowConsistency", "3.0", value, sizeof(value)); g_nvof_consistency_threshold = std::clamp(static_cast<float>(atof(value)), 0.5f, 12.0f);
-        read_setting("NvidiaOpticalFlowCost", "0.35", value, sizeof(value)); g_nvof_cost_threshold = std::clamp(static_cast<float>(atof(value)), 0.0f, 0.99f);
-        read_setting("NvidiaOpticalFlowMotionRepair", "1.0", value, sizeof(value)); g_nvof_motion_repair_strength = std::clamp(static_cast<float>(atof(value)), 0.0f, 1.0f);
-        read_setting("NvidiaOpticalFlowSubmitDepth", "0", value, sizeof(value)); g_nvof_submit_depth = strcmp(value, "0") != 0;
-        read_setting("VortGuides", "0", value, sizeof(value)); g_vort_guides_enabled = strcmp(value, "0") != 0;
-        read_setting("NeuralRendering", "1", value, sizeof(value)); g_nr_enabled = strcmp(value, "0") != 0;
-        // Multi-pass NR is deliberately session-only. Never inherit a risky
-        // 2x/3x selection after a crash or normal restart.
-        g_nr_pass_count = 1;
-        if (g_external_game_process_id != 0)
-        {
-            wchar_t external_pass_count[8] = {};
-            if (GetEnvironmentVariableW(L"DLSS5_AIO_NR_PASSES", external_pass_count,
-                static_cast<DWORD>(std::size(external_pass_count))) != 0)
-                g_nr_pass_count = static_cast<unsigned int>(
-                    std::clamp(_wtoi(external_pass_count), 1, 3));
-        }
-        g_nr_second_pass_failed = false;
-        g_nr_third_pass_failed = false;
-        read_setting("AsyncComputePipeline", "1", value, sizeof(value)); g_async_compute_requested = strcmp(value, "0") != 0;
-        read_setting("FrameGeneration", "1", value, sizeof(value)); g_framegen_enabled = strcmp(value, "0") != 0;
-        read_setting("DebugLog", "0", value, sizeof(value)); g_debug_log = strcmp(value, "0") != 0;
-        {
-            char titles[192] = {};
-            read_setting("TuningWindowTitles", "WOW-335-NR|DLSS5", titles, sizeof(titles));
-            wchar_t wide_titles[192] = {};
-            if (MultiByteToWideChar(CP_UTF8, 0, titles, -1, wide_titles,
-                    static_cast<int>(std::size(wide_titles))) > 0)
-                g_tuning_window_titles = wide_titles;
-        }
-        // zh: 启动转储放在全部 read_setting 之后（20261109 审查修复：原先在
-        // DebugLog/FrameGeneration/AsyncComputePipeline 读取之前，永远不触发）。
-        DebugLog("startup settings: profile=%d source_res=%d preset=%d model=%d intensity=%.2f tone=%.2f structure=%.2f skin=%.2f "
-                 "rejection_mask=%d flow=%d flow_res=%d flow_depth=%d vort=%d nr=%s fg=%s passes=%u async=%d",
-            static_cast<int>(g_color_profile), g_source_resolution_choice,
-            static_cast<int>(g_dlss_render_preset), g_nr_model, g_nr_intensity, g_nr_local_tone,
-            g_nr_local_structure, g_nr_skin_structure,
-            g_nr_rejection_mask_enabled ? 1 : 0, g_nvof_motion_enabled ? 1 : 0,
-            static_cast<int>(g_nvof_resolution_mode), g_nvof_depth_enabled ? 1 : 0,
-            g_vort_guides_enabled ? 1 : 0,
-            g_nr_enabled ? "on" : "off", g_framegen_enabled.load(std::memory_order_relaxed) ? "on" : "off",
-            g_nr_pass_count, g_async_compute_requested ? 1 : 0);
-        read_setting("CompositeReshade", "1", value, sizeof(value)); g_composite_reshade_output = strcmp(value, "0") != 0;
-        read_setting("ShowProxyFps", "1", value, sizeof(value)); g_show_proxy_fps = strcmp(value, "0") != 0;
-        read_setting("AdaptivePressureGovernor", "1", value, sizeof(value)); g_adaptive_governor_enabled = strcmp(value, "0") != 0;
-        read_setting("SuppressQueuePressureWarning", "0", value, sizeof(value)); g_suppress_queue_pressure_warning = strcmp(value, "0") != 0;
-        read_setting("PerformanceTelemetry", "1", value, sizeof(value)); g_performance_telemetry_enabled = strcmp(value, "0") != 0;
-        read_setting("EarlyProxyInitialization", "0", value, sizeof(value)); g_early_proxy_initialization = strcmp(value, "0") != 0;
-        read_setting("AutoWindowedVirtualization", "1", value, sizeof(value)); g_auto_windowed_virtualization = strcmp(value, "0") != 0;
-        read_setting("WindowedVirtualization", "0", value, sizeof(value)); g_windowed_virtualization_enabled = strcmp(value, "0") != 0;
-        read_setting("WindowedLogicalSizeMessages", "0", value, sizeof(value)); g_windowed_logical_size_messages = strcmp(value, "0") != 0;
-        read_setting("WindowedInputScaling", "0", value, sizeof(value)); g_windowed_input_scaling = strcmp(value, "0") != 0;
-        read_setting("DpiPhysicalOutputCorrection", "0", value, sizeof(value)); g_dpi_physical_output_correction = strcmp(value, "0") != 0;
-        if (g_windowed_input_scaling && !g_windowed_virtualization_enabled)
-        {
-            g_windowed_virtualization_enabled = true;
-            reshade::set_config_value(nullptr, section, "WindowedVirtualization", "1");
-        }
-        read_setting("DetachedPresentation", "0", value, sizeof(value)); g_detached_presentation = strcmp(value, "0") != 0;
-        read_setting("HideDetachedSystemCursor", "0", value, sizeof(value)); g_hide_detached_system_cursor = strcmp(value, "0") != 0;
-        read_setting("OpaqueComposition", "0", value, sizeof(value)); g_opaque_composition = strcmp(value, "0") != 0;
-        read_setting("SynchronousProxyPresentation", "0", value, sizeof(value)); g_synchronous_proxy_presentation = strcmp(value, "0") != 0;
-        if (g_startup_recovery_forced)
-        {
-            g_synchronous_proxy_presentation = true;
-            reshade::set_config_value(nullptr, section, "SynchronousProxyPresentation", "1");
-        }
-        g_requested_synchronous_proxy_presentation = g_synchronous_proxy_presentation;
-        Log("Standalone DLSS-NR + SR %s attached; requested profile=%s source_override=%s DLSS_render_preset=%s model=%d style=%u NR=%s NR_passes=%u async_compute=%s adaptive_governor=%s NR-mask=%s strength=%.2f VORT=%s early_proxy=%s auto_presentation=%s windowed_virtualization=%s logical_client=%s input_coordinates=%s dpi_physical_output=%s detached_output=%s detached_cursor=%s opaque_composition=%s presenter=%s telemetry=%s",
-            ADDON_VERSION, ProfileName(g_color_profile), RequestedSourceResolution().label,
-            DlssRenderPresetName(g_dlss_render_preset),
-            g_nr_model, NrStyle(), g_nr_enabled ? "enabled" : "disabled",
-            g_nr_pass_count,
-            g_async_compute_requested ? "requested" : "disabled",
-            g_adaptive_governor_enabled ? "enabled" : "disabled",
-            g_nr_rejection_mask_enabled ? "enabled" : "disabled", g_nr_rejection_mask_strength,
-            g_vort_guides_enabled ? "enabled" : "disabled",
-            g_early_proxy_initialization ? "enabled" : "disabled",
-            g_auto_windowed_virtualization ? "enabled" : "disabled",
-            g_windowed_virtualization_enabled ? "enabled" : "disabled",
-            g_windowed_logical_size_messages ? "enabled" : "disabled",
-            g_windowed_input_scaling ? "scaled-to-render" : "native-client",
-            g_dpi_physical_output_correction ? "enabled" : "disabled",
-            g_detached_presentation ? "enabled" : "disabled",
-            g_hide_detached_system_cursor ? "hidden-during-gameplay" : "visible",
-            g_opaque_composition ? "enabled" : "disabled",
-            g_synchronous_proxy_presentation ? "serialized" : "asynchronous",
-            g_performance_telemetry_enabled ? "enabled" : "disabled");
-        Log("NVIDIA Optical Flow prototype: requested=%s resolution=%s consistency=%.1fpx cost=%.2f (default on)",
-            g_nvof_motion_enabled ? "enabled" : "disabled",
-            NvofResolutionModeName(g_nvof_resolution_mode),
-            g_nvof_consistency_threshold, g_nvof_cost_threshold);
-        if (g_startup_recovery_detected)
-            Log("previous game session did not shut down cleanly; preserving configured presentation mode (automatic serialized recovery disabled): state=%s",
-                g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
-        if (g_startup_recovery_forced)
-            Log("serialized safe startup forced before first Present: reason=F8 held during launch state=%s",
-                g_startup_recovery_path[0] != '\0' ? g_startup_recovery_path : "marker unavailable");
-        reshade::register_event<reshade::addon_event::create_device>(OnCreateDevice);
-        reshade::register_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
-        reshade::register_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
-        reshade::register_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
-        reshade::register_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
-        reshade::register_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
-        reshade::register_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
-        reshade::register_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-        reshade::register_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
-        reshade::register_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-        reshade::register_event<reshade::addon_event::present>(OnPresent);
-        reshade::register_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
-        reshade::register_event<reshade::addon_event::reshade_present>(OnReshadePresent);
-        reshade::register_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
-        reshade::register_overlay(nullptr, DrawOverlay);
-    }
-    else if (reason == DLL_PROCESS_DETACH)
-    {
-        ClearStartupRecoveryMarker("clean process shutdown");
-        g_windowed_virtualization_active = false;
-        RestoreWindowedLogicalSizeSubclass();
-        reshade::unregister_event<reshade::addon_event::create_device>(OnCreateDevice);
-        reshade::unregister_event<reshade::addon_event::create_swapchain>(OnCreateSwapchain);
-        reshade::unregister_event<reshade::addon_event::set_fullscreen_state>(OnSetFullscreenState);
-        reshade::unregister_overlay(nullptr, DrawOverlay);
-        reshade::unregister_event<reshade::addon_event::reshade_open_overlay>(OnReshadeOpenOverlay);
-        reshade::unregister_event<reshade::addon_event::reshade_present>(OnReshadePresent);
-        reshade::unregister_event<reshade::addon_event::reshade_finish_effects>(OnReshadeFinishEffects);
-        reshade::unregister_event<reshade::addon_event::present>(OnPresent);
-        reshade::unregister_event<reshade::addon_event::destroy_device>(OnDestroyDevice);
-        reshade::unregister_event<reshade::addon_event::reshade_render_technique>(OnRenderTechnique);
-        reshade::unregister_event<reshade::addon_event::reshade_reloaded_effects>(OnReloadedEffects);
-        reshade::unregister_event<reshade::addon_event::destroy_effect_runtime>(OnDestroyEffectRuntime);
-        reshade::unregister_event<reshade::addon_event::init_effect_runtime>(OnInitEffectRuntime);
-        reshade::unregister_event<reshade::addon_event::init_swapchain>(OnInitSwapchain);
-        reshade::unregister_event<reshade::addon_event::init_command_queue>(OnInitCommandQueue);
-        StopNeuralDispatchThread();
-        if (g_proxy_present_stop_event) SetEvent(g_proxy_present_stop_event);
-        if (g_proxy_present_event) SetEvent(g_proxy_present_event);
-        if (g_proxy_present_thread)
-        {
-            WaitForSingleObject(g_proxy_present_thread, 2000);
-            CloseHandle(g_proxy_present_thread);
-        }
-        if (g_proxy_present_event) CloseHandle(g_proxy_present_event);
-        if (g_proxy_present_stop_event) CloseHandle(g_proxy_present_stop_event);
-        if (g_proxy_pacing_timer) CloseHandle(g_proxy_pacing_timer);
-        if (g_adaptive_governor_timer) CloseHandle(g_adaptive_governor_timer);
-        if (g_proxy_fence_event) CloseHandle(g_proxy_fence_event);
-        g_proxy_pacing_timer = nullptr;
-        g_adaptive_governor_timer = nullptr;
-        g_proxy_pipeline.Reset(); g_proxy_root_signature.Reset(); g_proxy_srv_heap.Reset(); g_proxy_rtv_heap.Reset();
-        for (UINT index = 0; index < kProxyCommandSlotCount; ++index)
-        {
-            g_proxy_lists[index].Reset();
-            g_proxy_allocators[index].Reset();
-            g_proxy_command_fence_values[index] = 0;
-        }
-        g_proxy_telemetry_readback.Reset(); g_proxy_telemetry_query_heap.Reset();
-        g_proxy_fence.Reset();
-        if (g_composition_target && g_composition_device)
-        {
-            g_composition_target->SetRoot(nullptr);
-            g_composition_device->Commit();
-        }
-        g_composition_effect.Reset(); g_composition_visual.Reset();
-        g_composition_target.Reset(); g_composition_device.Reset();
-        g_same_window_compositor = false;
-        g_composition_target_window = nullptr;
-        g_composition_retarget_pending = nullptr;
-        g_proxy_swapchain.Reset();
-        UpdateProxyCursorClip(false);
-        if (g_proxy_window) PostMessageW(g_proxy_window, WM_CLOSE, 0, 0);
-        if (g_proxy_window_thread)
-        {
-            // Detached mode executes ProxyWindowProc inside this DLL. Do not
-            // let the module unload while that thread can still dispatch it.
-            WaitForSingleObject(g_proxy_window_thread, 2000);
-            CloseHandle(g_proxy_window_thread);
-        }
-        if (g_proxy_window_ready) CloseHandle(g_proxy_window_ready);
-        if (g_nr_output) g_nr_output->Release();
-        g_captured_depth.Reset(); g_captured_motion.Reset(); g_captured_mask.Reset(); g_captured_nr_mask.Reset();
-        g_fallback_depth.Reset(); g_fallback_motion.Reset(); g_guide_rtv_heap.Reset();
-        ReleaseLegacyFrameResources();
-        if (g_vulkan.ok && g_vulkan_semaphore != VK_NULL_HANDLE)
-            g_vulkan.DestroySemaphore(g_vulkan.dev, g_vulkan_semaphore, nullptr);
-        g_vulkan_semaphore = VK_NULL_HANDLE;
-        if (g_vulkan.lib) FreeLibrary(g_vulkan.lib);
-        g_vulkan = {};
-        FeedVkHookRemove();
-        g_legacy_query9.Reset(); g_legacy_device9.Reset();
-        g_capture_ready_fence11.Reset(); g_capture_ready_fence12.Reset();
-        if (g_capture_ready_event) CloseHandle(g_capture_ready_event);
-        g_capture_ready_event = nullptr;
-        g_legacy_fence11.Reset(); g_legacy_fence12.Reset(); g_legacy_context4.Reset();
-        g_legacy_context11.Reset(); g_legacy_device11.Reset();
-        g_fg_stage.Reset(); g_sr_stage.Reset(); g_nr_stage.Reset();
-        g_nr_second_stage.Reset(); g_nr_third_stage.Reset();
-        g_post_reshade_color.Reset(); g_post_reshade_color_ready = false;
-        g_packed_color.Reset();
-        g_downsample_pipeline.Reset(); g_downsample_root_signature.Reset();
-        g_downsample_srv_heap.Reset(); g_downsample_rtv_heap.Reset();
-        g_guide_telemetry_fence.Reset(); g_guide_telemetry_readback.Reset();
-        g_guide_telemetry_query_heap.Reset();
-        for (PipelineFrameSlot &slot : g_pipeline_slots)
-        {
-            slot.generated_output.Reset();
-        slot.generated_output_2.Reset();
-        slot.generated_output_3.Reset();
-            slot.real_output.Reset();
-            slot.original_input.Reset();
-            slot.capture_input.Reset();
-            slot.legacy_input_rtv.Reset();
-            slot.list.Reset();
-            slot.allocator.Reset();
-            slot.capture_list.Reset();
-            slot.capture_allocator.Reset();
-            slot.telemetry_readback.Reset();
-            slot.telemetry_query_heap.Reset();
-            slot.telemetry_fence_value = 0;
-            slot.telemetry_pending = false;
-            slot.staged_nvof = {};
-            slot.staged_nvof_qpc = {};
-            slot.staged_nvof_reset = false;
-            slot.staged_capture_slot_index = -1;
-            slot.state.store(PipelineSlotFree, std::memory_order_release);
-        }
-        for (PresentationFrameSlot &slot : g_presentation_slots)
-        {
-            slot.generated_output.Reset();
-        slot.generated_output_2.Reset();
-        slot.generated_output_3.Reset();
-            slot.real_output.Reset();
-            slot.original_input.Reset();
-            slot.fg_telemetry_readback.Reset();
-            slot.fg_telemetry_query_heap.Reset();
-            slot.fg_list.Reset();
-            slot.fg_allocator.Reset();
-            slot.state.store(PresentationSlotFree, std::memory_order_release);
-        }
-        g_active_neural_list = nullptr;
-        g_neural_list.Reset(); g_neural_allocator.Reset(); g_neural_fence.Reset(); g_neural_device.Reset();
-        if (g_neural_fence_event) CloseHandle(g_neural_fence_event);
-        if (g_async_input_fence_event) CloseHandle(g_async_input_fence_event);
-        g_async_input_fence_event = nullptr;
-        g_async_input_fence.Reset();
-        g_async_fg_fence.Reset();
-        g_async_fg_queue.Reset();
-        g_async_compute_queue.Reset();
-        g_async_compute_active = false;
-        if (g_command_queue) g_command_queue->Release();
-        CloseSharedPerformanceTelemetry();
-        reshade::unregister_addon(module);
-        DeleteCriticalSection(&g_log_lock);
+    } else if (reason == DLL_PROCESS_DETACH && reserved != nullptr) {
+        // Other process threads are already gone. Do not wait, take logging
+        // locks, call COM/driver cleanup, or remove hooks under the loader lock.
+        if (g_startup_recovery_path[0] != '\0' && g_shutdown_complete)
+            DeleteFileA(g_startup_recovery_path);
+        AbandonForProcessExit();
     }
     return TRUE;
 }

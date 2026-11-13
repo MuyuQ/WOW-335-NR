@@ -1292,6 +1292,21 @@ static int Serve(DWORD game_pid)
 
 // ---------------------------------------------------------------------------
 
+static DWORD ShutdownLoadedAddon(DWORD timeout_ms)
+{
+    HMODULE addon = nullptr;
+    // Hold a caller-owned reference across the exported call and AddonUninit.
+    if (!GetModuleHandleExW(0, L"standalone-dlssnr.addon64", &addon)) return ERROR_SUCCESS;
+    const auto shutdown = reinterpret_cast<DWORD (WINAPI *)(DWORD)>(GetProcAddress(addon, "NRShutdown"));
+    const auto uninit = reinterpret_cast<void (*)(HMODULE, HMODULE)>(GetProcAddress(addon, "AddonUninit"));
+    const DWORD result = shutdown ? shutdown(timeout_ms) : ERROR_PROC_NOT_FOUND;
+    if (result == ERROR_SUCCESS && uninit) uninit(addon, nullptr);
+    Log("[host] explicit addon shutdown: status=%lu%s", result,
+        result == ERROR_SUCCESS ? "" : " (module and pending resources retained until retry or process exit)");
+    FreeLibrary(addon);
+    return result;
+}
+
 int main(int argc, char **argv)
 {
     {
@@ -1341,11 +1356,17 @@ int main(int argc, char **argv)
         static_cast<unsigned long>(pid));
     SetEnvironmentVariableW(L"DLSS5_AIO_EXTERNAL_GAME_PID", external_pid);
 
-    if (!InitDisguise()) return 1;
+    if (!InitDisguise()) {
+        ShutdownLoadedAddon(5000);
+        return 1;
+    }
     if (test)
     {
         Log("[carrier] --test is not supported by this prototype; launch through addon32");
+        ShutdownLoadedAddon(5000);
         return 2;
     }
-    return Serve(pid);
+    const int result = Serve(pid);
+    const DWORD shutdown_result = ShutdownLoadedAddon(5000);
+    return result != 0 ? result : (shutdown_result == ERROR_SUCCESS ? 0 : 3);
 }
