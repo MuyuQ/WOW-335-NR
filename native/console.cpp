@@ -24,6 +24,7 @@
 #include "backends/imgui_impl_dx11.h"
 #include "backends/imgui_impl_win32.h"
 #include "tiers.hpp"
+#include "atomic_text.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -334,47 +335,39 @@ static void ReadMaxFps()
     g_max_fps_background = find("MaxFPSBackground");
 }
 
-static void WriteMaxFps(int fps, int bg)
+static const char *g_fps_save_status = "";
+static bool WriteMaxFps(int fps, int bg)
 {
-    HANDLE file = CreateFileW(g_config_wtf.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    std::string text;
-    if (file != INVALID_HANDLE_VALUE) {
-        char buf[4096]{};
-        DWORD read = 0;
-        while (ReadFile(file, buf, sizeof buf, &read, nullptr) && read) text.append(buf, read);
-        CloseHandle(file);
+    const bool saved = nr_files::EditText(g_config_wtf, [&](std::string &text) {
+        auto set_line = [&](const char *key, int value) {
+            const std::string needle = std::string("SET ") + key + " \"";
+            const size_t pos = text.find(needle);
+            char line[64];
+            std::snprintf(line, sizeof line, "SET %s \"%d\"", key, value);
+            if (pos == std::string::npos) {
+                if (!text.empty() && text.back() != '\n') text += "\n";
+                text += line;
+                text += "\n";
+            } else {
+                const size_t vstart = pos + needle.size();
+                const size_t vend = text.find('"', vstart);
+                if (vend != std::string::npos)
+                    text = text.substr(0, vstart) + std::to_string(value) + text.substr(vend);
+            }
+        };
+        set_line("MaxFPS", fps);
+        set_line("MaxFPSBackground", bg);
+        return true;
+    });
+    if (!saved) {
+        g_fps_save_status = "保存失败：原配置保留，请检查文件权限或占用。";
+        DebugLogF("maxfps save failed: %ls error=%lu", g_config_wtf.c_str(), GetLastError());
+        return false;
     }
-    auto set_line = [&](const char *key, int value) {
-        const std::string needle = std::string("SET ") + key + " \"";
-        const size_t pos = text.find(needle);
-        char line[64];
-        std::snprintf(line, sizeof line, "SET %s \"%d\"", key, value);
-        if (pos == std::string::npos) {
-            if (!text.empty() && text.back() != '\n') text += "\n";
-            text += line;
-            text += "\n";
-        } else {
-            const size_t vstart = pos + needle.size();
-            const size_t vend = text.find('"', vstart);
-            if (vend != std::string::npos)
-                text = text.substr(0, vstart) + std::to_string(value) + text.substr(vend);
-        }
-    };
-    set_line("MaxFPS", fps);
-    set_line("MaxFPSBackground", bg);
-    file = CreateFileW(g_config_wtf.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                       FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        DebugLogF("maxfps save FAILED (path=%ls locked or missing)", g_config_wtf.c_str());
-        return;
-    }
-    DWORD written = 0;
-    WriteFile(file, text.data(), static_cast<DWORD>(text.size()), &written, nullptr);
-    CloseHandle(file);
     g_max_fps = fps;
     g_max_fps_background = bg;
-    DebugLogF("maxfps saved: foreground=%d background=%d (%ls)", fps, bg, g_config_wtf.c_str());
+    g_fps_save_status = "已保存；改前配置保留在 Config.wtf.nr-*.bak。";
+    return true;
 }
 
 // ===== ImGui / D3D11 =====
@@ -788,6 +781,7 @@ static void RenderUi(bool game_running, DWORD host_pid)
         WriteMaxFps((std::max)(fps_edit, 0), (std::max)(bg_edit, 0));
         fps_loaded = false;
     }
+    if (g_fps_save_status[0]) ImGui::TextWrapped("%s", g_fps_save_status);
     ImGui::TextDisabled("建议游戏未运行时保存——游戏退出回写会覆盖运行中的外部修改；\n也可在游戏内输入 /console MaxFPS 30 即时生效并由游戏自己保存。");
     EndCard();
 

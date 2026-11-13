@@ -208,7 +208,7 @@ WoW 3.3.5a 集成方式与日常入口。
   `DLSS5控制台.ini`；也可用 `--game <wow.exe 路径>` 指定并记住。
 - 检测到游戏运行后，若面板未启动，会从控制台所在目录拉起 `dlss5-panel.exe` 并保活。
 - 只读展示载体遥测；参数写入由悬浮面板完成，控制台不直接改载体参数。
-- 读写 `WTF\Config.wtf` 的 `SET MaxFPS` / `SET MaxFPSBackground`。
+- 读写 `WTF\Config.wtf` 的 `SET MaxFPS` / `SET MaxFPSBackground`。读取或写入失败时停止保存；成功替换保留改前副本 `Config.wtf.nr-*.bak`，备份由用户自行保管。
 - 提供悬浮面板日志目录与载体日志目录的打开入口。
 
 ### 游戏内悬浮面板
