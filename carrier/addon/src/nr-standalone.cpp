@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "../../../native/live_params.hpp"
 #include "../../../native/screenshot_readback.hpp"
 #include <intrin.h>
 #include <d3d9.h>
@@ -12436,36 +12437,6 @@ static bool OnReshadeOpenOverlay(reshade::api::effect_runtime *runtime, bool ope
 // 外部中文面板把参数写入 host64\live-params.json；本函数在 Present 路径上以
 // 0.5 秒节流轮询该文件的最后写入时间，变化时读取并热应用（与游戏内菜单
 // 完全相同的钳制与持久化写法）。解析器只处理面板生成的扁平 JSON。
-static bool LiveFindNumber(const char *json, const char *key, float &out)
-{
-    char needle[64];
-    std::snprintf(needle, sizeof needle, "\"%s\"", key);
-    const char *pos = std::strstr(json, needle);
-    if (!pos) return false;
-    pos = std::strchr(pos + 1, ':');
-    if (!pos) return false;
-    ++pos;
-    while (*pos == ' ') ++pos;
-    char *end = nullptr;
-    const double value = std::strtod(pos, &end);
-    if (end == pos) return false;
-    out = static_cast<float>(value);
-    return true;
-}
-static void LiveFindBool(const char *json, const char *key, bool &out, bool &found)
-{
-    found = false;
-    char needle[64];
-    std::snprintf(needle, sizeof needle, "\"%s\"", key);
-    const char *pos = std::strstr(json, needle);
-    if (!pos) return;
-    pos = std::strchr(pos + 1, ':');
-    if (!pos) return;
-    ++pos;
-    while (*pos == ' ') ++pos;
-    if (std::strncmp(pos, "true", 4) == 0) { out = true; found = true; }
-    else if (std::strncmp(pos, "false", 5) == 0) { out = false; found = true; }
-}
 static void ApplyLiveParamsFromFile()
 {
     static ULONGLONG s_last_check = 0, s_last_mtime = 0;
@@ -12485,7 +12456,6 @@ static void ApplyLiveParamsFromFile()
         attr.ftLastWriteTime.dwLowDateTime;
     if (mtime == s_last_mtime) return;
     DebugLog("live-params.json changed on disk; reapplying");
-    s_last_mtime = mtime;
     HANDLE file = CreateFileW(params_path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return;
@@ -12493,21 +12463,20 @@ static void ApplyLiveParamsFromFile()
     DWORD read = 0;
     const BOOL read_ok = ReadFile(file, text, sizeof text - 1, &read, nullptr);
     CloseHandle(file);
-    if (!read_ok) return;
+    if (!read_ok || read == sizeof(text) - 1) return;
     text[read] = 0;
-    float model = 0, intensity = 0, tone = 0, structure = 0, skin = 0;
-    bool nr = false, has_nr = false;
-    bool fg = true, has_fg = false;
-    float fg_multiplier = 0; bool has_fg_multiplier = false;
-    const bool numbers_ok =
-        LiveFindNumber(text, "model", model) && LiveFindNumber(text, "intensity", intensity) &&
-        LiveFindNumber(text, "localTone", tone) && LiveFindNumber(text, "localStructure", structure) &&
-        LiveFindNumber(text, "skinStructure", skin);
-    LiveFindBool(text, "neuralRendering", nr, has_nr);
-    LiveFindBool(text, "frameGeneration", fg, has_fg);
-    has_fg_multiplier = LiveFindNumber(text, "fgMultiplier", fg_multiplier);
-    const bool parsed = numbers_ok && has_nr;
-    if (!parsed) { Log("live-params rejected: unparsable content"); return; }
+    nr_params::Values value;
+    if (!nr_params::Parse(std::string_view(text, read), value)) {
+        s_last_mtime = mtime;
+        Log("live-params rejected: invalid flat JSON or non-finite values");
+        return;
+    }
+    s_last_mtime = mtime;
+    const float model=value.model, intensity=value.intensity, tone=value.tone,
+        structure=value.structure, skin=value.skin;
+    const bool nr=value.nr, has_nr=true, fg=value.fg, has_fg=value.has_fg;
+    const int fg_multiplier=value.multiplier;
+    const bool has_fg_multiplier=value.has_multiplier;
     const int new_model = std::clamp(static_cast<int>(model), 1, 3);
     // zh: 刻度与 native/tiers.hpp / 033 schema 一致——强度/结构 0–1（20261109 收敛，
     // 旧 0–2 是 upstream 菜单的偏宽范围）。
@@ -12531,6 +12500,10 @@ static void ApplyLiveParamsFromFile()
                 previous, requested, requested + 1, g_fg_mfg_max + 1);
     }
     char value16[16];
+    if (has_fg_multiplier) {
+        sprintf_s(value16, "%d", fg_multiplier);
+        reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "FgMultiplier", static_cast<const char *>(value16));
+    }
     sprintf_s(value16, "%d", new_model);
     reshade::set_config_value(nullptr, dlss5_aio_menu::kConfigSection, "Model", static_cast<const char *>(value16));
     sprintf_s(value16, "%.4f", g_nr_intensity);

@@ -25,6 +25,8 @@
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
 #include "tiers.hpp"
+#include "live_params.hpp"
+#include "pending_save.hpp"
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 namespace fs = std::filesystem;
@@ -79,7 +81,7 @@ struct Params {
     bool fg = true;   // zh: 帧生成独立开关——档位与微调滑杆不触碰它
     int fg_multiplier = 2;   // zh: 补帧倍数（2/3/4×）；3×/4× 需 RTX 50 系，其他卡载体自动回落 2×
     bool Equals(const Params &o) const {
-        return nr == o.nr && model == o.model && fg == o.fg &&
+        return nr == o.nr && model == o.model && fg == o.fg && fg_multiplier == o.fg_multiplier &&
             fabsf(intensity - o.intensity) < 0.005f && fabsf(tone - o.tone) < 0.005f &&
             fabsf(structure - o.structure) < 0.005f && fabsf(skin - o.skin) < 0.005f;
     }
@@ -91,7 +93,7 @@ struct Params {
     }
 };
 static Params g_params;
-static bool g_params_dirty = false;
+static nr_files::PendingSave g_save;
 static bool g_tier_locked = true;   // zh: 出厂档=锁定配方（微调禁用），自定义=解锁可调
 static Params g_custom;          // 自定义档位：最近一次应用的参数组合
 static bool g_custom_valid = false;
@@ -140,13 +142,13 @@ static std::string ParamsToJson(const Params &p)
 static bool WriteParamsAtomic(const fs::path &path, const Params &p)
 {
     const std::string body = ParamsToJson(p);
-    const fs::path temp = path.parent_path() / L"live-params.json.panel-tmp";
+    const fs::path temp = path.wstring() + L".panel-tmp-" + std::to_wstring(GetCurrentProcessId());
     HANDLE file = CreateFileW(temp.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
                               FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file == INVALID_HANDLE_VALUE) return false;
     DWORD written = 0;
     const bool ok = WriteFile(file, body.data(), static_cast<DWORD>(body.size()), &written, nullptr) &&
-        FlushFileBuffers(file);
+        written == body.size() && FlushFileBuffers(file);
     CloseHandle(file);
     if (!ok) { DeleteFileW(temp.c_str()); return false; }
     if (!MoveFileExW(temp.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING)) {
@@ -169,46 +171,25 @@ static void LoadCustomTier()
     CloseHandle(file);
     if (!ok) return;
     text[read] = 0;
-    auto num = [&](const char *key, float &out) {
-        char needle[48];
-        std::snprintf(needle, sizeof needle, "\"%s\":", key);
-        const char *pos = std::strstr(text, needle);
-        if (!pos) return false;
-        pos += std::strlen(needle);
-        while (*pos == ' ') ++pos;
-        char *end = nullptr;
-        const double v = std::strtod(pos, &end);
-        if (end == pos) return false;
-        out = static_cast<float>(v);
-        return true;
-    };
-    float model = 0, intensity = 0, tone = 0, structure = 0, skin = 0;
-    if (!num("model", model) || !num("intensity", intensity) || !num("localTone", tone) ||
-        !num("localStructure", structure) || !num("skinStructure", skin))
-        return;
-    g_custom.model = std::clamp(static_cast<int>(model), 1, 3);
-    g_custom.intensity = std::clamp(intensity, 0.0f, 1.0f);
-    g_custom.tone = std::clamp(tone, 0.0f, 2.0f);
-    g_custom.structure = std::clamp(structure, 0.0f, 1.0f);
-    g_custom.skin = std::clamp(skin, -1.0f, 1.0f);
-    const char *nr = std::strstr(text, "\"neuralRendering\":true");
-    g_custom.nr = nr != nullptr;
-    if (std::strstr(text, "\"frameGeneration\":"))
-        g_custom.fg = std::strstr(text, "\"frameGeneration\":true") != nullptr;
+    nr_params::Values value;
+    if (!nr_params::Parse(std::string_view(text, read), value)) return;
+    g_custom.model = static_cast<int>(value.model);
+    g_custom.intensity = value.intensity;
+    g_custom.tone = value.tone;
+    g_custom.structure = value.structure;
+    g_custom.skin = value.skin;
+    g_custom.nr = value.nr;
+    if (value.has_fg) g_custom.fg = value.fg;
+    if (value.has_multiplier) g_custom.fg_multiplier = value.multiplier;
+    ClampParams(g_custom);
     g_custom_valid = true;
 }
-static void SaveCustomTier(const Params &p)
+static bool SaveCustomTier(const Params &p)
 {
-    const std::string body = ParamsToJson(p);
-    HANDLE file = CreateFileW(CustomPath.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    DWORD written = 0;
-    WriteFile(file, body.data(), static_cast<DWORD>(body.size()), &written, nullptr);
-    FlushFileBuffers(file);
-    CloseHandle(file);
+    if (!WriteParamsAtomic(CustomPath, p)) return false;
     g_custom = p;
     g_custom_valid = true;
+    return true;
 }
 
 // 从 host64/ReShade.ini 读取当前值（面板启动时的初值来源）
@@ -230,6 +211,8 @@ static void ReadIniParams(Params &p)
     if (v[0]) p.nr = v[0] != L'0';
     v = read(L"FrameGeneration");
     if (v[0]) p.fg = v[0] != L'0';
+    v = read(L"FgMultiplier");
+    if (v[0]) p.fg_multiplier = std::clamp(_wtoi(v), 2, 4);
     v = read(L"Model");
     if (v[0]) p.model = std::clamp(_wtoi(v), 1, 3);
     v = read(L"Intensity");
@@ -544,6 +527,7 @@ static int g_nav_page = 0;   // 0 状态 / 1 画面增强 / 2 补帧 / 3 模型 
 
 static void PageHeader(const char *title)
 {
+    if (g_save.failed) ImGui::TextColored(kWarn, "参数未保存，正在重试");
     ImGui::TextColored(kAccent, "%s", title);
     ImGui::Spacing();
 }
@@ -626,7 +610,7 @@ static void PageStatus()
 static void PageNr()
 {
     PageHeader("画面增强（NR）");
-    if (ToggleSwitch("画面增强（NR）", g_params.nr)) g_params_dirty = true;
+    if (ToggleSwitch("画面增强（NR）", g_params.nr)) g_save.dirty = true;
 
     ImGui::Spacing();
     ImGui::TextColored(kAccent, "档位");
@@ -637,12 +621,14 @@ static void PageNr()
             124 * g_dpi_scale)) {
             const int keep_model = g_params.model;
             const bool keep_fg = g_params.fg;
+            const int keep_multiplier = g_params.fg_multiplier;
             g_params = kSchemes[i].p;
             g_params.model = keep_model;
             g_params.fg = keep_fg;
-            ClampParams(g_params);   // zh: 配方聚合初始化不含倍数字段，钳到默认 2×
+            g_params.fg_multiplier = keep_multiplier;
+            ClampParams(g_params);
             g_tier_locked = true;
-            g_params_dirty = true;
+            g_save.dirty = true;
         }
     }
     ImGui::SameLine();
@@ -650,7 +636,7 @@ static void PageNr()
         g_tier_locked = false;
         if (g_custom_valid && !g_params.Equals(g_custom)) {
             g_params = g_custom;
-            g_params_dirty = true;
+            g_save.dirty = true;
         }
     }
     if (ImGui::IsItemHovered())
@@ -662,16 +648,16 @@ static void PageNr()
     if (g_tier_locked) ImGui::BeginDisabled(true);
     HelpText("整体重绘幅度：0 关闭/最弱，1 满强度；过高会放大锐化与伪影。");
     if (ImGui::SliderFloat("强度", &g_params.intensity, kNrIntensityMin, kNrIntensityMax, "%.2f"))
-        g_params_dirty = true;
+        g_save.dirty = true;
     HelpText("色彩与明暗层次：1.00 为中性（0–2）；越低越平，越高保留越多。");
     if (ImGui::SliderFloat("色调结构", &g_params.tone, kNrToneMin, kNrToneMax, "%.2f"))
-        g_params_dirty = true;
+        g_save.dirty = true;
     HelpText("边缘与细节：0 最平滑，1 细节最多；过高会放大噪点。");
     if (ImGui::SliderFloat("结构强度", &g_params.structure, kNrStructureMin, kNrStructureMax, "%.2f"))
-        g_params_dirty = true;
+        g_save.dirty = true;
     HelpText("人物皮肤：-1 更平滑，0 中性，+1 保留更多纹理。");
     if (ImGui::SliderFloat("皮肤结构", &g_params.skin, kNrSkinMin, kNrSkinMax, "%.2f"))
-        g_params_dirty = true;
+        g_save.dirty = true;
     ClampParams(g_params);
     if (ImGui::Button("从载体 ini 重新读取")) {
         Params p;
@@ -688,7 +674,7 @@ static void PageNr()
 static void PageFg()
 {
     PageHeader("补帧（DLSS-G）");
-    if (ToggleSwitch("补帧（DLSS-G）", g_params.fg)) g_params_dirty = true;
+    if (ToggleSwitch("补帧（DLSS-G）", g_params.fg)) g_save.dirty = true;
     if (!g_tele.fg)
         ImGui::TextDisabled("补帧：关（配置未开启）");
     else if (g_tele.fg_failed)
@@ -708,7 +694,7 @@ static void PageFg()
         // zh: 固定宽 + SameLine；-1 宽会把后续按钮挤到面板外（首钮吃满整行）
         if (SegmentedOption(label, g_params.fg_multiplier == m, 100 * g_dpi_scale)) {
             g_params.fg_multiplier = m;
-            g_params_dirty = true;
+            g_save.dirty = true;
         }
     }
     ImGui::TextWrapped("3×/4× 需要 RTX 50 系显卡（其他卡自动回落 2×）。倍数越高呈现帧率越高，"
@@ -723,7 +709,7 @@ static void PageModel()
     for (int m = 1; m <= 3; ++m) {
         if (SegmentedOption(kModelNames[m - 1], g_params.model == m, -1.0f)) {
             g_params.model = m;
-            g_params_dirty = true;
+            g_save.dirty = true;
         }
     }
     ImGui::TextWrapped("%s", kModelDesc[g_params.model - 1]);
@@ -757,6 +743,7 @@ static void RenderUi()
         ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.071f, 0.090f, 0.122f, 0.92f));
         ImGui::Begin("##strip", nullptr, ImGuiWindowFlags_NoDecoration |
             ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
+        if (g_save.failed) ImGui::TextColored(kWarn, "参数未保存，正在重试");
         ImGui::TextColored(kAccent, "WOW-335-NR");
         ImGui::SameLine(0, 6);
         ImGui::TextUnformatted(SchemeName());
@@ -1165,14 +1152,13 @@ int wmain(int argc, wchar_t **argv)
         MaintainOutputOwnership(procs.host_pid);
 
         // 参数落盘（用户改动时）
-        if (g_params_dirty && now - last_flush >= 200) {
+        if (g_save.dirty && now - last_flush >= g_save.IntervalMs()) {
             last_flush = now;
-            g_params_dirty = false;
-            if (WriteParamsAtomic(ParamsPath, g_params)) {
-                SaveCustomTier(g_params);   // 自定义档位跟随最近一次调整
+            const bool previously_failed = g_save.failed;
+            if (g_save.Try([&] { return WriteParamsAtomic(ParamsPath, g_params) && SaveCustomTier(g_params); })) {
                 DebugLine(L"live-params.json written (params applied by the carrier within ~0.5s)");
             } else {
-                out_line(L"参数写入失败：live-params.json 不可写。");
+                if (!previously_failed) out_line(L"参数保存失败，保留请求并每秒重试。");
             }
         }
 

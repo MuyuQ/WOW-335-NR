@@ -588,6 +588,7 @@ DLSS5-ControlCenter.cmd
 | --- | --- | --- |
 | `NeuralRendering` | `1` | NR 开关 |
 | `FrameGeneration` | `0` | 帧生成开关；需要时在面板或 Add-ons 菜单开启 |
+| `FgMultiplier` | 未写入 | 请求补帧倍数 2/3/4，代码默认 2；运行时仍按显卡能力限制 |
 | `Model` | `1` | NR 模型 1–3 |
 | `Intensity` | `1.0` | 强度 0–1 |
 | `LocalTone` | `1.0` | 色调结构 0–2 |
@@ -621,15 +622,15 @@ DLSS5-ControlCenter.cmd
 }
 ```
 
-- 数值在载体侧按 `tiers.hpp` 边界钳制。
-- `fgMultiplier` 是 UI 语义的 2/3/4，载体转换为 `DLSSG.MultiFrameCount` 1/2/3。
+- 文件必须是完整的扁平 JSON，只接受上例字段；拒绝重复键、未知键、非有限数值和截断内容。模型须为 1/2/3，补帧倍数须为 2/3/4；观感浮点参数在载体侧按 `tiers.hpp` 边界钳制。
+- `fgMultiplier` 是 UI 语义的 2/3/4，载体转换为 `DLSSG.MultiFrameCount` 1/2/3，并以 `FgMultiplier` 写回 ini。切换画面档位保留补帧倍数。
 - 模型变化通过官方切换函数触发特性重建；仅改变量不会真正切换网络。
 - 载体应用后把值写回 `ReShade.ini`，面板可用「从载体 ini 重新读取」同步显示。
 
 ### `host64\custom-tier.json`
 
 面板保存的最近一次自定义组合，格式与 `live-params.json` 相同。点「自定义」时若存在该文件，
-面板会召回其中参数。
+面板会召回其中参数。热参数或自定义档保存失败时保留待保存请求，每秒重试，并显示未保存状态。
 
 ### `dlss5-aio-x86.cfg`
 
