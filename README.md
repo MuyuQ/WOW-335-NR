@@ -803,3 +803,9 @@ NR + DLSS/DLAA → DLSS/DLAA + FG → NR + DLSS/DLAA + FG → 恢复用户设置
 
 此外，DLSS5-Feeder 快照还收录了 Deep Fried Chicken 的互操作文档与许可文件；
 本项目不依赖该二进制，也不分发它。VORT Motion 是可选第三方着色器，不随本仓库分发。
+
+## 隔离回归检查
+
+原生、安装、性能和暂存回归的运行入口及适用范围见 [tests/README.md](tests/README.md)。检查通过不等于部署或真实游戏验收通过。
+
+Addon 的关闭入口、超时后重试及模块引用规则见 [关闭与模块所有权](carrier/addon/SHUTDOWN.md)。关闭先等待 CPU/GPU 工作完成再释放资源；接触过原生 hook 或私有日志回调的会话会保留 DLL 到进程退出，重新启用需重启载体。专用关闭回归不替代真实游戏退出、设备移除和长期运行验收。
