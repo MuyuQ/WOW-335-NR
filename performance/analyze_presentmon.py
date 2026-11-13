@@ -72,8 +72,23 @@ def summarize(headers, rows, expected_seconds=60.0, minimum_coverage=0.9):
         timestamps_complete = len(timestamps) == len(samples)
         monotonic = all(a <= b for a, b in zip(timestamps, timestamps[1:]))
         span = (timestamps[-1] - timestamps[0]) / 1000.0 if len(timestamps) >= 2 and monotonic else None
-        eligible = (len(presents) >= 100 and timestamps_complete and span is not None and
-                    span >= expected_seconds * minimum_coverage)
+        valid_fraction = len(presents) / len(data) if data else 0.0
+        valid_seconds = sum(presents) / 1000.0
+        missing_run = longest_missing = 0.0
+        if timestamps_complete and monotonic:
+            for previous, current in zip(samples, samples[1:]):
+                if current["present_ms"] is None:
+                    missing_run += (current["time_ms"] - previous["time_ms"]) / 1000.0
+                    longest_missing = max(longest_missing, missing_run)
+                else:
+                    missing_run = 0.0
+        else:
+            longest_missing = None
+        span_sufficient = bool(timestamps_complete and span is not None and
+                               span >= expected_seconds * minimum_coverage)
+        intervals_sufficient = (valid_fraction >= minimum_coverage and
+                                valid_seconds >= expected_seconds * minimum_coverage)
+        eligible = len(presents) >= 100 and span_sufficient and intervals_sufficient
         p99 = percentile(presents, 0.99) if len(presents) >= 100 else None
         p999 = percentile(presents, 0.999) if len(presents) >= 1000 else None
         reports.append({
@@ -81,6 +96,11 @@ def summarize(headers, rows, expected_seconds=60.0, minimum_coverage=0.9):
             "first_row_discarded": True, "valid_present_intervals": len(presents),
             "valid_display_intervals": len(displayed), "capture_span_seconds": span,
             "timestamps_complete": timestamps_complete, "timestamps_monotonic": monotonic,
+            "timestamp_span_sufficient": span_sufficient,
+            "valid_interval_fraction": valid_fraction,
+            "valid_interval_seconds": valid_seconds,
+            "longest_missing_interval_seconds": longest_missing,
+            "valid_interval_coverage_sufficient": intervals_sufficient,
             "meets_capture_length_and_count": eligible,
             "mean_present_fps_estimate": 1000.0 / (sum(presents) / len(presents)) if len(presents) >= 2 else None,
             "mean_display_fps_estimate": 1000.0 / (sum(displayed) / len(displayed)) if len(displayed) >= 2 else None,
@@ -92,7 +112,7 @@ def summarize(headers, rows, expected_seconds=60.0, minimum_coverage=0.9):
             "method": "Group by process and swapchain; discard first row; FPS=1000/mean interval; "
                       "1% low=1000/interpolated P99 interval (>=100 intervals); "
                       "0.1% low=1000/interpolated P99.9 interval (>=1000 intervals). "
-                      "Missing displayed timing remains null. Coverage is a data sufficiency check, "
+                      "Missing displayed timing remains null. Coverage requires both timestamp span and valid intervals. It is a data sufficiency check, "
                       "not a performance threshold. Role requires independent correlation.",
             "groups": reports}
 
