@@ -366,6 +366,11 @@ function Invoke-Dlss5Install {
     Assert-ProcessesStopped
     $preview = Get-Dlss5InstallPreview -Client $Client -Stage $Stage
     if (-not $preview.CanInstall) { throw '安装预检未通过；请查看文件冲突和来源状态。' }
+    $priorRecord = Test-Dlss5ClientRecord $preview.Client
+    $clientRecordPath = Get-Dlss5ClientRecordPath $preview.Client
+    if ([IO.File]::Exists($clientRecordPath) -and $null -eq $priorRecord) {
+        throw '已有安装记录不可读，保留现状；请先恢复记录。'
+    }
     $items = @($preview.Items | Where-Object { $_.PreState -notin @('same', 'missing-optional') })
     if ($items.Count -eq 0) {
         return [pscustomobject]@{ Status = 'already_current'; Operation = $null; Count = 0;
@@ -397,14 +402,24 @@ function Invoke-Dlss5Install {
             replaces_original = [bool]$item.ReplacesOriginal; pre_state = [string]$item.PreState;
             previous_sha256 = $item.ExistingSha256; backup = $backupRel })
     }
+    # Keep the first-install snapshot for each member; a later install owns only its delta.
+    $allEntries = @()
+    if ($null -ne $priorRecord) { $allEntries += @($priorRecord.Record.entries) }
+    foreach ($entry in $entries) {
+        if (@($allEntries | Where-Object { $_.target -eq $entry.target }).Count -eq 0) {
+            $allEntries += $entry
+        }
+    }
     $record = [ordered]@{ schema = 2; status = 'preparing'; client = $preview.Client; stage = $preview.Stage;
         manifest_version = $preview.ManifestVersion; tool = 'WOW-335-NR';
-        entries = @($entries); applied = @(); errors = @() }
+        entries = @($entries); repair_entries = @($allEntries);
+        previous_client_record = $(if ($null -ne $priorRecord) { $priorRecord.Record } else { $null });
+        applied = @(); errors = @() }
     Write-JsonAtomic $recordPath $record
     $changed = [Collections.Generic.List[object]]::new()
     $pendingTemps = [Collections.Generic.List[object]]::new()
     try {
-        foreach ($item in $items) {
+        foreach ($item in @($preview.Items | Where-Object { $_.PreState -ne 'missing-optional' })) {
             $staged = Get-MemberPath $operation ('stage/' + $item.Target)
             Copy-Verified $item.Source $staged ([string]$item.Sha256)
         }
@@ -444,7 +459,7 @@ function Invoke-Dlss5Install {
         $clientRecord = [ordered]@{ schema = 1; status = 'installed';
             installed_utc = [DateTime]::UtcNow.ToString('o'); client = $preview.Client;
             manifest_version = $preview.ManifestVersion; tool = 'WOW-335-NR'; operation = $operation;
-            entries = @($entries); residue = @($manifest.Residue) }
+            entries = @($allEntries); residue = @($manifest.Residue) }
         Write-JsonAtomic (Get-Dlss5ClientRecordPath $preview.Client) $clientRecord
         Write-Dlss5CoreDebug ("install completed: {0} members, operation {1}" -f $changed.Count, $operation)
         return [pscustomobject]@{ Status = 'completed'; Operation = $operation; Count = $changed.Count;
@@ -555,6 +570,10 @@ function Invoke-Dlss5Restore {
     param([Parameter(Mandatory)][string]$Operation)
     Assert-ProcessesStopped
     $verified = Get-VerifiedOperation $Operation
+    $active = Test-Dlss5ClientRecord $verified.Client
+    if ($null -ne $active -and [string]$active.Record.operation -ne $verified.Directory) {
+        throw '客户端有后续安装事务，请先恢复最近一次安装。'
+    }
     $runId = [guid]::NewGuid().ToString('N')
     $reportPath = Get-MemberPath $verified.Directory ("restore-$runId.json")
     $saveRoot = Get-MemberPath $verified.Directory ("modified-$runId")
@@ -569,8 +588,13 @@ function Invoke-Dlss5Restore {
         try {
             $clientRecord = Get-Dlss5ClientRecordPath $verified.Client
             $clientBackup = Get-MemberPath $verified.Client 'host64/dlss5-backup'
-            if ([IO.Directory]::Exists($clientBackup)) { [IO.Directory]::Delete($clientBackup, $true) }
-            if ([IO.File]::Exists($clientRecord)) { [IO.File]::Delete($clientRecord) }
+            $previousRecord = Get-ManifestField $verified.Record 'previous_client_record'
+            if ($null -ne $previousRecord) {
+                Write-JsonAtomic $clientRecord $previousRecord
+            } else {
+                if ([IO.Directory]::Exists($clientBackup)) { [IO.Directory]::Delete($clientBackup, $true) }
+                if ([IO.File]::Exists($clientRecord)) { [IO.File]::Delete($clientRecord) }
+            }
         } catch { $report.errors = @($report.errors) + @("清理客户端内安装记录：$($_.Exception.Message)") }
     }
     return [pscustomobject]@{ Status = $report.status; Report = $reportPath;
@@ -639,10 +663,14 @@ function Invoke-Dlss5Repair {
     $reportPath = Get-MemberPath $verified.Directory ("repair-$runId.json")
     $conflictRoot = Get-MemberPath $verified.Directory ("repair-modified-$runId")
     $report = [ordered]@{ status = 'in_progress'; repaired = @(); preserved = @(); errors = @() }
-    # zh: 可选运行库（nvngx_dlssg.dll）未在本次安装中时，暂存里本来就没有它；
-    # 修复跳过这类成员，不再整体报错（20261112）。
+    # Repair only recorded installed members; missing trusted inputs are errors.
+    $repairEntries = Get-ManifestField $verified.Record 'repair_entries'
+    if ($null -eq $repairEntries) { $repairEntries = @($verified.Entries) }
     Write-JsonAtomic $reportPath $report
-    foreach ($member in $verified.Lock.members) {
+    foreach ($installedEntry in $repairEntries) {
+        $matches = @($verified.Lock.members | Where-Object { $_.target -eq $installedEntry.target -and $_.sha256 -eq $installedEntry.sha256 })
+        if ($matches.Count -ne 1) { throw '修复记录与组件锁不一致。' }
+        $member = $matches[0]
         try {
             Assert-ProcessesStopped
             $dest = Get-MemberPath $verified.Client ([string]$member.target)
@@ -662,7 +690,7 @@ function Invoke-Dlss5Repair {
             Assert-NoReparse $dest
             $temp = "$dest.dlss5-repair-$runId"
             $staged = Get-MemberPath $verified.Directory ('stage/' + $member.target)
-            if (-not [IO.File]::Exists($staged) -or (Get-Sha256 $staged) -ne $member.sha256) { continue }
+            if (-not [IO.File]::Exists($staged) -or (Get-Sha256 $staged) -ne $member.sha256) { throw '修复来源缺失或身份不符，请重新提供组件。' }
             Copy-Verified $staged $temp ([string]$member.sha256)
             if ($exists) {
                 if ((Get-Sha256 $dest) -ne $current) { throw '文件在修复期间变化，保留现状。' }
