@@ -220,6 +220,12 @@ WoW 3.3.5a 集成方式与日常入口。
 - 「从载体 ini 重新读取」只同步显示，不写入载体；刚改的值需等载体落盘（约 1 秒）。
 - 单实例互斥；游戏退出后转入等待，下次启动游戏自动显示。
 
+### 截图
+
+- 游戏窗口在前台且 NR 开启时按 `PrintScreen`，会把当前合成画面保存为
+  游戏 `Screenshots\WoWScrnShot_<日期>_<时间>_NR.png`；这一次按键不再触发游戏的原生截图。
+- NR 关闭时不拦截，`PrintScreen` 仍由游戏自己保存原生截图。
+
 ### 载体 Add-ons 菜单
 
 游戏内按 `Home` 打开 ReShade 覆盖层，进入 Add-ons 页的「Standalone DLSS-NR + SR」可调高级项：

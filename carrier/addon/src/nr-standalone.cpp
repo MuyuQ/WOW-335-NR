@@ -1,6 +1,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include "../../../native/screenshot_readback.hpp"
 #include <intrin.h>
 #include <d3d9.h>
 #include <d3d11_4.h>
@@ -8,6 +9,10 @@
 #include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include <dcomp.h>
+#include <objbase.h>
+#include <objidl.h>
+#include <ocidl.h>
+#include <wincodec.h>
 #include <wrl/client.h>
 
 #include <algorithm>
@@ -74,6 +79,18 @@ static HWND g_proxy_preview_window;
 static HANDLE g_proxy_window_thread;
 static HANDLE g_proxy_window_ready;
 static HHOOK g_proxy_mouse_hook;
+// zh: PrintScreen 截图——NR 开启时由载体回读最终合成帧，NR 关闭时放行给游戏原生截图。
+static HHOOK g_proxy_keyboard_hook;
+static std::atomic<bool> g_screenshot_request{false};
+static std::atomic<bool> g_screenshot_pending{false};
+static std::atomic<unsigned long long> g_screenshot_last_tick{0};
+static std::atomic<unsigned long long> g_screenshot_fence_value{0};
+static Microsoft::WRL::ComPtr<ID3D12Resource> g_screenshot_readback;
+static unsigned int g_screenshot_width = 0;
+static unsigned int g_screenshot_height = 0;
+static unsigned int g_screenshot_row_pitch = 0;
+static unsigned long long g_screenshot_total_bytes = 0;
+static DXGI_FORMAT g_screenshot_format = DXGI_FORMAT_UNKNOWN;
 static Microsoft::WRL::ComPtr<IDXGISwapChain3> g_proxy_swapchain;
 static Microsoft::WRL::ComPtr<IDCompositionDevice> g_composition_device;
 static Microsoft::WRL::ComPtr<IDCompositionTarget> g_composition_target;
@@ -7514,6 +7531,34 @@ static LRESULT CALLBACK ProxyLowLevelMouseProc(int code, WPARAM wparam, LPARAM l
     return CallNextHookEx(g_proxy_mouse_hook, code, wparam, lparam);
 }
 
+static LRESULT CALLBACK ProxyLowLevelKeyboardProc(int code, WPARAM wparam, LPARAM lparam)
+{
+    if (code == HC_ACTION && (wparam == WM_KEYDOWN || wparam == WM_SYSKEYDOWN) && g_nr_enabled)
+    {
+        const KBDLLHOOKSTRUCT *info = reinterpret_cast<const KBDLLHOOKSTRUCT *>(lparam);
+        if (info != nullptr && info->vkCode == VK_SNAPSHOT)
+        {
+            const HWND foreground = GetForegroundWindow();
+            const bool game_foreground = foreground != nullptr && g_game_window != nullptr &&
+                (foreground == g_game_window || foreground == g_proxy_window ||
+                 GetAncestor(foreground, GA_ROOT) == g_game_window);
+            const ULONGLONG now = GetTickCount64();
+            const ULONGLONG last = g_screenshot_last_tick.load(std::memory_order_relaxed);
+            // zh: 只在游戏前台且 NR 开启时接管这一次按键；其他情况原样放行，
+            // 让 WoW 自己的 PrintScreen 继续生成原生截图。
+            if (game_foreground && now - last >= 600 &&
+                !g_proxy_hidden.load(std::memory_order_relaxed) &&
+                !g_proxy_transition_hold.load(std::memory_order_relaxed) &&
+                !g_screenshot_request.exchange(true, std::memory_order_acq_rel))
+            {
+                g_screenshot_last_tick.store(now, std::memory_order_relaxed);
+                return 1;
+            }
+        }
+    }
+    return CallNextHookEx(g_proxy_keyboard_hook, code, wparam, lparam);
+}
+
 static bool WindowQueryComesFromGameExecutable(void *return_address)
 {
     HMODULE caller = nullptr;
@@ -10003,9 +10048,15 @@ static DWORD WINAPI ProxyWindowThread(void *)
     }
     if (g_proxy_window) SetTimer(g_proxy_window, 1, 500, nullptr);
     g_proxy_mouse_hook = nullptr;
-    Log("proxy mouse routing ready: gameplay window forwarding; ReShade native-input bypass");
     SetEvent(g_proxy_window_ready);
     if (g_proxy_window == nullptr) return 1;
+    g_proxy_keyboard_hook = SetWindowsHookExW(WH_KEYBOARD_LL, ProxyLowLevelKeyboardProc,
+        g_self != nullptr ? g_self : GetModuleHandleW(nullptr), 0);
+    if (g_proxy_keyboard_hook != nullptr)
+        Log("NR screenshot capture armed: PrintScreen on the game window saves the composed frame");
+    else
+        Log("NR screenshot keyboard hook failed: error=%lu", GetLastError());
+    Log("proxy mouse routing ready: gameplay window forwarding; ReShade native-input bypass");
     MSG message;
     while (GetMessageW(&message, nullptr, 0, 0) > 0)
     {
@@ -10013,6 +10064,7 @@ static DWORD WINAPI ProxyWindowThread(void *)
         DispatchMessageW(&message);
     }
     if (g_proxy_mouse_hook) { UnhookWindowsHookEx(g_proxy_mouse_hook); g_proxy_mouse_hook = nullptr; }
+    if (g_proxy_keyboard_hook) { UnhookWindowsHookEx(g_proxy_keyboard_hook); g_proxy_keyboard_hook = nullptr; }
     g_proxy_window = nullptr;
     return 0;
 }
@@ -10874,12 +10926,235 @@ static int StagePipelineFrameForPresentation(UINT pipeline_slot_index)
     return presentation_slot_index;
 }
 
+static bool PathEndsWithNoCase(const std::wstring &value, const wchar_t *suffix)
+{
+    const size_t length = wcslen(suffix);
+    return value.size() >= length &&
+        _wcsicmp(value.c_str() + (value.size() - length), suffix) == 0;
+}
+
+static std::wstring BuildScreenshotPath()
+{
+    wchar_t module[MAX_PATH] = {};
+    bool have_module = false;
+    DWORD process_id = 0;
+    if (g_game_window != nullptr)
+        GetWindowThreadProcessId(g_game_window, &process_id);
+    if (process_id == 0)
+        process_id = g_external_game_process_id;
+    if (process_id != 0)
+    {
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, process_id);
+        if (process != nullptr)
+        {
+            DWORD length = MAX_PATH;
+            have_module = QueryFullProcessImageNameW(process, 0, module, &length) != FALSE;
+            CloseHandle(process);
+        }
+    }
+    if (!have_module)
+        have_module = GetModuleFileNameW(nullptr, module, MAX_PATH) != 0;
+
+    std::wstring directory;
+    if (have_module)
+    {
+        const std::wstring full(module);
+        const size_t slash = full.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            directory = full.substr(0, slash);
+    }
+    if (directory.empty())
+    {
+        wchar_t current[MAX_PATH] = {};
+        if (GetCurrentDirectoryW(MAX_PATH, current) != 0)
+            directory = current;
+    }
+    if (PathEndsWithNoCase(directory, L"\\host64"))
+    {
+        const size_t slash = directory.find_last_of(L"\\/");
+        if (slash != std::wstring::npos)
+            directory = directory.substr(0, slash);
+    }
+    if (directory.empty())
+        directory = L".";
+
+    const std::wstring screenshots = directory + L"\\Screenshots";
+    CreateDirectoryW(screenshots.c_str(), nullptr);
+    SYSTEMTIME now = {};
+    GetLocalTime(&now);
+    wchar_t name[96] = {};
+    swprintf_s(name, L"\\WoWScrnShot_%02u%02u%02u_%02u%02u%02u_NR.png",
+        now.wMonth, now.wDay, static_cast<unsigned int>(now.wYear % 100),
+        now.wHour, now.wMinute, now.wSecond);
+    return screenshots + name;
+}
+
+static bool SaveScreenshotPng(const std::wstring &path, const std::vector<unsigned char> &rgba,
+    UINT width, UINT height)
+{
+    const HRESULT init = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    const bool uninitialize = SUCCEEDED(init);
+    if (FAILED(init) && init != RPC_E_CHANGED_MODE)
+    {
+        Log("screenshot COM init failed: hr=0x%08X", static_cast<unsigned int>(init));
+        return false;
+    }
+
+    Microsoft::WRL::ComPtr<IWICImagingFactory> factory;
+    Microsoft::WRL::ComPtr<IWICStream> stream;
+    Microsoft::WRL::ComPtr<IWICBitmapEncoder> encoder;
+    Microsoft::WRL::ComPtr<IWICBitmapFrameEncode> frame;
+    Microsoft::WRL::ComPtr<IPropertyBag2> properties;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+        IID_PPV_ARGS(&factory));
+    if (SUCCEEDED(hr)) hr = factory->CreateStream(&stream);
+    if (SUCCEEDED(hr)) hr = stream->InitializeFromFilename(path.c_str(), GENERIC_WRITE);
+    if (SUCCEEDED(hr)) hr = factory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &encoder);
+    if (SUCCEEDED(hr)) hr = encoder->Initialize(stream.Get(), WICBitmapEncoderNoCache);
+    if (SUCCEEDED(hr)) hr = encoder->CreateNewFrame(&frame, &properties);
+    if (SUCCEEDED(hr)) hr = frame->Initialize(properties.Get());
+    if (SUCCEEDED(hr)) hr = frame->SetSize(width, height);
+    WICPixelFormatGUID pixel_format = GUID_WICPixelFormat32bppRGBA;
+    if (SUCCEEDED(hr)) hr = frame->SetPixelFormat(&pixel_format);
+    if (SUCCEEDED(hr) && !IsEqualGUID(pixel_format, GUID_WICPixelFormat32bppRGBA))
+        hr = E_FAIL;
+    if (SUCCEEDED(hr))
+        hr = frame->WritePixels(height, width * 4, static_cast<UINT>(rgba.size()),
+            const_cast<BYTE *>(rgba.data()));
+    if (SUCCEEDED(hr)) hr = frame->Commit();
+    if (SUCCEEDED(hr)) hr = encoder->Commit();
+
+    if (FAILED(hr))
+    {
+        DeleteFileW(path.c_str());
+        Log("screenshot encode failed: hr=0x%08X path=%ls", static_cast<unsigned int>(hr), path.c_str());
+    }
+    if (uninitialize)
+        CoUninitialize();
+    return SUCCEEDED(hr);
+}
+
+static bool EnsureScreenshotReadback(ID3D12Device *device, ID3D12Resource *destination)
+{
+    if (device == nullptr || destination == nullptr)
+        return false;
+    const D3D12_RESOURCE_DESC source = destination->GetDesc();
+    switch (source.Format)
+    {
+    case DXGI_FORMAT_B8G8R8A8_UNORM:
+    case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+    case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+    case DXGI_FORMAT_R10G10B10A2_UNORM:
+        break;
+    default:
+        Log("screenshot format unsupported: %u", static_cast<unsigned int>(source.Format));
+        return false;
+    }
+    if (g_screenshot_readback && g_screenshot_width == source.Width &&
+        g_screenshot_height == source.Height && g_screenshot_format == source.Format)
+        return true;
+
+    D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+    UINT64 total = 0;
+    Microsoft::WRL::ComPtr<ID3D12Resource> readback;
+    const HRESULT hr = nr_screenshot::CreateReadback(device, source, readback, footprint, total);
+    if (FAILED(hr))
+    {
+        Log("screenshot readback create failed: %ux%u fmt=%u hr=0x%08X",
+            static_cast<unsigned int>(source.Width), static_cast<unsigned int>(source.Height),
+            static_cast<unsigned int>(source.Format), static_cast<unsigned int>(hr));
+        return false;
+    }
+    g_screenshot_readback = readback;
+    g_screenshot_width = static_cast<unsigned int>(source.Width);
+    g_screenshot_height = static_cast<unsigned int>(source.Height);
+    g_screenshot_format = source.Format;
+    g_screenshot_row_pitch = footprint.Footprint.RowPitch;
+    g_screenshot_total_bytes = total;
+    return true;
+}
+
+static void ConvertScreenshotToRgba(const unsigned char *source, unsigned char *destination)
+{
+    const UINT width = g_screenshot_width;
+    const UINT height = g_screenshot_height;
+    for (UINT y = 0; y < height; ++y)
+    {
+        const unsigned char *row = source + static_cast<size_t>(y) * g_screenshot_row_pitch;
+        unsigned char *out = destination + static_cast<size_t>(y) * width * 4;
+        for (UINT x = 0; x < width; ++x)
+        {
+            const unsigned char *pixel = row + static_cast<size_t>(x) * 4;
+            switch (g_screenshot_format)
+            {
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+                out[0] = pixel[2]; out[1] = pixel[1]; out[2] = pixel[0]; out[3] = pixel[3];
+                break;
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+                out[0] = pixel[0]; out[1] = pixel[1]; out[2] = pixel[2]; out[3] = pixel[3];
+                break;
+            case DXGI_FORMAT_R10G10B10A2_UNORM:
+            {
+                unsigned int value = 0;
+                memcpy(&value, pixel, sizeof(value));
+                out[0] = static_cast<unsigned char>((value & 0x3FFu) * 255u / 1023u);
+                out[1] = static_cast<unsigned char>(((value >> 10) & 0x3FFu) * 255u / 1023u);
+                out[2] = static_cast<unsigned char>(((value >> 20) & 0x3FFu) * 255u / 1023u);
+                out[3] = 255;
+                break;
+            }
+            default:
+                out[0] = pixel[0]; out[1] = pixel[1]; out[2] = pixel[2]; out[3] = 255;
+                break;
+            }
+            out += 4;
+        }
+    }
+}
+
+static void PollScreenshotReadback()
+{
+    if (!g_screenshot_pending.load(std::memory_order_acquire))
+        return;
+    if (!g_proxy_fence || !g_screenshot_readback || g_screenshot_total_bytes == 0)
+    {
+        g_screenshot_pending.store(false, std::memory_order_release);
+        return;
+    }
+    if (g_proxy_fence->GetCompletedValue() < g_screenshot_fence_value.load(std::memory_order_relaxed))
+        return;
+    g_screenshot_pending.store(false, std::memory_order_release);
+
+    void *mapped = nullptr;
+    const D3D12_RANGE read_range = {0, static_cast<SIZE_T>(g_screenshot_total_bytes)};
+    const HRESULT hr = g_screenshot_readback->Map(0, &read_range, &mapped);
+    if (FAILED(hr) || mapped == nullptr)
+    {
+        Log("screenshot readback map failed: hr=0x%08X", static_cast<unsigned int>(hr));
+        return;
+    }
+    std::vector<unsigned char> rgba(
+        static_cast<size_t>(g_screenshot_width) * g_screenshot_height * 4, 255);
+    ConvertScreenshotToRgba(static_cast<const unsigned char *>(mapped), rgba.data());
+    const std::wstring path = BuildScreenshotPath();
+    const bool saved = SaveScreenshotPng(path, rgba, g_screenshot_width, g_screenshot_height);
+    g_screenshot_readback->Unmap(0, nullptr);
+    if (saved)
+        Log("NR screenshot saved: %ls", path.c_str());
+    else
+        Log("NR screenshot failed: %ls", path.c_str());
+}
+
 static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
     ID3D12Resource *generated_source, ID3D12Resource *original_source,
     bool has_generated_frame, unsigned int generated_count = 1,
     ID3D12Resource *generated_source_2 = nullptr,
     ID3D12Resource *generated_source_3 = nullptr)
 {
+    PollScreenshotReadback();
     if (g_proxy_hidden || g_proxy_transition_hold || g_sr_frames.load() == 0 || real_source == nullptr ||
         original_source == nullptr || g_proxy_swapchain == nullptr)
     {
@@ -11114,6 +11389,24 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
         auto rtv = g_proxy_rtv_heap->GetCPUDescriptorHandleForHeapStart(); rtv.ptr += buffer_index * g_proxy_rtv_stride;
         list->OMSetRenderTargets(1, &rtv, FALSE, nullptr); list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
         list->DrawInstanced(3, 1, 0, 0);
+        bool screenshot_recorded = false;
+        if (present_index == 0 && !g_screenshot_pending.load(std::memory_order_relaxed) &&
+            g_screenshot_request.exchange(false, std::memory_order_acq_rel) &&
+            GetTickCount64() - g_screenshot_last_tick.load(std::memory_order_relaxed) < 1500 &&
+            EnsureScreenshotReadback(device.Get(), destination.Get()))
+        {
+            D3D12_RESOURCE_BARRIER to_copy = Transition(destination.Get(),
+                D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_SOURCE);
+            list->ResourceBarrier(1, &to_copy);
+            D3D12_PLACED_SUBRESOURCE_FOOTPRINT footprint = {};
+            const auto texture_desc = destination->GetDesc();
+            device->GetCopyableFootprints(&texture_desc, 0, 1, 0, &footprint, nullptr, nullptr, nullptr);
+            nr_screenshot::CopyToReadback(list, destination.Get(), g_screenshot_readback.Get(), footprint);
+            D3D12_RESOURCE_BARRIER to_target = Transition(destination.Get(),
+                D3D12_RESOURCE_STATE_COPY_SOURCE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+            list->ResourceBarrier(1, &to_target);
+            screenshot_recorded = true;
+        }
         list->ResourceBarrier(end_count, barriers + begin_count);
         if (record_proxy_gpu)
         {
@@ -11150,6 +11443,12 @@ static bool PresentProxySourcesOnWorker(ID3D12Resource *real_source,
             return false;
         }
         g_proxy_command_fence_values[command_slot] = g_proxy_fence_value;
+        if (screenshot_recorded)
+        {
+            g_screenshot_fence_value.store(g_proxy_fence_value.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            g_screenshot_pending.store(true, std::memory_order_release);
+        }
         // ResizeBuffers can destroy the primary ReShade runtime after this
         // worker passed the function-entry guard but while it was pacing or
         // recording. Never enter an injected DXGI Present hook with that
