@@ -1,5 +1,16 @@
 # 回归检查
 
+审查整改的针对性检查：
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-ReviewRegression.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-CoreRecordSafety.ps1
+```
+
+前者编译并测试实际管道 I/O、控制中心应用回调与旧桌面控制台的配置读写，再编译实际 x86 桥接插件。覆盖管道分段读取、读写超时、取消后的下一次读取、对端退出、token 双向请求与过期结果、NR 关闭时的输入帧率、关闭窗口等待当前任务并应用结果、取消排队任务，以及不依赖调整窗口尺寸的 D2D 绘制目标恢复。测试仅创建隐藏窗口和自身的短时子进程，不启动游戏或私有运行库。后者检查 PS 异常记录、未授权残留、个人数据路径、类型不符与目录链接均不会扩大删除范围，失败时保留记录。两者输出仅在工作区 `_scratch/dlss5-aio/`。
+
+`Build-ControlCenter.ps1` 另负责最终产物的四个内置方案复制与哈希检查；编译与隔离检查不代替真实游戏、驱动挂起和干净系统验收。
+
 原生控制中心核心检查在维护仓库运行：
 
 ```powershell

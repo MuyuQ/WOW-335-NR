@@ -292,6 +292,7 @@ void AppShutdown(App& app) {
 
 void AppSetStatus(App& app, const std::wstring& text) {
     app.statusNote = text;
+    DiagLine(text);
     app.log.Add(text);
     app.dirty = true;
 }
@@ -329,7 +330,7 @@ void AppBumpGeneration(App& app) {
     app.toolRun.action.clear();
     app.toolRun.error.clear();
     app.toolRun.detail.clear();
-    ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
     app.restoreArmed = false;
     app.logViewer = App::LogViewer{};
     app.gpuStats = control_center::GpuStats{};
@@ -339,6 +340,7 @@ void AppBumpGeneration(App& app) {
     app.lastPanelCheck = 0;
     app.lastPanelLog.clear();
     app.lastWatchLog.clear();
+    app.fpsSaving = false;
     app.fpsFrontText.clear();
     app.fpsBackText.clear();
     app.fpsEditFocus = 0;
@@ -375,6 +377,7 @@ void AppSelectClient(App& app, const std::wstring& root, bool remember) {
 }
 
 void AppRequestSnapshot(App& app, bool verifyHashes) {
+    if (app.closeRequested) return;
     if (app.clientRoot.empty()) {
         app.snapshot = ClientSnapshot{};
         app.snapshotReady = false;
@@ -450,6 +453,7 @@ void AppRequestSnapshot(App& app, bool verifyHashes) {
 }
 
 void AppRequestClientScan(App& app) {
+    if (app.closeRequested) return;
     if (app.scanLoading) return;
     app.scanLoading = true;
     auto result = std::make_shared<std::vector<ClientCandidate>>();
@@ -477,6 +481,7 @@ void AppRequestClientScan(App& app) {
 }
 
 void AppRequestInstallPreview(App& app) {
+    if (app.closeRequested) return;
     if (app.clientRoot.empty()) {
         app.install = InstallSummary{};
         app.install.ready = true;
@@ -539,6 +544,7 @@ void AppRequestInstallPreview(App& app) {
 }
 
 void AppRequestUninstallPreview(App& app) {
+    if (app.closeRequested) return;
     if (app.clientRoot.empty()) {
         app.uninstall = UninstallSummary{};
         app.uninstall.ready = true;
@@ -640,6 +646,7 @@ void AppRequestUninstallPreview(App& app) {
 // ===========================================================================
 
 void AppRequestAdvanced(App& app) {
+    if (app.closeRequested) return;
     if (app.advanced.loading) return;
     if (app.clientRoot.empty()) {
         app.advanced.loaded = true;
@@ -651,12 +658,12 @@ void AppRequestAdvanced(App& app) {
     app.advanced.error.clear();
     const std::wstring client = app.clientRoot;
     const std::uint64_t generation = app.generation;
-    const std::uint64_t token = ++app.advanced.token;
+    const std::uint64_t token = ++app.advanced.readToken;
     auto result = std::make_shared<AdvancedReadTaskResult>();
     const bool posted = app.jobs.Post(
         [result, client]() { *result = RunAdvancedReadTask(client); },
         [&app, result, generation, token](const std::wstring& error) {
-            if (generation != app.generation || token != app.advanced.token) return;
+            if (generation != app.generation || token != app.advanced.readToken) return;
             app.advanced.loading = false;
             app.advanced.loaded = true;
             app.dirty = true;
@@ -683,17 +690,19 @@ void AppRequestAdvanced(App& app) {
 }
 
 void AppRequestSchemes(App& app) {
+    if (app.closeRequested) return;
     if (app.advanced.schemesLoading) return;
     app.advanced.schemesLoading = true;
     app.advanced.schemesError.clear();
     const std::wstring builtinRoot = Ds5BuiltinSchemesRoot(app.paths.exeDir);
     const std::wstring userRoot = Ds5UserSchemesRoot(app.paths.dataDir);
-    const std::uint64_t token = ++app.advanced.token;
+    const std::uint64_t token = ++app.advanced.schemesToken;
+    const std::uint64_t generation = app.generation;
     auto result = std::make_shared<SchemesTaskResult>();
     const bool posted = app.jobs.Post(
         [result, builtinRoot, userRoot]() { *result = RunSchemesListTask(builtinRoot, userRoot); },
-        [&app, result, token](const std::wstring& error) {
-            if (token != app.advanced.token) return;
+        [&app, result, token, generation](const std::wstring& error) {
+            if (generation != app.generation || token != app.advanced.schemesToken) return;
             app.advanced.schemesLoading = false;
             app.advanced.schemesLoaded = true;
             app.dirty = true;
@@ -865,7 +874,33 @@ void AppRestoreCandidateDefaults(App& app) {
 
 // 运行时遥测：进程关联 + 载体共享内存快照。只读、可丢弃；主页约每秒两次。
 // 结果 apply 时校验令牌与客户端，避免切换客户端后显示旧任务的数值。
+// SourceFps measures input Presents at the carrier, not successful NR evaluations.
+void ApplyTelemetryRates(App& app, const control_center::TelemetrySample& sample) {
+    if (sample.available) {
+        app.fpsSource = static_cast<double>(sample.sourceFps);
+        if (app.sampleAt < 0.0) {
+            // 输出帧率先建基线；输入帧率直接使用载体公布的测量值。
+            app.sampleAt = sample.timestampSeconds;
+            app.sampleFrames = static_cast<double>(sample.framesPresented);
+        } else {
+            const double delta = sample.timestampSeconds - app.sampleAt;
+            if (delta >= 0.5) {
+                const double output =
+                    (static_cast<double>(sample.framesPresented) - app.sampleFrames) / delta;
+                if (output >= 0.0 && output < 1000.0) app.fpsOutput = output;
+                app.sampleAt = sample.timestampSeconds;
+                app.sampleFrames = static_cast<double>(sample.framesPresented);
+            }
+        }
+    } else {
+        app.fpsSource = -1.0;
+        app.fpsOutput = -1.0;
+        app.sampleAt = -1.0;
+    }
+}
+
 void AppRequestTelemetry(App& app) {
+    if (app.closeRequested) return;
     if (app.clientRoot.empty()) {
         app.telemetryPolling = false;
         app.gameRunning = false;
@@ -925,31 +960,7 @@ void AppRequestTelemetry(App& app) {
 
             const control_center::TelemetrySample& sample = result->sample;
             app.telemetry = sample;
-            if (sample.available) {
-                if (app.sampleAt < 0.0) {
-                    // 第一秒只建基线，不出数（与旧界面一致）。
-                    app.sampleAt = sample.timestampSeconds;
-                    app.sampleNr = static_cast<double>(sample.nrFrames);
-                    app.sampleFrames = static_cast<double>(sample.framesPresented);
-                } else {
-                    const double delta = sample.timestampSeconds - app.sampleAt;
-                    if (delta >= 0.5) {
-                        const double source =
-                            (static_cast<double>(sample.nrFrames) - app.sampleNr) / delta;
-                        const double output =
-                            (static_cast<double>(sample.framesPresented) - app.sampleFrames) / delta;
-                        if (source >= 0.0 && source < 1000.0) app.fpsSource = source;
-                        if (output >= 0.0 && output < 1000.0) app.fpsOutput = output;
-                        app.sampleAt = sample.timestampSeconds;
-                        app.sampleNr = static_cast<double>(sample.nrFrames);
-                        app.sampleFrames = static_cast<double>(sample.framesPresented);
-                    }
-                }
-            } else {
-                app.fpsSource = -1.0;
-                app.fpsOutput = -1.0;
-                app.sampleAt = -1.0;
-            }
+            ApplyTelemetryRates(app, sample);
             if (app.debugOverlay) {
                 DiagLine(Fmt(L"遥测：游戏=%d 载体=%d 未识别=%d 快照=%d 源=%.1f 输出=%.1f 备注=%s",
                              app.gameProcessCount, app.hostProcessCount, app.unidentifiedProcesses,
@@ -1283,6 +1294,7 @@ void AppHandleWheel(App& app, int wheelDelta) {
 }
 
 void AppHandleKey(App& app, WPARAM key) {
+    if (app.closeRequested) return;
     if (key == VK_F9) {
         const int next = (app.pageTransitionStyle + 1) % kPageTransitionStyleCount;
         app.pageTransitionStyle = next;
@@ -1323,6 +1335,12 @@ void AppTick(App& app) {
     static ULONGLONG lastPoll = 0;
     static ULONGLONG lastTelemetry = 0;
     const ULONGLONG now = GetTickCount64();
+    if (app.closeRequested) {
+        app.jobs.DrainApply();
+        if (app.jobs.HasExited()) { app.jobs.DrainApply(); DestroyWindow(app.hwnd); return; }
+        InvalidateRect(app.hwnd, nullptr, FALSE);
+        return;
+    }
     // 帧率输入框的插入符闪烁。
     if (app.fpsEditFocus != 0 && now - app.fpsCaretTick >= 500) {
         app.fpsCaretTick = now;
@@ -1396,10 +1414,6 @@ void AppTick(App& app) {
 
 void AppRender(App& app) {
     static int renderCount = 0;
-    if (!app.gfx.DeviceReady()) {
-        if (renderCount < 5) DiagLine(L"渲染：设备为空，跳过");
-        return;
-    }
     if (app.gfx.ClientWidthDip() <= 1.0f || app.gfx.ClientHeightDip() <= 1.0f) return;
 
     const double frameStart = NowMs();
@@ -1584,6 +1598,7 @@ void AppSyncSchemeNameEdit(App& app) {
 // 动作分发
 // ===========================================================================
 void AppHandleClick(App& app) {
+    if (app.closeRequested) return;
     const std::string id = app.ui.clicked;
     if (id.empty()) return;
     DiagLine(Fmt(L"动作：id=%s page=%d wizardStep=%d", cc::Utf8ToWide(id).c_str(),
@@ -2025,10 +2040,12 @@ void AppSaveFpsCap(App& app) {
     app.fpsSaving = true;
     app.dirty = true;
     const std::wstring clientRoot = app.clientRoot;
+    const std::uint64_t generation = app.generation;
     auto result = std::make_shared<control_center::ConfigWtfWriteResult>();
     const bool posted = app.jobs.Post(
         [clientRoot, front, back, result]() { *result = control_center::SaveConfigFpsCap(clientRoot, front, back); },
-        [&app, result, front, back](const std::wstring& error) {
+        [&app, result, front, back, generation, clientRoot](const std::wstring& error) {
+            if (generation != app.generation || !SamePath(clientRoot, app.clientRoot)) return;
             app.fpsSaving = false;
             app.dirty = true;
             if (!error.empty()) {
@@ -2137,7 +2154,8 @@ void AppLaunchOrPanel(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"game";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<GameStartTaskResult>();
     const std::wstring client = app.clientRoot;
@@ -2188,7 +2206,8 @@ void AppStartPanel(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"panel";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<PanelStartTaskResult>();
     const std::wstring exeDir = app.paths.exeDir;
@@ -2233,7 +2252,8 @@ void AppOpenPanelLog(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"panellog";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<LogTailTaskResult>();
     const std::wstring logDir = app.lastPanelLog;
@@ -2265,7 +2285,8 @@ void AppOpenCarrierLog(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"carrierlog";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<LogTailTaskResult>();
     const std::wstring logDir = app.lastWatchLog;
@@ -2289,6 +2310,7 @@ void AppOpenCarrierLog(App& app) {
 }
 
 void AppRequestGpuStats(App& app) {
+    if (app.closeRequested) return;
     if (app.gpuPolling) return;
     app.gpuPolling = true;
     auto result = std::make_shared<GpuStatsTaskResult>();
@@ -2322,7 +2344,8 @@ void AppExportDiagnostics(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"diagnostics";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<DiagnosticsTaskResult>();
     const std::wstring client = app.clientRoot;
@@ -2370,7 +2393,8 @@ void AppExportManifestList(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"manifest";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<ManifestListTaskResult>();
     const std::wstring client = app.clientRoot;
@@ -2418,7 +2442,8 @@ void AppRestoreInstall(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"restore";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<RestoreTaskResult>();
     const std::wstring client = app.clientRoot;
@@ -2468,7 +2493,8 @@ void AppStartWindowWatch(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"watch";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<WindowWatchTaskResult>();
     const std::wstring productRoot = app.paths.exeDir;
@@ -2513,7 +2539,8 @@ void AppTogglePipeline(App& app) {
     app.toolRun = App::ToolRun{};
     app.toolRun.running = true;
     app.toolRun.action = L"pipeline";
-    const std::uint64_t token = ++app.toolRun.token;
+    app.toolRun.token = ++app.toolToken;
+    const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
     auto result = std::make_shared<PipelineToggleTaskResult>();
     const std::wstring client = app.clientRoot;
@@ -2877,7 +2904,16 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
             }
             return 0;
         case WM_CLOSE:
-            DestroyWindow(hwnd);
+            if (gReady && gApp != nullptr) {
+                if (!gApp->closeRequested) {
+                    gApp->closeRequested = true;
+                    cc::AppSetStatus(*gApp, L"正在退出：取消未开始的任务，等待当前任务安全结束…");
+                    gApp->jobs.RequestStop();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            } else {
+                DestroyWindow(hwnd);
+            }
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, kTickTimer);
@@ -2895,6 +2931,19 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) 
 // 程序入口
 // ===========================================================================
 int APIENTRY wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int) {
+    struct InstanceGuard {
+        HANDLE handle = CreateMutexW(nullptr, TRUE, L"Local\\WOW335NR-ControlCenter-UI");
+        DWORD error = GetLastError();
+        ~InstanceGuard() { if (handle) CloseHandle(handle); }
+    } instanceGuard;
+    if (!instanceGuard.handle) return 1;
+    if (instanceGuard.error == ERROR_ALREADY_EXISTS) {
+        if (HWND existing = FindWindowW(kWindowClass, nullptr)) {
+            ShowWindow(existing, SW_RESTORE);
+            SetForegroundWindow(existing);
+        }
+        return 0;
+    }
     gStartTick = GetTickCount64();
     EnableDpiAwareness();
     const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);

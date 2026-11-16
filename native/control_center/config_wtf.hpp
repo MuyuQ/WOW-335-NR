@@ -13,6 +13,7 @@
 //     when verification fails
 #include <windows.h>
 #include <tlhelp32.h>
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -358,6 +359,7 @@ inline ConfigWtfWriteResult SaveConfigFpsCap(const std::wstring& clientRoot, int
     std::vector<Splice> splices;
     for (const auto& match : frontMatches) splices.push_back({match.valueBegin, match.valueEnd, &frontText});
     for (const auto& match : backMatches) splices.push_back({match.valueBegin, match.valueEnd, &backText});
+    std::sort(splices.begin(), splices.end(), [](const Splice& a, const Splice& b) { return a.begin < b.begin; });
     std::string updated = body;
     for (size_t index = splices.size(); index > 0; --index) {
         const Splice& splice = splices[index - 1];

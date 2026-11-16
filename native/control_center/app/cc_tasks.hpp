@@ -318,7 +318,7 @@ inline RepairTaskResult RunRepairTask(const std::wstring& clientRoot, const cont
     std::wstring canonicalOperation, canonicalRoot;
     if (!CanonicalLocalPath(operation, canonicalOperation) || !CanonicalLocalPath(OperationsRoot(paths), canonicalRoot) ||
         !WithinRoot(canonicalOperation, canonicalRoot)) {
-        result.error = L"安装记录中的操作目录不安全。";
+        result.error = L"安装记录不在本控制中心的事务目录内；请使用原安装入口修复，不要手动移动记录。";
         return result;
     }
     progress->stage.store(0);

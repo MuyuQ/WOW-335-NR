@@ -186,7 +186,29 @@ function Test-Dlss5ClientRecord([string]$Client) {
     if (-not [IO.File]::Exists($path)) { return $null }
     try {
         $record = [IO.File]::ReadAllText($path, [Text.UTF8Encoding]::new($false, $true)) | ConvertFrom-Json
-        if ($record.schema -ne 1 -or -not $record.entries) { return $null }
+        if ($record.schema -ne 1 -or $record.status -ne 'installed' -or
+            $record.entries -isnot [array] -or $record.entries.Count -eq 0) { return $null }
+        # A client record describes history; only release metadata authorizes targets.
+        # Historical payload hashes may differ from the current release.
+        $lock = Get-Dlss5Lock
+        $seen = @{}
+        foreach ($entry in $record.entries) {
+            $target = [string]$entry.target
+            $null = Get-MemberPath $Client $target
+            $known = @($lock.members | Where-Object { [string]$_.target -eq $target })
+            if ($seen.ContainsKey($target) -or $known.Count -ne 1 -or
+                $entry.sha256 -isnot [string] -or $entry.sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                $entry.replaces_original -isnot [bool] -or
+                $entry.replaces_original -ne [bool]$known[0].replaces_original) { return $null }
+            $seen[$target] = $true
+            if ($entry.pre_state -eq 'present') {
+                if ($entry.backup -isnot [string] -or $entry.backup -ne $target -or
+                    $entry.previous_sha256 -isnot [string] -or
+                    $entry.previous_sha256 -cnotmatch '^[0-9a-f]{64}$') { return $null }
+                $null = Get-MemberPath (Get-MemberPath $Client 'host64/dlss5-backup') $entry.backup
+            } elseif ($entry.pre_state -ne 'absent' -or $null -ne $entry.backup -or
+                      $null -ne $entry.previous_sha256) { return $null }
+        }
         return [pscustomobject]@{ Path = $path; Record = $record;
             BackupRoot = (Get-MemberPath $Client 'host64/dlss5-backup') }
     } catch { return $null }
@@ -516,7 +538,7 @@ function Get-VerifiedOperation([string]$Operation) {
     $operationFull = Get-CanonicalPath $Operation
     if (-not (Test-Within $operationFull $script:OperationsRoot) -or
         -not ([IO.Path]::GetDirectoryName($operationFull).Equals($script:OperationsRoot, [StringComparison]::OrdinalIgnoreCase))) {
-        throw '事务记录不在受控目录。'
+        throw '事务记录不在本 PowerShell 入口的受控目录；请使用原安装入口修复或恢复，不要手动移动记录。'
     }
     Assert-NoReparse $operationFull
     $recordPath = Get-MemberPath $operationFull 'transaction.json'
@@ -625,7 +647,7 @@ function Invoke-Dlss5Uninstall {
     param([Parameter(Mandatory)][string]$Client, [switch]$KeepRecord)
     Assert-ProcessesStopped
     $lock = Get-Dlss5Lock
-    $null = Get-Dlss5Manifest
+    $trustedManifest = Get-Dlss5Manifest
     $clientFull = Assert-Client $Client $lock
     $recordInfo = Test-Dlss5ClientRecord $clientFull
     if ($null -eq $recordInfo) {
@@ -646,15 +668,40 @@ function Invoke-Dlss5Uninstall {
         foreach ($item in @($recordInfo.Record.residue)) {
             $rel = [string](Get-ManifestField $item 'path')
             if (-not $rel) { continue }
-            if ([string](Get-ManifestField $item 'policy') -ne 'delete') { $reported += $rel; continue }
+            $kind = [string](Get-ManifestField $item 'kind')
+            $trusted = @($trustedManifest.Residue | Where-Object {
+                [string](Get-ManifestField $_ 'path') -eq $rel -and
+                [string](Get-ManifestField $_ 'kind') -eq $kind -and
+                [string](Get-ManifestField $_ 'policy') -eq 'delete'
+            })
+            if ([string](Get-ManifestField $item 'policy') -ne 'delete' -or $trusted.Count -ne 1) {
+                $reported += $rel; continue
+            }
             if ($rel -like '%*%') { $reported += $rel; continue }
             try {
                 $path = Get-MemberPath $clientFull $rel
-                if ([IO.Directory]::Exists($path)) { [IO.Directory]::Delete($path, $true); $removed += $rel }
-                elseif ([IO.File]::Exists($path)) { [IO.File]::Delete($path); $removed += $rel }
+                if ([IO.Directory]::Exists($path)) {
+                    if ($kind -ne 'tree') { throw '残留类型变化，保留现状。' }
+                    $pending = [Collections.Generic.Stack[string]]::new()
+                    $pending.Push($path)
+                    while ($pending.Count) {
+                        $directory = $pending.Pop()
+                        Assert-NoReparse $directory
+                        foreach ($child in Get-ChildItem -LiteralPath $directory -Force -ErrorAction Stop) {
+                            if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw '残留目录包含链接，保留现状。' }
+                            if ($child.PSIsContainer) { $pending.Push($child.FullName) }
+                        }
+                    }
+                    Assert-NoReparse $path
+                    [IO.Directory]::Delete($path, $true); $removed += $rel
+                } elseif ([IO.File]::Exists($path)) {
+                    if ($kind -ne 'file') { throw '残留类型变化，保留现状。' }
+                    [IO.File]::Delete($path); $removed += $rel
+                }
             } catch { $report.errors = @($report.errors) + @("残留 $rel：$($_.Exception.Message)") }
         }
         try {
+            if (@($report.errors).Count) { throw '残留清理未完成，保留安装记录与备份供重试。' }
             if ([IO.Directory]::Exists($recordInfo.BackupRoot)) { [IO.Directory]::Delete($recordInfo.BackupRoot, $true) }
             if (-not $KeepRecord -and [IO.File]::Exists($recordInfo.Path)) { [IO.File]::Delete($recordInfo.Path) }
         } catch { $report.errors = @($report.errors) + @("清理安装记录：$($_.Exception.Message)") }

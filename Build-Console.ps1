@@ -64,7 +64,7 @@ try {
     foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $old[$name], 'Process') }
 }
 $headers = [ordered]@{}
-foreach ($name in @('tiers.hpp','atomic_text.hpp')) {
+foreach ($name in @('tiers.hpp','atomic_text.hpp','control_center/config_wtf.hpp','control_center/client_identity.hpp','control_center/guarded_path.hpp','control_center/member_path.hpp')) {
     $headers[$name] = (Get-FileHash -LiteralPath (Join-Path $PSScriptRoot ('native/' + $name)) -Algorithm SHA256).Hash.ToLowerInvariant()
 }
 $record = [ordered]@{ headers_sha256 = $headers; schema = 1; state = 'compiled_candidate_not_game_validated'; compiler = $install;

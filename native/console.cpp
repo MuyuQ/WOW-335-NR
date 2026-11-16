@@ -1,7 +1,7 @@
 // WOW-335-NR 控制台：桌面端一站式程序。
 // - 启动游戏、保活游戏内悬浮面板（dlss5-panel.exe）
 // - 展示遥测（NR/FG 帧数、输出帧率、图层覆盖）
-// - 源帧率上限读写（Config.wtf 的 SET MaxFPS / MaxFPSBackground）
+// - 源帧率上限读写（Config.wtf 的 SET maxFPS / maxFPSBK）
 // 调参由游戏内悬浮面板经 live-params 通道实时写入载体插件；本程序读同一参数模型做展示与档位识别。
 #include <windows.h>
 #include <d3d11.h>
@@ -25,6 +25,7 @@
 #include "backends/imgui_impl_win32.h"
 #include "tiers.hpp"
 #include "atomic_text.hpp"
+#include "control_center/config_wtf.hpp"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
@@ -313,55 +314,19 @@ static std::wstring g_config_wtf;
 
 static void ReadMaxFps()
 {
-    g_max_fps = g_max_fps_background = -1;
-    HANDLE file = CreateFileW(g_config_wtf.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) return;
-    std::string text;
-    char buf[4096]{};
-    DWORD read = 0;
-    while (ReadFile(file, buf, sizeof buf, &read, nullptr) && read) text.append(buf, read);
-    CloseHandle(file);
-    auto find = [&](const char *key) {
-        const std::string needle = std::string("SET ") + key + " \"";
-        size_t pos = text.find(needle);
-        if (pos == std::string::npos) return -1;
-        pos += needle.size();
-        const size_t end = text.find('"', pos);
-        if (end == std::string::npos) return -1;
-        return atoi(text.substr(pos, end - pos).c_str());
-    };
-    g_max_fps = find("MaxFPS");
-    g_max_fps_background = find("MaxFPSBackground");
+    const auto caps = control_center::ReadConfigFpsCap(g_client_dir);
+    g_max_fps = caps.readable ? caps.front : -1;
+    g_max_fps_background = caps.readable ? caps.back : -1;
 }
 
 static const char *g_fps_save_status = "";
 static bool WriteMaxFps(int fps, int bg)
 {
-    const bool saved = nr_files::EditText(g_config_wtf, [&](std::string &text) {
-        auto set_line = [&](const char *key, int value) {
-            const std::string needle = std::string("SET ") + key + " \"";
-            const size_t pos = text.find(needle);
-            char line[64];
-            std::snprintf(line, sizeof line, "SET %s \"%d\"", key, value);
-            if (pos == std::string::npos) {
-                if (!text.empty() && text.back() != '\n') text += "\n";
-                text += line;
-                text += "\n";
-            } else {
-                const size_t vstart = pos + needle.size();
-                const size_t vend = text.find('"', vstart);
-                if (vend != std::string::npos)
-                    text = text.substr(0, vstart) + std::to_string(value) + text.substr(vend);
-            }
-        };
-        set_line("MaxFPS", fps);
-        set_line("MaxFPSBackground", bg);
-        return true;
-    });
+    const auto saved = control_center::SaveConfigFpsCap(g_client_dir, fps, bg);
     if (!saved) {
-        g_fps_save_status = "保存失败：原配置保留，请检查文件权限或占用。";
-        DebugLogF("maxfps save failed: %ls error=%lu", g_config_wtf.c_str(), GetLastError());
+        g_fps_save_status = saved.error == control_center::ConfigWtfWriteError::GameRunning
+            ? "请先退出游戏再保存。" : "保存失败，请检查数值范围、文件权限或占用；原配置或备份已保留。";
+        DebugLogF("maxfps save failed: %ls error=%lu", g_config_wtf.c_str(), saved.win32Error);
         return false;
     }
     g_max_fps = fps;

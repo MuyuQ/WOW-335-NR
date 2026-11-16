@@ -8,7 +8,7 @@
 //     因此界面状态没有跨线程写入；
 //   - 结果通过 PostMessage 唤醒 UI 线程；UI 侧再校验 generation 与客户端，
 //     切换客户端后旧任务结果被丢弃；
-//   - 队列有上限，满时拒绝入队并立即回调错误，不阻塞 UI。
+//   - 队列有上限，满时返回 false，由调用方显示错误，不阻塞 UI。
 #pragma once
 
 #include <windows.h>
@@ -45,20 +45,28 @@ public:
         hwnd_.store(hwnd, std::memory_order_release);
         std::lock_guard<std::mutex> lock(mutex_);
         if (running_) return;
+        stopping_ = false;
+        exited_ = false;
         running_ = true;
         worker_ = std::thread([this] { Run(); });
     }
 
-    void Stop() {
+    // Discard work that has not started. The current task owns its transaction
+    // and finishes normally; the UI remains alive to apply its result.
+    void RequestStop() {
         {
             std::lock_guard<std::mutex> lock(mutex_);
-            if (!running_) return;
             stopping_ = true;
-            hwnd_.store(nullptr, std::memory_order_release);
+            queue_.clear();
         }
         cv_.notify_all();
+    }
+    bool HasExited() const { return exited_.load(std::memory_order_acquire); }
+    void Stop() {
+        RequestStop();
         if (worker_.joinable()) worker_.join();
-        // 仍未执行的任务在退出时直接丢弃。
+        running_ = false;
+        hwnd_.store(nullptr, std::memory_order_release);
         std::lock_guard<std::mutex> lock(doneMutex_);
         done_.clear();
     }
@@ -102,7 +110,7 @@ private:
             {
                 std::unique_lock<std::mutex> lock(mutex_);
                 cv_.wait(lock, [this] { return stopping_ || !queue_.empty(); });
-                if (stopping_ && queue_.empty()) return;
+                if (stopping_) { exited_.store(true, std::memory_order_release); return; }
                 p = std::move(queue_.front());
                 queue_.pop_front();
             }
@@ -144,6 +152,7 @@ private:
     std::deque<Pending> queue_;
     std::atomic<bool> running_{false};
     bool stopping_ = false;
+    std::atomic<bool> exited_{true};
     std::thread worker_;
 
     std::mutex doneMutex_;

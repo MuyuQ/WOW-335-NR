@@ -525,6 +525,11 @@ void DrawFooter(App& app) {
     g.FillRect(footer, Color(kWindow));
     g.Line(26.0f * u, footer.top + 0.5f, width - 26.0f * u, footer.top + 0.5f, Color(kLineSoft));
 
+    if (app.closeRequested) {
+        auto* format = g.Format(FontUi(), kFontSmall * u, 400, HAlign::Left, VAlign::Middle);
+        g.Text(footer.Inset(24.0f * u, 4.0f * u), L"正在退出：已取消未开始的任务，等待当前任务安全结束…", format, Color(kText));
+        return;
+    }
     struct Action {
         const char* id;
         std::wstring label;

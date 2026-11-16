@@ -1582,18 +1582,17 @@ function Update-RuntimeState {
         }
         $hasTel = ($null -ne $tel -and $tel.Available)
         if ($hasTel) {
+            $script:fpsSource = [double]$tel.SourceFps
             $now = [Diagnostics.Stopwatch]::GetTimestamp() / [double][Diagnostics.Stopwatch]::Frequency
             if ($null -ne $script:lastSample) {
                 $delta = $now - $script:lastSample.At
                 if ($delta -ge 0.5) {
-                    $source = ([double]$tel.NrFrames - $script:lastSample.Nr) / $delta
                     $output = ([double]$tel.FramesPresented - $script:lastSample.Frames) / $delta
-                    if ($source -ge 0 -and $source -lt 1000) { $script:fpsSource = $source }
                     if ($output -ge 0 -and $output -lt 1000) { $script:fpsOutput = $output }
-                    $script:lastSample = @{ At = $now; Nr = [double]$tel.NrFrames; Frames = [double]$tel.FramesPresented }
+                    $script:lastSample = @{ At = $now; Frames = [double]$tel.FramesPresented }
                 }
             } else {
-                $script:lastSample = @{ At = $now; Nr = [double]$tel.NrFrames; Frames = [double]$tel.FramesPresented }
+                $script:lastSample = @{ At = $now; Frames = [double]$tel.FramesPresented }
             }
             if ($null -ne $script:fpsOutput) {
                 $live.Fps.Text = '{0:0.0}' -f $script:fpsOutput

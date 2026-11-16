@@ -50,6 +50,7 @@
 #include <reshade.hpp>
 
 #include "feed_ipc.h"
+#include "pipe_io.hpp"
 #include "feed_fmt.h"  // the DXGI format decisions shared with the host
 #include "feed_gl.h"   // raw-OpenGL interop, the same header the 64-bit add-on uses
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
@@ -872,14 +873,18 @@ static void ArchivePreviousHostReShadeLog()
 
 static bool PipeWrite(const void *buf, DWORD len)
 {
-    DWORD put = 0;
-    return g.pipe != nullptr && WriteFile(g.pipe, buf, len, &put, nullptr) && put == len;
+    if (g.pipe == nullptr) return false;
+    const bool ok = feed_pipe::Write(g.pipe, g.hproc, buf, len);
+    if (!ok) Log("[feed32] pipe write failed or timed out (error %lu)", GetLastError());
+    return ok;
 }
 
 static bool PipeRead(void *buf, DWORD len)
 {
-    DWORD got = 0;
-    return g.pipe != nullptr && ReadFile(g.pipe, buf, len, &got, nullptr) && got == len;
+    if (g.pipe == nullptr) return false;
+    const bool ok = feed_pipe::Read(g.pipe, g.hproc, buf, len);
+    if (!ok) Log("[feed32] pipe read failed or timed out (error %lu)", GetLastError());
+    return ok;
 }
 
 static bool EnsureHost()
@@ -957,7 +962,7 @@ static bool EnsureHost()
     sprintf_s(name, FEED_PIPE_FMT, static_cast<unsigned long>(GetCurrentProcessId()));
     for (int i = 0; i < 150 && g.pipe == nullptr; ++i)   // up to 15 s (host loads ReShade + NGX)
     {
-        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, 0, nullptr);
+        HANDLE p = CreateFileA(name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
         if (p != INVALID_HANDLE_VALUE) { g.pipe = p; break; }
         if (!HostAlive()) { HostLost("exited during startup"); return false; }
         Sleep(100);

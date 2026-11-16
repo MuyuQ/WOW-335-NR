@@ -234,6 +234,26 @@ void TestGameRunningGate(const std::wstring& root) {
     Check(static_cast<bool>(after), "save must succeed after the game exits");
 }
 
+void TestReorderedAndInterleavedKeys(const std::wstring& root) {
+    const std::string inputs[] = {
+        "SET maxFPSBK \"9\"\r\nSET maxFPS \"30\"\r\nSET locale \"zhCN\"\r\n",
+        "SET maxFPS \"9\"\nSET maxFPSBK \"7\"\nSET maxFPS \"30\"\nSET maxFPSBK \"40\"\nSET locale \"zhCN\"\n"
+    };
+    for (size_t i = 0; i < 2; ++i) {
+        const auto client = MakeClient(root, (L"reordered-" + std::to_wstring(i)).c_str(), inputs[i]);
+        const auto saved = SaveConfigFpsCap(client, 60, 120);
+        Check(static_cast<bool>(saved), "reordered/interleaved key save");
+        const auto caps = ReadConfigFpsCap(client);
+        Check(caps.front == 60 && caps.back == 120, "reordered caps readback");
+        std::string bytes; ReadBytes(Join(client, L"WTF\\Config.wtf"), bytes);
+        std::string expected = inputs[i];
+        // Verify every duplicate and unrelated byte, including newline style.
+        if (i == 0) expected = "SET maxFPSBK \"120\"\r\nSET maxFPS \"60\"\r\nSET locale \"zhCN\"\r\n";
+        else expected = "SET maxFPS \"60\"\nSET maxFPSBK \"120\"\nSET maxFPS \"60\"\nSET maxFPSBK \"120\"\nSET locale \"zhCN\"\n";
+        Check(bytes == expected, "only value spans may change");
+    }
+}
+
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
@@ -247,6 +267,7 @@ int wmain(int argc, wchar_t** argv) {
     TestAnsiLfPreservingBytes(root);
     TestAppendMissingKeys(root);
     TestDuplicateKeysAndCaseInsensitivity(root);
+    TestReorderedAndInterleavedKeys(root);
     TestRangeValidation(root);
     TestLockedFile(root);
     TestBackupNamesDoNotCollide(root);

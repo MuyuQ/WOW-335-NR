@@ -68,7 +68,8 @@ struct AdvancedSummary {
     std::vector<Ds5Scheme> schemes;
     std::wstring schemesError;
     // 后台请求令牌：切换客户端或发起新请求后，旧回调直接丢弃。
-    std::uint64_t token = 0;
+    std::uint64_t readToken = 0;
+    std::uint64_t schemesToken = 0;
     // 动作令牌：保存/应用等写操作的请求，不能被并发的加载请求作废。
     std::uint64_t actionToken = 0;
 };
@@ -76,6 +77,7 @@ struct AdvancedSummary {
 struct App {
     HINSTANCE instance = nullptr;
     HWND hwnd = nullptr;
+    bool closeRequested = false;
 
     AppPaths paths;
     Settings settings;
@@ -103,6 +105,7 @@ struct App {
     std::wstring stageRoot;
     std::wstring templateRoot;
     std::uint64_t generation = 1;
+    std::uint64_t toolToken = 0;
 
     ClientSnapshot snapshot;
     bool snapshotReady = false;
@@ -168,7 +171,6 @@ struct App {
     double fpsSource = -1.0;  // 源帧率（帧/秒），未知为 -1
     double fpsOutput = -1.0;  // 输出帧率（帧/秒），未知为 -1
     double sampleAt = -1.0;   // 上次采样时刻（遥测时钟秒）
-    double sampleNr = 0.0;
     double sampleFrames = 0.0;
     std::uint64_t runtimeToken = 0;
 

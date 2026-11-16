@@ -98,6 +98,27 @@ foreach ($name in @('install-manifest.json', 'payload-lock.json')) {
 $templateSource = Join-Path $repo 'templates'
 if (-not (Test-Path -LiteralPath $templateSource)) { throw "缺少模板目录：templates" }
 Copy-Item -LiteralPath $templateSource -Destination (Join-Path $output 'templates') -Recurse
+
+# Built-in schemes are required resources, verified in the final portable layout.
+$schemeSource = Join-Path $repo 'schemes'
+$schemeTarget = Join-Path $output 'schemes'
+[IO.Directory]::CreateDirectory($schemeTarget) | Out-Null
+$schemeHashes = [ordered]@{}
+foreach ($name in @('原画', '轻量', '均衡', '浓郁')) {
+    $source = Join-Path $schemeSource ($name + '.json')
+    $target = Join-Path $schemeTarget ($name + '.json')
+    $scheme = Get-Content -LiteralPath $source -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($scheme.schema -ne 1 -or $scheme.name -ne $name -or $null -eq $scheme.values) {
+        throw "内置方案无效：$name"
+    }
+    Copy-Item -LiteralPath $source -Destination $target
+    $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash.ToLowerInvariant() -ne $hash) {
+        throw "内置方案复制校验失败：$name"
+    }
+    $schemeHashes[('schemes/' + $name + '.json')] = $hash
+}
+
 # 锁文件与面板/助手：便携包自带身份记录；工作区部署位存在运行组件时一并打包到 bin\。
 foreach ($name in @('watcher-lock.json', 'panel-lock.json')) {
     $source = Join-Path $repo $name
@@ -162,6 +183,7 @@ if ($bundled.Contains('window_watch.exe') -and (Test-Path -LiteralPath $watchLoc
 }
 
 $sources = [ordered]@{}
+foreach ($key in $schemeHashes.Keys) { $sources[$key] = $schemeHashes[$key] }
 foreach ($file in (Get-ChildItem -LiteralPath $appDir -File | Where-Object { $_.Extension -in '.cpp', '.hpp', '.h', '.rc', '.ico' } |
                    Sort-Object Name)) {
     $sources[$file.Name] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
@@ -170,7 +192,7 @@ foreach ($file in (Get-ChildItem -LiteralPath $coreDir -File | Where-Object { $_
                    Sort-Object Name)) {
     $sources[('control_center/' + $file.Name)] = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
 }
-$layout = @('WOW-335-NR-ControlCenter.exe', 'install-manifest.json', 'payload-lock.json', 'templates')
+$layout = @('WOW-335-NR-ControlCenter.exe', 'install-manifest.json', 'payload-lock.json', 'templates', 'schemes')
 foreach ($name in @('watcher-lock.json', 'panel-lock.json')) {
     if (Test-Path -LiteralPath (Join-Path $output $name)) { $layout += $name }
 }
@@ -183,6 +205,7 @@ $record = [ordered]@{
     sources = $sources
     executable_sha256 = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
     portable = [ordered]@{
+        scheme_sha256 = $schemeHashes
         layout = $layout
         bundled_binaries = $bundled
         panel_lock_match = $panelLockMatch

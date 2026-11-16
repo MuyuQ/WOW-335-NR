@@ -208,7 +208,7 @@ WoW 3.3.5a 集成方式与日常入口。
   `DLSS5控制台.ini`；也可用 `--game <wow.exe 路径>` 指定并记住。
 - 检测到游戏运行后，若面板未启动，会从控制台所在目录拉起 `dlss5-panel.exe` 并保活。
 - 只读展示载体遥测；参数写入由悬浮面板完成，控制台不直接改载体参数。
-- 读写 `WTF\Config.wtf` 的 `SET MaxFPS` / `SET MaxFPSBackground`。读取或写入失败时停止保存；成功替换保留改前副本 `Config.wtf.nr-*.bak`，备份由用户自行保管。
+- 读写 `WTF\Config.wtf` 的 `SET maxFPS` / `SET maxFPSBK`。读取或写入失败时停止保存；成功替换保留改前副本 `Config.wtf.nr-*.bak`，备份由用户自行保管。
 - 提供悬浮面板日志目录与载体日志目录的打开入口。
 
 ### 游戏内悬浮面板
@@ -265,6 +265,7 @@ window_watch.exe --game <wow.exe 绝对路径>
 - 安装成功后把清单与安装前快照写入客户端内 `host64/dlss5-install-record.json`，
   原件备份写入 `host64/dlss5-backup/`；卸载直接读这份客户端内记录，不依赖 `_scratch`。
   事务记录另存于 `_scratch/dlss5-aio/control-operations/` 供追溯。
+  旧 PowerShell 卸载也会验证记录成员；只删除与当前受信任清单匹配的残留项，未知路径只报告。残留目录含链接时停止该项清理，并保留安装记录供重试。
 - 已退役为日常入口：日常启动游戏和调参请用桌面控制台与悬浮面板。
 
 ## 环境要求
@@ -347,7 +348,13 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build-WindowWatch.ps1
 `version.dll` 由程序按需动态加载，不进入导入表；NVIDIA 运行时 DLL 与 ReShade 仍由用户
 自备，不随包分发。
 
-便携运行：整个候选目录可复制到任意位置直接运行，清单、模板、锁、面板/助手都从产品根读取。
+便携运行：整个候选目录可复制到任意位置直接运行，清单、模板、四个内置方案、锁、面板/助手都从产品根读取。构建会核对四个方案的名称与复制后哈希，记录在 `build.json`。
+
+本地维护源已修复参数读取与方案扫描互相作废、设备绘制目标丢失后无法自动重建、Config.wtf 键顺序影响保存等问题，尚未部署或通过真实游戏验收。关闭原生控制中心时会取消未开始的后台任务，保持窗口并等待当前任务安全结束；已进入执行的写事务不强制中断。同一用户会话只运行一个原生控制中心实例。
+
+原生与 PowerShell 界面的“源帧率”使用遥测 `SourceFps`，表示载体输入 Present 的测量节奏，不再用 NR 成功处理帧数差分。它不保证等于桥接旁路或跳帧期间游戏原始提交的全部帧率。
+
+两种控制中心的安装事务目录不同：原生在 `%LOCALAPPDATA%/WOW-335-NR/operations`，PowerShell 在工作区 `_scratch/dlss5-aio/control-operations`。修复和恢复须使用原安装入口并保留其事务目录；共享客户端内安装记录不代表事务可跨入口迁移。不要手动移动记录来绕过目录检查。
 两种部署布局都支持：
 
 - 便携 / 子目录布局：`<产品根>/WOW-335-NR-ControlCenter.exe` + `<产品根>/bin/dlss5-panel.exe`；

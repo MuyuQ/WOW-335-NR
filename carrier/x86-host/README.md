@@ -35,3 +35,7 @@ of persistent menu keys, labels, choices, defaults, ranges, groups, and concise
 help text. The x86 panel renders that schema generically and writes the same keys
 consumed directly by the x64 addon, so persistent options are no longer
 maintained in a separate 32-bit menu table.
+
+## 本地桥接 I/O 修复
+
+32 位客户端以重叠 I/O 访问管道，单次写入期限为 250 ms，整条读取期限为 5 s；对端进程退出会唤醒等待。超时后先取消并收完未决 I/O，再进入原有宿主排空与关闭流程。上述期限不包含后续 GPU 排空和宿主退出等待。此修改尚未部署或通过真实游戏验收。
