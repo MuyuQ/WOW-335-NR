@@ -172,8 +172,9 @@
       "target": "standalone-dlssnr.addon32",
       "source_kind": "stage",
       "source": "standalone-dlssnr.addon32",
-      "sha256": "3e22a5a020031c2d5f8e6f42c64f9dc9d4b31f390a1d7b9ae442c23b5819df1e",
-      "replaces_original": false
+      "sha256": "8a31df57235a60508f22e723e020ad3a2d34ceb7edad3056407c47cfab3149b6",
+      "replaces_original": false,
+      "note": "Local build from a33678e: bounded and cancellable pipe I/O; deployment verified separately."
     },
     {
       "target": "host64/nvngx_dlssg.dll",

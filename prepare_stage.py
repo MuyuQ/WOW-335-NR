@@ -55,12 +55,17 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     for flag in ("aio-zip", "reshade32", "reshade64", "reshade-fxh", "nr", "sr"):
         parser.add_argument("--" + flag, type=Path, required=True)
+    parser.add_argument("--addon32", type=Path, help="locally built addon32; must match the component lock")
     parser.add_argument("--batch", type=Path, required=True, help="existing isolated DLSS test batch in _scratch")
     parser.add_argument("--name", required=True, help="new staging directory name: letters, digits, dash or underscore")
     args = parser.parse_args()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", args.name):
         parser.error("invalid staging name")
     paths = {key: no_links(getattr(args, key)) for key in ("reshade32", "reshade64", "reshade_fxh", "nr", "sr")}
+    extra = dict(EXTRA)
+    if args.addon32 is not None:
+        paths["addon32"] = no_links(args.addon32)
+        extra["standalone-dlssnr.addon32"] = "addon32"
     archive_path = no_links(args.aio_zip)
     if any(not path.is_file() for path in [archive_path, *paths.values()]):
         parser.error("a required source file is missing")
@@ -75,9 +80,9 @@ def main():
     for member in members:
         safe_member(member["source"])
     expected = {item["source"]: item["sha256"] for item in members}
-    if any(rel not in expected for rel in EXTRA):
+    if any(rel not in expected for rel in extra):
         parser.error("EXTRA inputs do not map to stage members in the lock")
-    for relative, key in EXTRA.items():
+    for relative, key in extra.items():
         if relative not in expected or sha(paths[key]) != expected[relative]:
             parser.error(f"{key} identity differs from the lock")
     batch = no_links(args.batch)
@@ -94,7 +99,7 @@ def main():
         if len(names) != len(set(names)) or archive.testzip() is not None:
             parser.error("AIO archive has duplicate or invalid members")
         for relative in expected:
-            if relative not in EXTRA and relative not in names:
+            if relative not in extra and relative not in names:
                 parser.error(f"AIO archive lacks {relative}")
         target.mkdir(parents=True, exist_ok=False)
         try:
@@ -105,7 +110,7 @@ def main():
                     raise RuntimeError("component destination escaped staging")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 no_links(destination)
-                source = paths[EXTRA[relative]].open("rb") if relative in EXTRA else archive.open(relative, "r")
+                source = paths[extra[relative]].open("rb") if relative in extra else archive.open(relative, "r")
                 with source, destination.open("xb") as stream:
                     shutil.copyfileobj(source, stream, 8 * 1024 * 1024)
                     stream.flush()
@@ -114,6 +119,7 @@ def main():
                     raise RuntimeError(f"component readback mismatch: {relative}")
             result = {"state": "prepared", "created_utc": datetime.now(timezone.utc).isoformat(),
                       "aio_zip_sha256": ZIP_SHA, "member_count": len(expected),
+                      "addon32_sha256": sha(paths["addon32"]) if "addon32" in paths else None,
                       "private_runtime_sources": {key: str(paths[key]) for key in ("nr", "sr")},
                       "note": "Local private staging only; do not include runtime files in diagnostics or distribution."}
             with (target / "stage-record.json").open("x", encoding="utf-8", newline="\n") as stream:

@@ -5,6 +5,7 @@
 ```powershell
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-ReviewRegression.ps1
 powershell.exe -NoProfile -ExecutionPolicy Bypass -File tests/Test-CoreRecordSafety.ps1
+python -X utf8 -B tests/test_stage_override.py
 ```
 
 前者编译并测试实际管道 I/O、控制中心应用回调与旧桌面控制台的配置读写，再编译实际 x86 桥接插件。覆盖管道分段读取、读写超时、取消后的下一次读取、对端退出、token 双向请求与过期结果、NR 关闭时的输入帧率、关闭窗口等待当前任务并应用结果、取消排队任务，以及不依赖调整窗口尺寸的 D2D 绘制目标恢复。测试仅创建隐藏窗口和自身的短时子进程，不启动游戏或私有运行库。后者检查 PS 异常记录、未授权残留、个人数据路径、类型不符与目录链接均不会扩大删除范围，失败时保留记录。两者输出仅在工作区 `_scratch/dlss5-aio/`。
@@ -46,3 +47,5 @@ python -X utf8 -B tools/tests/test_dlss5_stage.py
 核心检查包含补装、补装失败回退、补装事务恢复、后加可选运行库、完整卸载和缺失修复来源。性能检查区分完整时间跨度与有效帧间隔覆盖。测试使用合成文件、ZIP 和遥测，不加载 NVIDIA 私有运行库；全部输出保留在工作区 `_scratch/dlss5-aio/`。
 
 这些检查不替代真实游戏中的 PNG 截图、模型切换、补帧呈现、设备移除和长期稳定性验收。
+
+暂存桥接覆盖检查验证 `--addon32` 只接收锁匹配的本地构建，并拒绝旧压缩包插件和错误身份的本地文件。
