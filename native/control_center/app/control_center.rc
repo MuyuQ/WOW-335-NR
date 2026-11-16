@@ -1,0 +1,6 @@
+// WOW-335-NR 原生控制中心资源脚本：只包含应用图标。
+// 由 Build-ControlCenter.ps1 先运行 rc.exe 生成 control_center.res，再随 exe 链接。
+// 说明：这里直接写数值 ID（101），与 app_icon.h 的 IDI_CONTROL_CENTER_ICON 保持一致——
+// rc.exe 的预处理器不会展开头文件里的宏来做资源名，写宏名会得到字符串资源名，
+// 导致 LoadIconW(MAKEINTRESOURCEW(101)) 找不到图标。
+101 ICON "control_center.ico"

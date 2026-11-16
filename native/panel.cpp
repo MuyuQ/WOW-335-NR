@@ -3,7 +3,7 @@
 //       写 host64\live-params.json → addon64 热应用 NR 参数（0.5 秒内生效）；
 //       直读 Local\DLSS5_AIO_Telemetry_<pid> 共享内存展示运行状态。
 // 边界：结构校验（wow.exe + host64 载体存在且非链接），不启动游戏；
-//       收起态为穿透信息条，展开态可交互；游戏退出即结束。
+//       收起态为右上角可交互信息条（含“展开面板”按钮），展开态为完整面板；游戏退出即结束。
 // 构建：Build-Panel.ps1（/utf-8，MSVC x64 /MT）。
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
@@ -16,6 +16,7 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdarg>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -111,7 +112,7 @@ static const struct { const char *name; Params p; } kSchemes[] = {
 // zh: 「默认/自然/电影」为 033 从引擎契约读出的官方语义；具体视觉差异待实测。
 static const char *kModelNames[3] = { "默认", "自然", "电影" };
 static const char *kModelDesc[3] = {
-    "默认：引擎原始风格。社区观察重绘较保守，观感最接近原画。",
+    "默认：引擎原始风格。社区反馈重绘较保守，观感最接近原画。",
     "自然：引擎的自然向风格（视觉差异待实测）。",
     "电影：引擎的电影向风格；与「自然」实测观感差异细微。",
 };
@@ -230,6 +231,7 @@ struct Telemetry {
     bool available = false;
     bool nr_enabled = false, pipeline_ready = false, processed_visible = false, fg = false;
     bool fg_failed = false;
+    unsigned source_fps = 0, proxy_fps = 0, gpu_us = 0;
     unsigned long long nr_frames = 0, sr_frames = 0, fg_frames = 0, presented = 0;
     unsigned input_w = 0, input_h = 0, output_w = 0, output_h = 0;
     double age = 0;
@@ -260,6 +262,8 @@ static Telemetry ReadTelemetry(DWORD host_pid)
                 const unsigned flags = rd32(48);
                 const unsigned input_w = rd32(56), input_h = rd32(60);
                 const unsigned output_w = rd32(64), output_h = rd32(68);
+                const unsigned source_fps = rd32(72), proxy_fps = rd32(76);
+                const unsigned gpu_us = rd32(116);
                 const unsigned long long nr_frames = rd64(200), sr_frames = rd64(208);
                 const unsigned long long fg_frames = rd64(216), presented = rd64(224);
                 std::atomic_thread_fence(std::memory_order_acquire);
@@ -282,6 +286,9 @@ static Telemetry ReadTelemetry(DWORD host_pid)
                     out.presented = presented;
                     out.input_w = input_w; out.input_h = input_h;
                     out.output_w = output_w; out.output_h = output_h;
+                    out.source_fps = source_fps;
+                    out.proxy_fps = proxy_fps;
+                    out.gpu_us = gpu_us;
                 }
                 break;
             }
@@ -342,91 +349,112 @@ enum class LayerState { NoHost, NoOutput, RawMode, Hidden, UnderGame, Covered };
 static LayerState g_layer = LayerState::NoHost;
 static HWND g_game_hwnd_seen = nullptr;   // 主循环按游戏进程匹配到的窗口
 
-// ===== 视觉主题：与桌面控制台同款（深夜蓝黑 + 祖母绿强调） =====
-static const ImVec4 kAccent(0.239f, 0.839f, 0.549f, 1.0f);     // #3DD68C
-static const ImVec4 kWarn(0.941f, 0.639f, 0.369f, 1.0f);       // #F0A35E
-static const ImVec4 kMuted(0.545f, 0.596f, 0.647f, 1.0f);      // #8B98A5
+// ===== 视觉主题：OpenDesign 面板稿（皮革黑 + 古金 + 苔玉） =====
+// 设计源：Open Design 项目 19b1a0ea-3318-4a61-a3a7-600bbec63ae4（界面重设计·游戏内面板稿 560×640）。
+static const ImU32 kColCanvas = IM_COL32(20, 16, 10, 255);       // #14100a 窗口底
+static const ImU32 kColNavBg = IM_COL32(22, 17, 12, 255);        // #16110c 侧栏
+static const ImU32 kColSurface = IM_COL32(27, 22, 16, 255);      // #1b1610
+static const ImU32 kColSurface2 = IM_COL32(35, 28, 20, 255);     // #231c14
+static const ImU32 kColSurface3 = IM_COL32(44, 35, 24, 255);     // #2c2318
+static const ImU32 kColLine = IM_COL32(58, 46, 31, 255);         // #3a2e1f
+static const ImU32 kColLineSoft = IM_COL32(42, 33, 23, 255);     // #2a2117
+static const ImU32 kColText = IM_COL32(234, 223, 198, 255);      // #eadfc6
+static const ImU32 kColText2 = IM_COL32(194, 178, 149, 255);     // #c2b295
+static const ImU32 kColText3 = IM_COL32(154, 138, 109, 255);     // #9a8a6d
+static const ImU32 kColAccent = IM_COL32(200, 164, 92, 255);     // #c8a45c
+static const ImU32 kColAccentBright = IM_COL32(227, 200, 132, 255);
+static const ImU32 kColAccentInk = IM_COL32(26, 18, 6, 255);     // #1a1206
+static const ImU32 kColAccentSoft = IM_COL32(200, 164, 92, 31);  // rgba(.12)
+static const ImU32 kColAccentLine = IM_COL32(200, 164, 92, 82);  // rgba(.32)
+static const ImU32 kColJade = IM_COL32(109, 171, 134, 255);      // #6dab86
+static const ImU32 kColJadeText = IM_COL32(201, 231, 214, 255);  // #c9e7d6
+static const ImU32 kColJadeSoft = IM_COL32(109, 171, 134, 31);   // rgba(.12)
+static const ImU32 kColJadeLine = IM_COL32(109, 171, 134, 87);   // rgba(.34)
+static const ImU32 kColWarn = IM_COL32(217, 138, 74, 255);       // #d98a4a
+static const ImU32 kColDanger = IM_COL32(191, 95, 82, 255);      // #bf5f52
+static const ImU32 kColKnobLight = IM_COL32(240, 246, 242, 255);
+
+// ===== 字体（正文微软雅黑，数字用 Constantia；加载失败时逐级回退） =====
+static ImFont *g_font_body = nullptr;
+static ImFont *g_font_small = nullptr;
+static ImFont *g_font_h1 = nullptr;
+static ImFont *g_font_num = nullptr;
+static ImFont *g_font_num_sm = nullptr;
+
+static ImFont *AddFirstAvailableFont(const char *const *paths, int count, float size)
+{
+    for (int i = 0; i < count; ++i) {
+        if (ImFont *font = ImGui::GetIO().Fonts->AddFontFromFileTTF(paths[i], size)) return font;
+    }
+    return nullptr;
+}
+
+static void LoadPanelFonts()
+{
+    const float dpi = g_dpi_scale;
+    static const char *body_paths[] = {
+        "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyh.ttf",
+        "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/segoeui.ttf"};
+    static const char *bold_paths[] = {
+        "C:/Windows/Fonts/msyhbd.ttc", "C:/Windows/Fonts/msyhbd.ttf",
+        "C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/simhei.ttf"};
+    static const char *num_paths[] = {
+        "C:/Windows/Fonts/constan.ttf", "C:/Windows/Fonts/georgia.ttf",
+        "C:/Windows/Fonts/times.ttf", "C:/Windows/Fonts/segoeui.ttf"};
+    g_font_body = AddFirstAvailableFont(body_paths, 4, 13.5f * dpi);
+    g_font_small = AddFirstAvailableFont(body_paths, 4, 11.5f * dpi);
+    g_font_h1 = AddFirstAvailableFont(bold_paths, 4, 20.0f * dpi);
+    g_font_num = AddFirstAvailableFont(num_paths, 4, 34.0f * dpi);
+    g_font_num_sm = AddFirstAvailableFont(num_paths, 4, 26.0f * dpi);
+    if (!g_font_body) g_font_body = ImGui::GetIO().Fonts->AddFontDefault();
+    if (!g_font_small) g_font_small = g_font_body;
+    if (!g_font_h1) g_font_h1 = g_font_body;
+    if (!g_font_num) g_font_num = g_font_body;
+    if (!g_font_num_sm) g_font_num_sm = g_font_body;
+}
 
 static void ApplyStyle()
 {
     ImGui::StyleColorsDark();
     ImGuiStyle &style = ImGui::GetStyle();
-    style.WindowRounding = 10.0f;
+    style.WindowRounding = 12.0f;
     style.FrameRounding = 6.0f;
-    style.GrabRounding = 4.0f;
-    style.WindowBorderSize = 0.0f;
-    style.ScrollbarSize = 12.0f;
-    style.WindowPadding = ImVec2(14, 11);
-    style.FramePadding = ImVec2(9, 6);
-    style.ItemSpacing = ImVec2(10, 8);
+    style.GrabRounding = 3.0f;
+    style.WindowBorderSize = 1.0f;
+    style.WindowPadding = ImVec2(0, 0);
+    style.FramePadding = ImVec2(8, 5);
+    style.ItemSpacing = ImVec2(8, 6);
+    style.ScrollbarSize = 5.0f;
     ImVec4 *c = style.Colors;
-    c[ImGuiCol_WindowBg] = ImVec4(0.071f, 0.090f, 0.122f, 0.97f);  // #12171F
-    c[ImGuiCol_TitleBg] = ImVec4(0.043f, 0.059f, 0.078f, 1.0f);
-    c[ImGuiCol_Text] = ImVec4(0.902f, 0.929f, 0.953f, 1.0f);       // #E6EDF3
-    c[ImGuiCol_TextDisabled] = ImVec4(0.545f, 0.596f, 0.647f, 1.0f);
-    c[ImGuiCol_Button] = ImVec4(0.106f, 0.137f, 0.176f, 1.0f);     // #1B232D
-    c[ImGuiCol_ButtonHovered] = ImVec4(0.145f, 0.192f, 0.244f, 1.0f);
-    c[ImGuiCol_ButtonActive] = ImVec4(0.180f, 0.240f, 0.300f, 1.0f);
-    c[ImGuiCol_FrameBg] = ImVec4(0.094f, 0.122f, 0.155f, 1.0f);
-    c[ImGuiCol_FrameBgHovered] = ImVec4(0.118f, 0.153f, 0.192f, 1.0f);
-    c[ImGuiCol_FrameBgActive] = ImVec4(0.137f, 0.180f, 0.227f, 1.0f);
-    c[ImGuiCol_SliderGrab] = kAccent;
-    c[ImGuiCol_SliderGrabActive] = ImVec4(0.310f, 0.910f, 0.620f, 1.0f);
-    c[ImGuiCol_CheckMark] = kAccent;
-    c[ImGuiCol_Header] = ImVec4(0.106f, 0.137f, 0.176f, 1.0f);
-    c[ImGuiCol_Separator] = ImVec4(0.110f, 0.157f, 0.200f, 1.0f);
+    c[ImGuiCol_WindowBg] = ImVec4(20 / 255.0f, 16 / 255.0f, 10 / 255.0f, 1.0f);
+    c[ImGuiCol_Border] = ImVec4(58 / 255.0f, 46 / 255.0f, 31 / 255.0f, 1.0f);
+    c[ImGuiCol_Text] = ImVec4(234 / 255.0f, 223 / 255.0f, 198 / 255.0f, 1.0f);
+    c[ImGuiCol_TextDisabled] = ImVec4(154 / 255.0f, 138 / 255.0f, 109 / 255.0f, 1.0f);
+    c[ImGuiCol_Button] = ImVec4(35 / 255.0f, 28 / 255.0f, 20 / 255.0f, 1.0f);
+    c[ImGuiCol_ButtonHovered] = ImVec4(44 / 255.0f, 35 / 255.0f, 24 / 255.0f, 1.0f);
+    c[ImGuiCol_ButtonActive] = ImVec4(58 / 255.0f, 46 / 255.0f, 31 / 255.0f, 1.0f);
+    c[ImGuiCol_FrameBg] = ImVec4(44 / 255.0f, 35 / 255.0f, 24 / 255.0f, 1.0f);
+    c[ImGuiCol_FrameBgHovered] = ImVec4(58 / 255.0f, 46 / 255.0f, 31 / 255.0f, 1.0f);
+    c[ImGuiCol_FrameBgActive] = ImVec4(58 / 255.0f, 46 / 255.0f, 31 / 255.0f, 1.0f);
+    c[ImGuiCol_SliderGrab] = ImVec4(200 / 255.0f, 164 / 255.0f, 92 / 255.0f, 1.0f);
+    c[ImGuiCol_SliderGrabActive] = ImVec4(227 / 255.0f, 200 / 255.0f, 132 / 255.0f, 1.0f);
+    c[ImGuiCol_CheckMark] = ImVec4(200 / 255.0f, 164 / 255.0f, 92 / 255.0f, 1.0f);
+    c[ImGuiCol_ScrollbarBg] = ImVec4(0, 0, 0, 0);
+    c[ImGuiCol_ScrollbarGrab] = ImVec4(58 / 255.0f, 46 / 255.0f, 31 / 255.0f, 1.0f);
+    c[ImGuiCol_ScrollbarGrabHovered] = ImVec4(154 / 255.0f, 138 / 255.0f, 109 / 255.0f, 1.0f);
+    c[ImGuiCol_ScrollbarGrabActive] = ImVec4(194 / 255.0f, 178 / 255.0f, 149 / 255.0f, 1.0f);
 }
 
 static void ToggleExpanded()
 {
     g_expanded = !g_expanded;
-    DebugLine(g_expanded ? L"panel expanded (interactive)" : L"panel collapsed (click-through strip)");
-    // 立即预设目标尺寸，避免切换瞬间内容被旧尺寸裁切一帧
+    DebugLine(g_expanded ? L"panel expanded (interactive)" : L"panel collapsed (strip)");
+    // 收起态右上信息条也保留“展开面板”按钮，因此始终可交互；仅禁激活避免抢游戏焦点。
     LONG_PTR ex = GetWindowLongPtrW(g_window, GWL_EXSTYLE);
-    if (g_expanded) ex &= ~WS_EX_TRANSPARENT;
-    else ex |= WS_EX_TRANSPARENT;
+    ex &= ~WS_EX_TRANSPARENT;
     SetWindowLongPtrW(g_window, GWL_EXSTYLE, ex);
     SetWindowPos(g_window, HWND_TOPMOST, 0, 0, 0, 0,
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-}
-
-// 开关滑块：圆角胶囊 + 圆形滑钮（与桌面控制台同款）
-// zh: v 必须是引用——翻转运出的新值写回调用方的存储，否则开关视觉闪一帧即弹回
-static bool ToggleSwitch(const char *label, bool &v)
-{
-    ImGui::PushID(label);
-    const float h = ImGui::GetFrameHeight() * 0.70f;
-    const float w = h * 1.85f;
-    const ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImDrawList *dl = ImGui::GetWindowDrawList();
-    bool changed = false;
-    ImGui::InvisibleButton("##toggle", ImVec2(w, h));
-    if (ImGui::IsItemClicked()) { v = !v; changed = true; }
-    const ImU32 bg_on = IM_COL32(61, 214, 140, 255);
-    const ImU32 bg_off = IM_COL32(52, 63, 76, 255);
-    dl->AddRectFilled(pos, ImVec2(pos.x + w, pos.y + h), v ? bg_on : bg_off, h * 0.5f);
-    const float r = h * 0.5f - 2.0f;
-    const float cx = v ? pos.x + w - r - 2.0f : pos.x + r + 2.0f;
-    dl->AddCircleFilled(ImVec2(cx, pos.y + h * 0.5f), r, IM_COL32(233, 240, 245, 255));
-    ImGui::SameLine(0, 10);
-    ImGui::TextUnformatted(label);
-    ImGui::PopID();
-    return changed;
-}
-
-// 分段选择按钮：选中态强调色填充 + 深字
-static bool SegmentedOption(const char *label, bool active, float width)
-{
-    bool clicked = false;
-    if (active) {
-        ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.310f, 0.910f, 0.620f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, kAccent);
-        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.020f, 0.049f, 0.039f, 1.0f));
-    }
-    clicked = ImGui::Button(label, ImVec2(width, 0));
-    if (active) ImGui::PopStyleColor(4);
-    return clicked;
 }
 
 static const char *SchemeName()
@@ -481,7 +509,6 @@ static LayerState EvaluateLayerCover()
     if (!output) return LayerState::NoOutput;
     if (!IsWindowVisible(output)) return LayerState::Hidden;
     if (g_game_hwnd_seen && IsWindowVisible(g_game_hwnd_seen)) {
-        // 沿 z 序向上走：先遇到游戏窗口 = 输出窗被盖住
         HWND w = output;
         for (int steps = 0; (w = GetWindow(w, GW_HWNDPREV)) != nullptr && steps < 256; ++steps)
             if (w == g_game_hwnd_seen) return LayerState::UnderGame;
@@ -502,8 +529,7 @@ static const char *LayerShortName(LayerState s)
 
 static void SyncWindowLayout(const RECT &game)
 {
-    // 位置同步（尺寸由 ImGui 手柄决定，OS 窗口在主循环里跟随）；拖拽/缩放中让路。
-    // 默认贴游戏右上角；用户拖动过后按记下的偏移跟随（游戏窗口移动/缩放时仍跟随）。
+    // 位置同步（尺寸由 ImGui 决定，OS 窗口在主循环里跟随）；拖拽/缩放中让路。
     if (g_dragging) return;
     RECT cur{};
     GetWindowRect(g_window, &cur);
@@ -512,9 +538,6 @@ static void SyncWindowLayout(const RECT &game)
     if (g_user_positioned) {
         px = game.right + g_user_off_x;
         py = game.top + g_user_off_y;
-    } else if (g_expanded) {
-        px = game.right - w - static_cast<int>(8 * g_dpi_scale);
-        py = game.top + static_cast<int>(10 * g_dpi_scale);
     } else {
         px = game.right - w - static_cast<int>(8 * g_dpi_scale);
         py = game.top + static_cast<int>(10 * g_dpi_scale);
@@ -522,359 +545,982 @@ static void SyncWindowLayout(const RECT &game)
     SetWindowPos(g_window, nullptr, px, py, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOZORDER);
 }
 
-// ===== 展开态布局：参考 033 设置面板（自绘标题行 + 左侧导航 + 内容页 + 底栏）=====
-static int g_nav_page = 0;   // 0 状态 / 1 画面增强 / 2 补帧 / 3 模型 / 4 说明
+// 自绘 UI 的临时提示与“模型重建中”计时（毫秒 tick）
+static ULONGLONG g_toast_until = 0;
+static ULONGLONG g_model_busy_until = 0;
 
-static void PageHeader(const char *title)
+// ===== 文本与基础绘制 =====
+static float MeasureWidth(ImFont *font, const char *text)
 {
-    if (g_save.failed) ImGui::TextColored(kWarn, "参数未保存，正在重试");
-    ImGui::TextColored(kAccent, "%s", title);
-    ImGui::Spacing();
+    if (!font) return ImGui::CalcTextSize(text).x;
+    ImGui::PushFont(font);
+    const float width = ImGui::CalcTextSize(text).x;
+    ImGui::PopFont();
+    return width;
+}
+static float FontHeight(ImFont *font)
+{
+    if (!font) return ImGui::GetTextLineHeight();
+    ImGui::PushFont(font);
+    const float height = ImGui::GetTextLineHeight();
+    ImGui::PopFont();
+    return height;
+}
+static void PutText(ImFont *font, float x, float y, ImU32 color, const char *text)
+{
+    if (!font) return;
+    ImGui::PushFont(font);
+    ImGui::PushStyleColor(ImGuiCol_Text, color);
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    ImGui::TextUnformatted(text);
+    ImGui::PopStyleColor();
+    ImGui::PopFont();
+}
+static void PutTextF(ImFont *font, float x, float y, ImU32 color, const char *fmt, ...)
+{
+    char buffer[256]{};
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buffer, sizeof buffer, fmt, args);
+    va_end(args);
+    PutText(font, x, y, color, buffer);
+}
+static void PutTextRight(ImFont *font, float right, float y, ImU32 color, const char *text)
+{
+    PutText(font, right - MeasureWidth(font, text), y, color, text);
+}
+static const char *FloatText(float value, int decimals)
+{
+    static char buffers[4][32]{};
+    static int slot = 0;
+    slot = (slot + 1) & 3;
+    if (decimals == 1) std::snprintf(buffers[slot], sizeof buffers[slot], "%.1f", value);
+    else if (decimals == 0) std::snprintf(buffers[slot], sizeof buffers[slot], "%.0f", value);
+    else std::snprintf(buffers[slot], sizeof buffers[slot], "%.2f", value);
+    return buffers[slot];
+}
+static void CardRect(ImDrawList *dl, float x, float y, float w, float h, float rounding)
+{
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + w, y + h), kColSurface, rounding);
+    dl->AddRect(ImVec2(x, y), ImVec2(x + w, y + h), kColLine, rounding, 0, 1.0f * g_dpi_scale);
 }
 
-// 侧栏导航项：选中 = 强调色文字 + 浅色底 + 左侧 3px 竖条
-static bool NavItem(const char *label, int idx)
+// 品牌标记：古金量表弧 + 苔玉分区的迷你版本（与图标 S2 同源）
+static void DrawBrandMark(ImDrawList *dl, float cx, float cy, float radius)
 {
-    const bool sel = (idx == g_nav_page);
-    if (sel) {
-        ImGui::PushStyleColor(ImGuiCol_Header, ImVec4(0.118f, 0.173f, 0.153f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderHovered, ImVec4(0.137f, 0.196f, 0.173f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_HeaderActive, ImVec4(0.118f, 0.173f, 0.153f, 1.0f));
-        ImGui::PushStyleColor(ImGuiCol_Text, kAccent);
+    const float kPi = 3.14159265358979323846f;
+    const float thickness = radius * 0.26f;
+    float point_x[25]{}, point_y[25]{};
+    for (int i = 0; i <= 24; ++i) {
+        const float angle = (150.0f + 240.0f * i / 24.0f) * kPi / 180.0f;
+        point_x[i] = cx + std::cos(angle) * radius;
+        point_y[i] = cy + std::sin(angle) * radius;
     }
-    const bool clicked = ImGui::Selectable(label, sel);
-    if (sel) {
-        ImDrawList *dl = ImGui::GetWindowDrawList();
-        const ImVec2 mn = ImGui::GetItemRectMin(), mx = ImGui::GetItemRectMax();
-        dl->AddRectFilled(mn, ImVec2(mn.x + 3.0f * g_dpi_scale, mx.y),
-            IM_COL32(61, 214, 140, 255));
-        ImGui::PopStyleColor(4);
+    for (int i = 0; i < 24; ++i) {
+        const float angle = (150.0f + 240.0f * (i + 0.5f) / 24.0f) * kPi / 180.0f;
+        const ImU32 color = angle >= 300.0f * kPi / 180.0f ? kColJade : kColAccent;
+        dl->AddLine(ImVec2(point_x[i], point_y[i]), ImVec2(point_x[i + 1], point_y[i + 1]), color, thickness);
     }
+    const float needle = -50.0f * kPi / 180.0f;
+    dl->AddLine(ImVec2(cx, cy),
+        ImVec2(cx + std::cos(needle) * radius * 0.62f, cy + std::sin(needle) * radius * 0.62f),
+        kColText, radius * 0.14f);
+    dl->AddCircleFilled(ImVec2(cx, cy), radius * 0.13f, kColAccent);
+}
+
+// 导航图标：状态/画面增强/补帧/模型/说明
+static void DrawNavIcon(ImDrawList *dl, int page, float cx, float cy, ImU32 color)
+{
+    const float r = 6.0f * g_dpi_scale;
+    const float t = 1.4f * g_dpi_scale;
+    switch (page) {
+    case 0: {   // 心跳折线
+        const ImVec2 points[5] = {
+            ImVec2(cx - r, cy), ImVec2(cx - r * 0.35f, cy - r * 0.8f), ImVec2(cx + r * 0.05f, cy + r * 0.55f),
+            ImVec2(cx + r * 0.5f, cy - r * 0.35f), ImVec2(cx + r, cy)};
+        dl->AddPolyline(points, 5, color, 0, t);
+        break;
+    }
+    case 1: {   // 层叠
+        dl->AddLine(ImVec2(cx - r, cy + r * 0.55f), ImVec2(cx, cy - r * 0.15f), color, t);
+        dl->AddLine(ImVec2(cx + r, cy + r * 0.55f), ImVec2(cx, cy - r * 0.15f), color, t);
+        dl->AddLine(ImVec2(cx - r * 0.7f, cy + r), ImVec2(cx, cy + r * 0.35f), color, t);
+        dl->AddLine(ImVec2(cx + r * 0.7f, cy + r), ImVec2(cx, cy + r * 0.35f), color, t);
+        break;
+    }
+    case 2: {   // 双帧
+        dl->AddRect(ImVec2(cx - r, cy - r * 0.7f), ImVec2(cx + r * 0.35f, cy + r * 0.7f), color, 1.5f, 0, t);
+        dl->AddRect(ImVec2(cx - r * 0.35f, cy - r * 0.2f), ImVec2(cx + r, cy + r), color, 1.5f, 0, t);
+        break;
+    }
+    case 3: {   // 立方
+        dl->AddLine(ImVec2(cx, cy - r), ImVec2(cx + r, cy - r * 0.4f), color, t);
+        dl->AddLine(ImVec2(cx + r, cy - r * 0.4f), ImVec2(cx + r, cy + r * 0.45f), color, t);
+        dl->AddLine(ImVec2(cx + r, cy + r * 0.45f), ImVec2(cx, cy + r), color, t);
+        dl->AddLine(ImVec2(cx, cy + r), ImVec2(cx - r, cy + r * 0.45f), color, t);
+        dl->AddLine(ImVec2(cx - r, cy + r * 0.45f), ImVec2(cx - r, cy - r * 0.4f), color, t);
+        dl->AddLine(ImVec2(cx - r, cy - r * 0.4f), ImVec2(cx, cy - r), color, t);
+        dl->AddLine(ImVec2(cx, cy - r * 0.2f), ImVec2(cx + r * 0.55f, cy - r * 0.55f), color, t * 0.8f);
+        break;
+    }
+    default: {  // 说明
+        dl->AddCircle(ImVec2(cx, cy - r * 0.25f), r * 0.8f, color, 0, t);
+        dl->AddCircleFilled(ImVec2(cx, cy - r * 0.35f), r * 0.16f, color);
+        dl->AddLine(ImVec2(cx, cy - r * 0.05f), ImVec2(cx, cy + r * 0.3f), color, t);
+        break;
+    }
+    }
+}
+
+static float ChipWidth(const char *text)
+{
+    return MeasureWidth(g_font_small, text) + 22.0f * g_dpi_scale;
+}
+static void DrawChip(ImDrawList *dl, float x, float y, const char *text, bool on, bool jade)
+{
+    const float dpi = g_dpi_scale;
+    const float height = 23.0f * dpi;
+    const float width = ChipWidth(text);
+    const ImU32 background = on ? (jade ? kColJadeSoft : kColAccentSoft) : kColSurface2;
+    const ImU32 border = on ? (jade ? kColJadeLine : kColAccentLine) : kColLineSoft;
+    const ImU32 text_color = on ? (jade ? kColJadeText : kColAccent) : kColText3;
+    const ImU32 dot_color = on ? (jade ? kColJade : kColAccent) : kColText3;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height), background, height * 0.5f);
+    dl->AddRect(ImVec2(x, y), ImVec2(x + width, y + height), border, height * 0.5f, 0, 1.0f * dpi);
+    dl->AddCircleFilled(ImVec2(x + 9.0f * dpi, y + height * 0.5f), 2.2f * dpi, dot_color);
+    PutText(g_font_small, x + 16.0f * dpi, y + (height - FontHeight(g_font_small)) * 0.5f - 1.0f * dpi,
+        text_color, text);
+}
+
+// 分段选择条：返回被点击的序号，-1 表示未点击
+static int SegmentedBar(const char *id, float x, float y, float width,
+    const char *const *items, int count, int selected)
+{
+    const float dpi = g_dpi_scale;
+    const float pad = 4.0f * dpi;
+    const float gap = 4.0f * dpi;
+    const float height = 30.0f * dpi;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height + pad * 2.0f), kColSurface3, 8.0f * dpi);
+    const float cell_width = (width - pad * 2.0f - gap * (count - 1)) / static_cast<float>(count);
+    const float text_height = FontHeight(g_font_body);
+    int clicked = -1;
+    ImGui::PushID(id);
+    for (int i = 0; i < count; ++i) {
+        const ImVec2 cell(x + pad + i * (cell_width + gap), y + pad);
+        ImGui::PushID(i);
+        ImGui::SetCursorScreenPos(cell);
+        ImGui::InvisibleButton("##seg", ImVec2(cell_width, height));
+        if (ImGui::IsItemClicked()) clicked = i;
+        const bool hovered = ImGui::IsItemHovered();
+        if (i == selected) {
+            dl->AddRectFilled(cell, ImVec2(cell.x + cell_width, cell.y + height), kColAccent, 6.0f * dpi);
+        } else if (hovered) {
+            dl->AddRectFilled(cell, ImVec2(cell.x + cell_width, cell.y + height), kColSurface2, 6.0f * dpi);
+        }
+        const ImU32 color = i == selected ? kColAccentInk : kColText2;
+        PutText(g_font_body, cell.x + (cell_width - MeasureWidth(g_font_body, items[i])) * 0.5f,
+            cell.y + (height - text_height) * 0.5f - 1.0f * dpi, color, items[i]);
+        ImGui::PopID();
+    }
+    ImGui::PopID();
     return clicked;
 }
 
-// zh: 四个微调参数语义不同（强度/结构 0 是下限，色调 1.00 中性，皮肤 0 中性），
-// 因此保留各自自然量程，只统一“两位小数 + 上方说明”的呈现方式。
-static void HelpText(const char *text)
+// 按钮：kind 0=primary(古金实底) 1=secondary(描边) 2=ghost
+static bool Btn(const char *id, float x, float y, float width, float height, const char *label, int kind)
 {
-    ImGui::PushStyleColor(ImGuiCol_Text, ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled));
-    ImGui::TextWrapped("%s", text);
-    ImGui::PopStyleColor();
-}
-
-static void PageStatus()
-{
-    PageHeader("状态");
-    if (g_game_fps > 0) ImGui::Text("真实帧率：%.1f → 输出帧率：%.1f FPS",
-        g_src_fps > 0 ? g_src_fps : 0.0f, g_game_fps);
-    if (g_tele.available) {
-        ImGui::Text("模型：%s   强度：%.2f   管线：%s", kModelNames[g_params.model - 1],
-            g_params.intensity,
-            g_tele.pipeline_ready ? "就绪" : "未就绪");
-        if (!g_tele.fg)
-            ImGui::TextDisabled("补帧：关（配置未开启）");
-        else if (g_tele.fg_failed)
-            ImGui::TextColored(kWarn, "补帧：开启但求值失败（显示真实帧）");
-        else if (g_tele.fg_frames > 0)
-            ImGui::TextColored(ImVec4(0.62f, 1.0f, 0.78f, 1.0f), "补帧：开（已插帧 %llu）", g_tele.fg_frames);
-        else
-            ImGui::TextColored(kWarn, "补帧：开（尚未插出帧）");
-        switch (g_layer) {
-        case LayerState::Covered:
-            ImGui::TextColored(ImVec4(0.62f, 1.0f, 0.78f, 1.0f), "显示图层：覆盖中（你看到的是 NR 处理画面）");
-            break;
-        case LayerState::RawMode:
-            ImGui::TextColored(kWarn, "显示图层：F10 处于原画模式！按 F10 切回，否则参数变化不可见");
-            break;
-        case LayerState::Hidden:
-            ImGui::TextColored(kWarn, "显示图层：输出窗已隐藏——回到游戏窗口即恢复");
-            break;
-        case LayerState::UnderGame:
-            ImGui::TextColored(kWarn, "显示图层：输出窗被游戏窗口盖住——回到游戏窗口即恢复");
-            break;
-        case LayerState::NoOutput:
-            ImGui::TextColored(kWarn, "显示图层：未找到输出窗（载体未运行或正在启动）");
-            break;
-        default:
-            ImGui::TextColored(kWarn, "显示图层：载体遥测未确认");
-            break;
-        }
-        ImGui::Text("NR 帧数：%llu   SR 帧数：%llu", g_tele.nr_frames, g_tele.sr_frames);
-        ImGui::Text("分辨率：%ux%u → %ux%u", g_tele.input_w, g_tele.input_h, g_tele.output_w, g_tele.output_h);
+    const float dpi = g_dpi_scale;
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    ImGui::InvisibleButton("##btn", ImVec2(width, height));
+    const bool clicked = ImGui::IsItemClicked();
+    const bool hovered = ImGui::IsItemHovered();
+    if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float rounding = 7.0f * dpi;
+    ImU32 background = kColSurface2;
+    ImU32 border = kColLine;
+    ImU32 text_color = kColText;
+    if (kind == 0) {
+        background = hovered ? kColAccentBright : kColAccent;
+        border = background;
+        text_color = kColAccentInk;
+    } else if (kind == 1) {
+        background = hovered ? kColSurface3 : kColSurface2;
+        border = kColLine;
+        text_color = kColText;
     } else {
-        ImGui::TextColored(kWarn, "载体遥测：未确认（载体未运行或刚启动）");
+        background = hovered ? kColSurface2 : IM_COL32(0, 0, 0, 0);
+        border = hovered ? kColLine : IM_COL32(0, 0, 0, 0);
+        text_color = kColText2;
     }
-    ImGui::TextDisabled("档位：%s", SchemeName());
+    if ((background >> 24) != 0) dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height), background, rounding);
+    if ((border >> 24) != 0) dl->AddRect(ImVec2(x, y), ImVec2(x + width, y + height), border, rounding, 0, 1.0f * dpi);
+    PutText(g_font_body, x + (width - MeasureWidth(g_font_body, label)) * 0.5f,
+        y + (height - FontHeight(g_font_body)) * 0.5f - 1.0f * dpi, text_color, label);
+    ImGui::PopID();
+    return clicked;
 }
 
-static void PageNr()
+// 开关行（标题 + 说明 + 右侧 38×22 开关），返回是否翻转
+static bool ToggleRow(const char *id, float x, float y, float width,
+    const char *title, const char *desc, bool &value)
 {
-    PageHeader("画面增强（NR）");
-    if (ToggleSwitch("画面增强（NR）", g_params.nr)) g_save.dirty = true;
+    const float dpi = g_dpi_scale;
+    const float switch_w = 38.0f * dpi;
+    const float switch_h = 22.0f * dpi;
+    const float switch_x = x + width - switch_w;
+    const float switch_y = y + 7.0f * dpi;
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(ImVec2(switch_x, switch_y));
+    ImGui::InvisibleButton("##switch", ImVec2(switch_w, switch_h));
+    const bool clicked = ImGui::IsItemClicked();
+    if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    if (clicked) value = !value;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(switch_x, switch_y), ImVec2(switch_x + switch_w, switch_y + switch_h),
+        value ? kColJade : kColSurface3, switch_h * 0.5f);
+    const float knob_radius = switch_h * 0.5f - 2.0f * dpi;
+    const float knob_x = value ? switch_x + switch_w - knob_radius - 2.0f * dpi : switch_x + knob_radius + 2.0f * dpi;
+    dl->AddCircleFilled(ImVec2(knob_x, switch_y + switch_h * 0.5f), knob_radius,
+        value ? kColKnobLight : kColText3);
+    PutText(g_font_body, x, y - 1.0f * dpi, kColText, title);
+    if (desc && desc[0]) PutText(g_font_small, x, y + 22.0f * dpi, kColText3, desc);
+    ImGui::PopID();
+    return clicked;
+}
 
-    ImGui::Spacing();
-    ImGui::TextColored(kAccent, "档位");
-    ImGui::TextDisabled("档位是完整配方，NR 开关跟随档位（原画=关闭）。");
-    for (int i = 0; i < 4; ++i) {
-        if (i % 3) ImGui::SameLine();
-        if (SegmentedOption(kSchemes[i].name, g_tier_locked && g_params.MatchesTier(kSchemes[i].p),
-            124 * g_dpi_scale)) {
-            const int keep_model = g_params.model;
-            const bool keep_fg = g_params.fg;
-            const int keep_multiplier = g_params.fg_multiplier;
-            g_params = kSchemes[i].p;
-            g_params.model = keep_model;
-            g_params.fg = keep_fg;
-            g_params.fg_multiplier = keep_multiplier;
-            ClampParams(g_params);
-            g_tier_locked = true;
-            g_save.dirty = true;
+// 自定义滑杆（轨道 4px + 14px 奶白滑钮），返回数值是否改变
+static bool SliderRow(const char *id, float x, float &y, float width,
+    const char *label, float &value, float minimum, float maximum, bool disabled)
+{
+    const float dpi = g_dpi_scale;
+    PutText(g_font_small, x, y, kColText2, label);
+    PutTextRight(g_font_body, x + width, y - 1.0f * dpi, kColText, FloatText(value, 2));
+    const float track_y = y + 22.0f * dpi;
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(ImVec2(x, track_y - 8.0f * dpi));
+    ImGui::InvisibleButton("##slider", ImVec2(width, 16.0f * dpi));
+    if (disabled) {
+        PutText(g_font_small, x, y, kColText3, label);
+        PutTextRight(g_font_body, x + width, y - 1.0f * dpi, kColText3, FloatText(value, 2));
+    }
+    const ImU32 active_color = disabled ? kColLine : kColAccent;
+    const ImU32 knob_fill = disabled ? kColSurface3 : kColKnobLight;
+    bool changed = false;
+    if (!disabled && ImGui::IsItemActive()) {
+        const float mouse = ImGui::GetIO().MousePos.x;
+        float ratio = (mouse - x) / width;
+        ratio = ratio < 0.0f ? 0.0f : (ratio > 1.0f ? 1.0f : ratio);
+        const float next = minimum + ratio * (maximum - minimum);
+        if (std::fabs(next - value) > 0.0005f) { value = next; changed = true; }
+    }
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float rail = track_y + 4.0f * dpi;
+    dl->AddRectFilled(ImVec2(x, rail - 2.0f * dpi), ImVec2(x + width, rail + 2.0f * dpi),
+        kColSurface3, 2.0f * dpi);
+    float ratio = (value - minimum) / (maximum - minimum);
+    ratio = ratio < 0.0f ? 0.0f : (ratio > 1.0f ? 1.0f : ratio);
+    dl->AddRectFilled(ImVec2(x, rail - 2.0f * dpi), ImVec2(x + width * ratio, rail + 2.0f * dpi),
+        active_color, 2.0f * dpi);
+    const ImVec2 knob(x + width * ratio, rail);
+    dl->AddCircleFilled(knob, 7.0f * dpi, knob_fill);
+    dl->AddCircle(knob, 7.0f * dpi, active_color, 0, 2.0f * dpi);
+    ImGui::PopID();
+    y += 44.0f * dpi;
+    return changed;
+}
+
+// 提示块：surface-2 圆角底 + 11.5px 文字
+// 按最大宽度手工折行。ImGui 的自动换行只认空格，中文说明会整行溢出面板，
+// 这里按 UTF-8 码点逐个累加并量宽，遇到换行符也尊重；同时避免收尾标点落在行首。
+static bool IsClosingPunct(const char *glyph)
+{
+    static const char *closing[] = {"。", "，", "、", "；", "：", "！", "？", "）", ")", "」", "』", "】", "》", "%", "…"};
+    for (const char *item : closing)
+        if (std::strcmp(glyph, item) == 0) return true;
+    return false;
+}
+static bool IsOpeningPunct(const char *glyph)
+{
+    static const char *opening[] = {"（", "(", "「", "『", "【", "《"};
+    for (const char *item : opening)
+        if (std::strcmp(glyph, item) == 0) return true;
+    return false;
+}
+static float GlyphRunWidth(ImFont *font, const std::vector<std::string> &glyphs)
+{
+    std::string joined;
+    for (const std::string &glyph : glyphs) joined += glyph;
+    return MeasureWidth(font, joined.c_str());
+}
+static void FlushLine(std::vector<std::string> &lines, std::vector<std::string> &glyphs)
+{
+    std::string line;
+    for (const std::string &glyph : glyphs) line += glyph;
+    lines.push_back(line);
+    glyphs.clear();
+}
+static std::vector<std::string> WrapCjk(ImFont *font, const char *text, float max_width)
+{
+    std::vector<std::string> lines;
+    std::vector<std::string> glyphs;
+    const char *p = text;
+    while (*p) {
+        if (*p == '\n') {
+            FlushLine(lines, glyphs);
+            ++p;
+            continue;
+        }
+        int length = 1;
+        const unsigned char lead = static_cast<unsigned char>(*p);
+        if ((lead & 0xE0) == 0xC0) length = 2;
+        else if ((lead & 0xF0) == 0xE0) length = 3;
+        else if ((lead & 0xF8) == 0xF0) length = 4;
+        glyphs.push_back(std::string(p, length));
+        p += length;
+        if (glyphs.size() > 1 && GlyphRunWidth(font, glyphs) > max_width) {
+            const std::string glyph = glyphs.back();
+            glyphs.pop_back();
+            const bool carry_prev = !glyphs.empty() &&
+                (IsClosingPunct(glyph.c_str()) || IsOpeningPunct(glyphs.back().c_str()));
+            if (carry_prev && glyphs.size() >= 2) {
+                std::string carry = glyphs.back();
+                glyphs.pop_back();
+                FlushLine(lines, glyphs);
+                glyphs.push_back(carry);
+            } else {
+                FlushLine(lines, glyphs);
+            }
+            glyphs.push_back(glyph);
         }
     }
-    ImGui::SameLine();
-    if (SegmentedOption("自定义", !g_tier_locked, 124 * g_dpi_scale)) {
+    if (!glyphs.empty() || lines.empty()) FlushLine(lines, glyphs);
+    return lines;
+}
+
+static void InfoBlock(float x, float &y, float width, const char *text, bool warn)
+{
+    const float dpi = g_dpi_scale;
+    const float pad = 10.0f * dpi;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const std::vector<std::string> lines = WrapCjk(g_font_small, text, width - pad * 2.0f);
+    const float line_step = FontHeight(g_font_small) + 5.0f * dpi;
+    const float height = line_step * static_cast<float>(lines.size()) + pad * 2.0f - 5.0f * dpi;
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + height),
+        warn ? IM_COL32(217, 138, 74, 26) : kColSurface2, 8.0f * dpi);
+    dl->AddRect(ImVec2(x, y), ImVec2(x + width, y + height),
+        warn ? IM_COL32(217, 138, 74, 90) : kColLineSoft, 8.0f * dpi, 0, 1.0f * dpi);
+    float line_y = y + pad - 1.0f * dpi;
+    for (const std::string &line : lines) {
+        PutText(g_font_small, x + pad, line_y, warn ? kColWarn : kColText2, line.c_str());
+        line_y += line_step;
+    }
+    y += height + 10.0f * dpi;
+}
+
+// 分区标题：5px 菱形 + 11.5px 文字 + 发丝线
+static void SectionTitle(float x, float &y, float width, const char *title)
+{
+    const float dpi = g_dpi_scale;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float cy = y + 8.0f * dpi;
+    const ImVec2 diamond[4] = {
+        ImVec2(x + 3.0f * dpi, cy), ImVec2(x + 6.0f * dpi, cy - 3.0f * dpi),
+        ImVec2(x + 9.0f * dpi, cy), ImVec2(x + 6.0f * dpi, cy + 3.0f * dpi)};
+    dl->AddConvexPolyFilled(diamond, 4, kColAccent);
+    PutText(g_font_small, x + 14.0f * dpi, y, kColText2, title);
+    const float line_x = x + 20.0f * dpi + MeasureWidth(g_font_small, title);
+    if (line_x < x + width) dl->AddLine(ImVec2(line_x, cy), ImVec2(x + width, cy), kColLineSoft, 1.0f * dpi);
+    y += 22.0f * dpi;
+}
+
+// 统计行：左侧组名 + 三列（小标签 + 值）
+static void StatRow(float x, float &y, float width, const char *label,
+    const char *caption1, const char *value1, const char *caption2, const char *value2,
+    const char *caption3, const char *value3)
+{
+    const float dpi = g_dpi_scale;
+    const float label_width = 52.0f * dpi;
+    const float cell_width = (width - label_width) / 3.0f;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + label_width - 6.0f * dpi, y + 40.0f * dpi), kColSurface3, 5.0f * dpi);
+    PutText(g_font_small, x + 6.0f * dpi, y + 12.0f * dpi, kColText3, label);
+    const char *captions[3] = {caption1, caption2, caption3};
+    const char *values[3] = {value1, value2, value3};
+    for (int i = 0; i < 3; ++i) {
+        const float cell_x = x + label_width + i * cell_width;
+        PutText(g_font_small, cell_x, y + 0.0f * dpi, kColText3, captions[i]);
+        PutText(g_font_body, cell_x, y + 17.0f * dpi, kColText, values[i]);
+    }
+    y += 46.0f * dpi;
+}
+
+// 页面头： eyebrow（带 live 点）+ 20px 标题 + 说明
+static void PageHead(float x, float &y, float width, const char *eyebrow, const char *title, const char *sub)
+{
+    const float dpi = g_dpi_scale;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddCircleFilled(ImVec2(x + 3.0f * dpi, y + 6.0f * dpi), 2.4f * dpi,
+        g_tele.available ? kColJade : kColText3);
+    PutText(g_font_small, x + 10.0f * dpi, y, kColAccent, eyebrow);
+    y += 20.0f * dpi;
+    PutText(g_font_h1, x, y, kColText, title);
+    y += 30.0f * dpi;
+    PutText(g_font_small, x, y, kColText3, sub);
+    y += 24.0f * dpi;
+    (void)width;
+}
+
+// ===== 页面：状态 =====
+static void RenderStatusPage(float x, float &y, float width)
+{
+    const float dpi = g_dpi_scale;
+    PageHead(x, y, width, "实时状态", "状态", "载体遥测每 500 ms 刷新一次");
+
+    const float hero_height = 158.0f * dpi;
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + hero_height), kColSurface2, 10.0f * dpi);
+    dl->AddRect(ImVec2(x, y), ImVec2(x + width, y + hero_height), kColLine, 10.0f * dpi, 0, 1.0f * dpi);
+
+    PutText(g_font_small, x + 14.0f * dpi, y + 12.0f * dpi, kColText3, "输出帧率");
+    const char *fps_text = g_tele.available && g_game_fps > 0.0f ? FloatText(g_game_fps, 1) : "—";
+    PutText(g_font_num, x + 14.0f * dpi, y + 24.0f * dpi, kColText, fps_text);
+    const float value_width = MeasureWidth(g_font_num, fps_text);
+    PutText(g_font_body, x + 14.0f * dpi + value_width + 6.0f * dpi,
+        y + 24.0f * dpi + FontHeight(g_font_num) - FontHeight(g_font_body) - 6.0f * dpi,
+        kColAccent, "FPS");
+
+    // 图层胶囊（右上）
+    const char *layer_text = "图层未确认";
+    bool layer_on = false;
+    switch (g_layer) {
+    case LayerState::Covered: layer_text = "图层覆盖中"; layer_on = true; break;
+    case LayerState::RawMode: layer_text = "原画模式"; break;
+    case LayerState::Hidden: layer_text = "图层已隐藏"; break;
+    case LayerState::UnderGame: layer_text = "图层被遮挡"; break;
+    case LayerState::NoOutput: layer_text = "无输出窗"; break;
+    default: break;
+    }
+    DrawChip(dl, x + width - 14.0f * dpi - ChipWidth(layer_text), y + 12.0f * dpi, layer_text, layer_on, true);
+
+    if (!g_tele.available) {
+        PutText(g_font_small, x + 14.0f * dpi, y + 84.0f * dpi, kColText3, "启动游戏后显示实时数据");
+    } else if (g_src_fps > 0.0f && g_game_fps > 0.0f) {
+        const float gain = g_src_fps > 0.01f ? g_game_fps / g_src_fps : 0.0f;
+        PutTextF(g_font_small, x + 14.0f * dpi, y + 84.0f * dpi, kColText3,
+            "源 %.1f → 输出 %.1f · 增益 %.2f×", g_src_fps, g_game_fps, gain);
+    } else {
+        PutText(g_font_small, x + 14.0f * dpi, y + 84.0f * dpi, kColText3, "正在采样帧率…");
+    }
+
+    const float fact_top = y + 110.0f * dpi;
+    const float fact_width = (width - 28.0f * dpi) / 4.0f;
+    const char *fact_labels[4] = {"档位", "模型", "强度", "管线"};
+    const char *fact_values[4] = {
+        SchemeName(), kModelNames[g_params.model - 1], FloatText(g_params.intensity, 2),
+        g_tele.available ? (g_tele.pipeline_ready ? "就绪" : "未就绪") : "未确认"};
+    for (int i = 0; i < 4; ++i) {
+        const float fact_x = x + 14.0f * dpi + i * fact_width;
+        PutText(g_font_small, fact_x, fact_top, kColText3, fact_labels[i]);
+        PutText(g_font_body, fact_x, fact_top + 16.0f * dpi, kColText, fact_values[i]);
+        if (i > 0) {
+            dl->AddLine(ImVec2(fact_x - 6.0f * dpi, fact_top - 2.0f * dpi),
+                ImVec2(fact_x - 6.0f * dpi, fact_top + 34.0f * dpi), kColLineSoft, 1.0f * dpi);
+        }
+    }
+    y += hero_height + 18.0f * dpi;
+
+    SectionTitle(x, y, width, "运行数据");
+    const char *dash = "—";
+    char res_in[32]{}, res_out[32]{}, res_scale[32]{};
+    char latency[32]{}, source_fps[32]{}, output_fps[32]{};
+    char nr_frames[32]{}, sr_frames[32]{}, fg_frames[32]{};
+    if (g_tele.available) {
+        std::snprintf(res_in, sizeof res_in, "%ux%u", g_tele.input_w, g_tele.input_h);
+        std::snprintf(res_out, sizeof res_out, "%ux%u", g_tele.output_w, g_tele.output_h);
+        std::snprintf(res_scale, sizeof res_scale, "%.2f×",
+            g_tele.input_w > 0 ? static_cast<double>(g_tele.output_w) / g_tele.input_w : 1.0);
+        if (g_tele.gpu_us > 0) std::snprintf(latency, sizeof latency, "%.1f ms", g_tele.gpu_us / 1000.0);
+        std::snprintf(source_fps, sizeof source_fps, "%.1f", g_tele.source_fps > 0 ? static_cast<double>(g_tele.source_fps) : g_src_fps);
+        std::snprintf(output_fps, sizeof output_fps, "%.1f", static_cast<double>(g_game_fps));
+        std::snprintf(nr_frames, sizeof nr_frames, "%llu", g_tele.nr_frames);
+        std::snprintf(sr_frames, sizeof sr_frames, "%llu", g_tele.sr_frames);
+        std::snprintf(fg_frames, sizeof fg_frames, "%llu", g_tele.fg_frames);
+    }
+    StatRow(x, y, width, "分辨率", "输入", g_tele.available ? res_in : dash,
+        "输出", g_tele.available ? res_out : dash, "缩放", g_tele.available ? res_scale : dash);
+    StatRow(x, y, width, "性能", "延迟", g_tele.available && g_tele.gpu_us > 0 ? latency : dash,
+        "源帧率", g_tele.available ? source_fps : dash, "输出帧率", g_tele.available ? output_fps : dash);
+    StatRow(x, y, width, "计数", "增强帧", g_tele.available ? nr_frames : dash,
+        "超分帧", g_tele.available ? sr_frames : dash, "生成帧", g_tele.available ? fg_frames : dash);
+    y += 6.0f * dpi;
+    InfoBlock(x, y, width, "调整即时生效（约 0.5 秒内由载体应用）；关闭面板不会回滚设置。", false);
+}
+
+// ===== 页面：画面增强 =====
+static void RenderNrPage(float x, float &y, float width)
+{
+    const float dpi = g_dpi_scale;
+    PageHead(x, y, width, "画质", "画面增强", "Neural Rendering · 调整即时生效");
+
+    const float card_height = 58.0f * dpi;
+    CardRect(ImGui::GetWindowDrawList(), x, y, width, card_height, 8.0f * dpi);
+    if (ToggleRow("nr-toggle", x + 14.0f * dpi, y + 10.0f * dpi, width - 28.0f * dpi,
+        "画面增强", "关闭时等同原画，保留引擎原始输出", g_params.nr)) {
+        g_save.dirty = true;
+    }
+    y += card_height + 16.0f * dpi;
+
+    if (g_save.failed) {
+        char warn_text[96]{};
+        std::snprintf(warn_text, sizeof warn_text, "参数未保存，正在重试");
+        PutText(g_font_small, x, y, kColWarn, warn_text);
+        y += 18.0f * dpi;
+    }
+
+    SectionTitle(x, y, width, "档位");
+    static const char *tier_items[5] = {"原画", "轻量", "均衡", "浓郁", "自定义"};
+    int selected_tier = -1;
+    for (int i = 0; i < 4; ++i) {
+        if (g_tier_locked && g_params.MatchesTier(kSchemes[i].p)) selected_tier = i;
+    }
+    if (!g_tier_locked) selected_tier = 4;
+    const int tier_clicked = SegmentedBar("tier", x, y, width, tier_items, 5, selected_tier);
+    y += 30.0f * dpi + 8.0f * dpi + 8.0f * dpi;
+    if (tier_clicked >= 0 && tier_clicked < 4) {
+        const int keep_model = g_params.model;
+        const bool keep_fg = g_params.fg;
+        const int keep_multiplier = g_params.fg_multiplier;
+        g_params = kSchemes[tier_clicked].p;
+        g_params.model = keep_model;
+        g_params.fg = keep_fg;
+        g_params.fg_multiplier = keep_multiplier;
+        ClampParams(g_params);
+        g_tier_locked = true;
+        g_save.dirty = true;
+    } else if (tier_clicked == 4 && g_tier_locked) {
         g_tier_locked = false;
         if (g_custom_valid && !g_params.Equals(g_custom)) {
             g_params = g_custom;
             g_save.dirty = true;
         }
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("进入自定义模式：解锁微调；已保存的组合会被召回");
+    PutText(g_font_small, x, y, kColText3, "档位是完整配方（强度/色调/结构/皮肤）；原画等于关闭 NR。");
+    y += 24.0f * dpi;
 
-    ImGui::Spacing();
-    ImGui::TextColored(kAccent, "微调");
-    if (g_tier_locked) ImGui::TextDisabled("出厂档位锁定。点「自定义」解锁微调。");
-    if (g_tier_locked) ImGui::BeginDisabled(true);
-    HelpText("整体重绘幅度：0 关闭/最弱，1 满强度；过高会放大锐化与伪影。");
-    if (ImGui::SliderFloat("强度", &g_params.intensity, kNrIntensityMin, kNrIntensityMax, "%.2f"))
-        g_save.dirty = true;
-    HelpText("色彩与明暗层次：1.00 为中性（0–2）；越低越平，越高保留越多。");
-    if (ImGui::SliderFloat("色调结构", &g_params.tone, kNrToneMin, kNrToneMax, "%.2f"))
-        g_save.dirty = true;
-    HelpText("边缘与细节：0 最平滑，1 细节最多；过高会放大噪点。");
-    if (ImGui::SliderFloat("结构强度", &g_params.structure, kNrStructureMin, kNrStructureMax, "%.2f"))
-        g_save.dirty = true;
-    HelpText("人物皮肤：-1 更平滑，0 中性，+1 保留更多纹理。");
-    if (ImGui::SliderFloat("皮肤结构", &g_params.skin, kNrSkinMin, kNrSkinMax, "%.2f"))
-        g_save.dirty = true;
+    SectionTitle(x, y, width, "微调");
+    if (g_tier_locked) {
+        PutText(g_font_small, x, y, kColText3, "出厂档位锁定。点「自定义」解锁微调。");
+        y += 22.0f * dpi;
+    }
+    ImGui::BeginDisabled(g_tier_locked);
+    bool dirty = false;
+    dirty = SliderRow("intensity", x, y, width, "整体重绘幅度", g_params.intensity,
+        kNrIntensityMin, kNrIntensityMax, g_tier_locked) || dirty;
+    PutText(g_font_small, x, y - 18.0f * dpi, kColText3, "0 关闭/最弱，1 满强度；过高会放大锐化与伪影。");
+    y += 4.0f * dpi;
+    dirty = SliderRow("tone", x, y, width, "色调结构", g_params.tone, kNrToneMin, kNrToneMax, g_tier_locked) || dirty;
+    PutText(g_font_small, x, y - 18.0f * dpi, kColText3, "1.00 为中性（0–2）；越低越平，越高保留越多。");
+    y += 4.0f * dpi;
+    dirty = SliderRow("structure", x, y, width, "结构强度", g_params.structure,
+        kNrStructureMin, kNrStructureMax, g_tier_locked) || dirty;
+    PutText(g_font_small, x, y - 18.0f * dpi, kColText3, "0 最平滑，1 细节最多；过高会放大噪点。");
+    y += 4.0f * dpi;
+    dirty = SliderRow("skin", x, y, width, "皮肤结构", g_params.skin, kNrSkinMin, kNrSkinMax, g_tier_locked) || dirty;
+    PutText(g_font_small, x, y - 18.0f * dpi, kColText3, "-1 更平滑，0 中性，+1 保留更多纹理。");
+    y += 6.0f * dpi;
+    ImGui::EndDisabled();
+    if (dirty) g_save.dirty = true;
     ClampParams(g_params);
-    if (ImGui::Button("从载体 ini 重新读取")) {
+
+    if (Btn("reread", x, y, 150.0f * dpi, 32.0f * dpi, "重新读取当前设置", 1)) {
         Params p;
         ReadIniParams(p);
         ClampParams(p);
         g_params = p;
+        g_toast_until = GetTickCount64() + 2400;
         DebugLine(L"carrier ReShade.ini re-read into the panel (display only)");
     }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("从 host64\\ReShade.ini 读取载体已保存的值；只同步显示，不写入载体。");
-    if (g_tier_locked) ImGui::EndDisabled();
+    if (g_toast_until > GetTickCount64())
+        PutText(g_font_small, x + 160.0f * dpi, y + 9.0f * dpi, kColJadeText, "已重新读取载体当前设置");
+    y += 32.0f * dpi + 8.0f * dpi;
 }
 
-static void PageFg()
+// ===== 页面：补帧 =====
+static void RenderFgPage(float x, float &y, float width)
 {
-    PageHeader("补帧（DLSS-G）");
-    if (ToggleSwitch("补帧（DLSS-G）", g_params.fg)) g_save.dirty = true;
-    if (!g_tele.fg)
-        ImGui::TextDisabled("补帧：关（配置未开启）");
-    else if (g_tele.fg_failed)
-        ImGui::TextColored(kWarn, "补帧：开启但求值失败（显示真实帧）");
-    else if (g_tele.fg_frames > 0)
-        ImGui::TextColored(ImVec4(0.62f, 1.0f, 0.78f, 1.0f), "补帧：开（已插帧 %llu）", g_tele.fg_frames);
-    else
-        ImGui::TextColored(kWarn, "补帧：开（尚未插出帧）");
-    if (g_tele.available && (g_tele.fg_frames > 0 || g_tele.nr_frames > 0))
-        ImGui::Text("累计：真实帧 %llu → 插帧 %llu", g_tele.nr_frames, g_tele.fg_frames);
-    ImGui::Spacing();
-    ImGui::TextColored(kAccent, "补帧倍数");
-    for (int m = 2; m <= 4; ++m) {
-        if (m > 2) ImGui::SameLine();
-        char label[8];
-        std::snprintf(label, sizeof label, "%d×", m);
-        // zh: 固定宽 + SameLine；-1 宽会把后续按钮挤到面板外（首钮吃满整行）
-        if (SegmentedOption(label, g_params.fg_multiplier == m, 100 * g_dpi_scale)) {
-            g_params.fg_multiplier = m;
-            g_save.dirty = true;
-        }
+    const float dpi = g_dpi_scale;
+    PageHead(x, y, width, "画质", "补帧", "DLSS-G · 2× / 3× / 4× 插帧");
+
+    const float card_height = 58.0f * dpi;
+    CardRect(ImGui::GetWindowDrawList(), x, y, width, card_height, 8.0f * dpi);
+    if (ToggleRow("fg-toggle", x + 14.0f * dpi, y + 10.0f * dpi, width - 28.0f * dpi,
+        "补帧", "关闭时只输出超分帧", g_params.fg)) {
+        g_save.dirty = true;
     }
-    ImGui::TextWrapped("3×/4× 需要 RTX 50 系显卡（其他卡自动回落 2×）。倍数越高呈现帧率越高，"
-        "动态画面软化与延迟也会随之增加。");
-    ImGui::Spacing();
-    ImGui::TextWrapped("插帧会成倍增加显存与内存占用。源帧率上限请在桌面控制台设置（默认 30，防止内存爆涨退出）。");
+    y += card_height + 16.0f * dpi;
+
+    // 状态胶囊
+    const char *state_text = "未确认";
+    bool state_on = false;
+    bool state_warn = false;
+    if (g_tele.available) {
+        if (!g_tele.fg) { state_text = "补帧 关"; }
+        else if (g_tele.fg_failed) { state_text = "补帧失败"; state_warn = true; }
+        else if (g_tele.fg_frames > 0) {
+            char buffer[64]{};
+            std::snprintf(buffer, sizeof buffer, "已插帧 %llu", g_tele.fg_frames);
+            PutTextF(g_font_small, x, y + 4.0f * dpi, kColJadeText, "已插帧 %llu", g_tele.fg_frames);
+            state_text = "补帧 开"; state_on = true;
+        }
+        else { state_text = "补帧 等待"; state_warn = true; }
+    }
+    const float chip_x = x + width - ChipWidth(state_text);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    if (g_tele.available && g_tele.fg && g_tele.fg_frames > 0) {
+        // 上方已经输出文字，这里补一个胶囊在右侧
+        DrawChip(dl, chip_x, y, state_text, state_on, true);
+        y += 30.0f * dpi;
+    } else {
+        DrawChip(dl, x, y, state_text, false, false);
+        y += 26.0f * dpi;
+        if (state_warn) PutText(g_font_small, x + ChipWidth(state_text) + 8.0f * dpi, y - 22.0f * dpi,
+            kColWarn, "开启但求值失败时显示真实帧");
+    }
+    if (g_tele.available)
+        PutTextF(g_font_small, x, y, kColText3, "累计：增强帧 %llu → 生成帧 %llu",
+            g_tele.nr_frames, g_tele.fg_frames), y += 20.0f * dpi;
+
+    SectionTitle(x, y, width, "补帧倍数");
+    static const char *multiplier_items[3] = {"2×", "3×", "4×"};
+    const int multiplier_selected = std::clamp(g_params.fg_multiplier, 2, 4) - 2;
+    const int multiplier_clicked = SegmentedBar("fg-multiplier", x, y, width,
+        multiplier_items, 3, multiplier_selected);
+    y += 30.0f * dpi + 8.0f * dpi + 8.0f * dpi;
+    if (multiplier_clicked >= 0) {
+        g_params.fg_multiplier = multiplier_clicked + 2;
+        g_save.dirty = true;
+    }
+    if (g_params.fg_multiplier >= 4)
+        InfoBlock(x, y, width, "4× 需要 RTX 50 系显卡；其他卡载体自动回落 2×。4× 显著增加显存占用，出现提示时请降低档位。", true);
+    else
+        InfoBlock(x, y, width, "3×/4× 需要 RTX 50 系显卡（其他卡自动回落 2×）。倍数越高呈现帧率越高，动态画面软化与延迟也会增加。", false);
+    InfoBlock(x, y, width, "插帧会成倍增加显存与内存占用。源帧率上限请在桌面控制台设置（默认 30，防止内存爆涨退出）。", false);
 }
 
-static void PageModel()
+// ===== 页面：模型 =====
+static void RenderModelPage(float x, float &y, float width)
 {
-    PageHeader("模型");
+    const float dpi = g_dpi_scale;
+    PageHead(x, y, width, "画质", "模型", "三套引擎外观方案，切换后约 1 秒后台重建");
+
+    static const char *model_short[3] = {"默认", "自然", "电影"};
     for (int m = 1; m <= 3; ++m) {
-        if (SegmentedOption(kModelNames[m - 1], g_params.model == m, -1.0f)) {
+        const float row_height = 66.0f * dpi;
+        const bool selected = g_params.model == m;
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(ImVec2(x, y), ImVec2(x + width, y + row_height),
+            selected ? kColAccentSoft : kColSurface, 10.0f * dpi);
+        dl->AddRect(ImVec2(x, y), ImVec2(x + width, y + row_height),
+            selected ? kColAccentLine : kColLineSoft, 10.0f * dpi, 0, 1.0f * dpi);
+        const float radio_x = x + 16.0f * dpi, radio_y = y + row_height * 0.5f;
+        dl->AddCircle(ImVec2(radio_x, radio_y), 7.0f * dpi, selected ? kColAccent : kColText3, 0, 1.6f * dpi);
+        if (selected) dl->AddCircleFilled(ImVec2(radio_x, radio_y), 3.4f * dpi, kColAccent);
+        PutText(g_font_body, x + 34.0f * dpi, y + 12.0f * dpi, kColText, kModelNames[m - 1]);
+        if (selected) PutText(g_font_small, x + 34.0f * dpi + MeasureWidth(g_font_body, kModelNames[m - 1]) + 8.0f * dpi,
+            y + 15.0f * dpi, kColAccent, "使用中");
+        if (g_model_busy_until > GetTickCount64() && selected)
+            PutText(g_font_small, x + width - 14.0f * dpi - MeasureWidth(g_font_small, "重建中"),
+                y + 15.0f * dpi, kColAccent, "重建中");
+        ImGui::PushID(m);
+        ImGui::SetCursorScreenPos(ImVec2(x, y));
+        ImGui::InvisibleButton("##model", ImVec2(width, row_height));
+        if (ImGui::IsItemClicked() && g_params.model != m) {
             g_params.model = m;
             g_save.dirty = true;
+            g_model_busy_until = GetTickCount64() + 1200;
         }
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        ImGui::PopID();
+        // 描述：wrap 到右侧可用宽度
+        ImGui::PushFont(g_font_small);
+        ImGui::PushStyleColor(ImGuiCol_Text, kColText3);
+        ImGui::SetCursorScreenPos(ImVec2(x + 34.0f * dpi, y + 34.0f * dpi));
+        ImGui::PushTextWrapPos(x + width - 14.0f * dpi);
+        ImGui::TextUnformatted(kModelDesc[m - 1]);
+        ImGui::PopTextWrapPos();
+        ImGui::PopStyleColor();
+        ImGui::PopFont();
+        y += row_height + 10.0f * dpi;
     }
-    ImGui::TextWrapped("%s", kModelDesc[g_params.model - 1]);
-    ImGui::TextDisabled("三选一即引擎外观风格（默认/自然/电影）。切换立即生效，后台重建约 1 秒。");
+    y += 6.0f * dpi;
+    InfoBlock(x, y, width, "模型是引擎外观风格；切换后立即写入，后台约 1 秒重建（期间帧率短暂波动）。", false);
 }
 
-static void PageHelp()
+// ===== 页面：说明 =====
+static void RenderHelpPage(float x, float &y, float width)
 {
-    PageHeader("说明");
-    ImGui::TextDisabled("操作");
-    ImGui::BulletText("F10：原画对比（AIO 自带热键）");
-    ImGui::BulletText("F11：展开 / 收起本面板");
-    ImGui::BulletText("拖动顶部标题行移动面板；拖右下角缩放");
-    ImGui::TextDisabled("调参");
-    ImGui::BulletText("调整即时生效，经 live-params 通道写入；关闭面板不回滚");
-    ImGui::BulletText("档位是出厂配方（微调锁定）；点「自定义」解锁滑杆");
-    ImGui::BulletText("模型切换立即生效，约 1 秒后台重建");
-    ImGui::TextDisabled("其他");
-    ImGui::BulletText("源帧率上限在桌面控制台设置（防插帧爆内存）");
+    const float dpi = g_dpi_scale;
+    PageHead(x, y, width, "其他", "说明", "热键与调参约定");
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+
+    auto bullet = [&](const char *text) {
+        dl->AddCircleFilled(ImVec2(x + 4.0f * dpi, y + 8.0f * dpi), 1.8f * dpi, kColText3);
+        PutText(g_font_small, x + 14.0f * dpi, y, kColText2, text);
+        y += 22.0f * dpi;
+    };
+    SectionTitle(x, y, width, "操作");
+    bullet("F10：原画对比（AIO 自带热键）");
+    bullet("F11：展开 / 收起本面板");
+    bullet("拖动顶部标题行移动面板");
+    y += 8.0f * dpi;
+    SectionTitle(x, y, width, "调参");
+    bullet("调整即时生效，经 live-params 写入；关闭面板不回滚");
+    bullet("档位是出厂配方（微调锁定）；点「自定义」解锁滑杆");
+    bullet("模型切换立即生效，约 1 秒后台重建");
+    y += 8.0f * dpi;
+    SectionTitle(x, y, width, "其他");
+    bullet("源帧率上限在桌面控制台设置（防插帧爆内存）");
+    y += 10.0f * dpi;
+    InfoBlock(x, y, width, "关于：WOW-335-NR 游戏内面板 · 作者 Mcode · 工具版本 1.2.0", false);
+}
+
+// ===== 展开态 / 收起态 =====
+static int g_nav_page = 0;   // 0 状态 / 1 画面增强 / 2 补帧 / 3 模型 / 4 说明
+static void RenderStrip(float dpi)
+{
+    ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
+    ImGui::SetNextWindowSize(ImVec2(238.0f * dpi, 176.0f * dpi), ImGuiCond_Always);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 11.0f * dpi);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f * dpi);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(27 / 255.0f, 22 / 255.0f, 16 / 255.0f, 0.97f));
+    ImGui::PushStyleColor(ImGuiCol_Border, kColLine);
+    ImGui::Begin("##strip", nullptr, ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoSavedSettings |
+        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoMove);
+    const ImVec2 origin = ImGui::GetWindowPos();
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    const float x = origin.x + 12.0f * dpi;
+    float y = origin.y + 12.0f * dpi;
+
+    DrawBrandMark(dl, x + 8.0f * dpi, y + 9.0f * dpi, 8.0f * dpi);
+    PutText(g_font_body, x + 22.0f * dpi, y, kColText, "WOW-335-NR");
+    const char *scheme = SchemeName();
+    const float pill_width = MeasureWidth(g_font_small, scheme) + 16.0f * dpi;
+    dl->AddRectFilled(ImVec2(origin.x + 238.0f * dpi - 12.0f * dpi - pill_width, y),
+        ImVec2(origin.x + 238.0f * dpi - 12.0f * dpi, y + 20.0f * dpi), kColSurface3, 10.0f * dpi);
+    PutText(g_font_small, origin.x + 238.0f * dpi - 12.0f * dpi - pill_width + 8.0f * dpi,
+        y + 3.0f * dpi, kColAccent, scheme);
+    y += 26.0f * dpi;
+
+    const bool nr_on = g_tele.available ? g_tele.nr_enabled : g_params.nr;
+    const bool fg_on = g_tele.available ? g_tele.fg : g_params.fg;
+    DrawChip(dl, x, y, nr_on ? "画面增强 开" : "画面增强 关", nr_on, true);
+    DrawChip(dl, x + ChipWidth(nr_on ? "画面增强 开" : "画面增强 关") + 8.0f * dpi, y,
+        fg_on ? "补帧 开" : "补帧 关", fg_on, true);
+    y += 30.0f * dpi;
+
+    const char *fps_text = g_tele.available && g_game_fps > 0.0f ? FloatText(g_game_fps, 1) : "—";
+    PutText(g_font_num_sm, x, y, kColText, fps_text);
+    PutText(g_font_small, x + MeasureWidth(g_font_num_sm, fps_text) + 5.0f * dpi,
+        y + FontHeight(g_font_num_sm) - FontHeight(g_font_small) - 3.0f * dpi, kColAccent, "FPS");
+    PutTextRight(g_font_small, origin.x + 238.0f * dpi - 12.0f * dpi,
+        y + 8.0f * dpi, kColText3, LayerShortName(g_layer));
+    y += 30.0f * dpi;
+    if (g_tele.available) {
+        char sub[96]{};
+        std::snprintf(sub, sizeof sub, "%ux%u → %ux%u", g_tele.input_w, g_tele.input_h,
+            g_tele.output_w, g_tele.output_h);
+        PutText(g_font_small, x, y, kColText3, sub);
+    } else {
+        PutText(g_font_small, x, y, kColText3, "等待载体遥测…");
+    }
+    y += 20.0f * dpi;
+    if (Btn("strip-expand", x, y, 238.0f * dpi - 24.0f * dpi, 32.0f * dpi, "展开面板", 1)) ToggleExpanded();
+    g_ui_w = ImGui::GetWindowWidth();
+    g_ui_h = ImGui::GetWindowHeight();
+    ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(2);
 }
 
 static void RenderUi()
 {
     const float dpi = g_dpi_scale;
-
-    // 收起态：右上信息条（穿透，仅展示）
     if (!g_expanded) {
-        ImGui::SetNextWindowPos(ImVec2(5 * dpi, 3 * dpi), ImGuiCond_Always);
-        ImGui::SetNextWindowSize(ImVec2(204 * dpi, 116 * dpi));
-        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 8.0f * dpi);
-        ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.071f, 0.090f, 0.122f, 0.92f));
-        ImGui::Begin("##strip", nullptr, ImGuiWindowFlags_NoDecoration |
-            ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav);
-        if (g_save.failed) ImGui::TextColored(kWarn, "参数未保存，正在重试");
-        ImGui::TextColored(kAccent, "WOW-335-NR");
-        ImGui::SameLine(0, 6);
-        ImGui::TextUnformatted(SchemeName());
-        if (g_tele.available) {
-            ImGui::TextColored(g_tele.nr_enabled ? kAccent : kMuted, "● NR %s", g_tele.nr_enabled ? "开" : "关");
-            ImGui::SameLine(0, 8);
-            if (!g_tele.fg) ImGui::TextColored(kMuted, "● FG 关");
-            else if (g_tele.fg_failed) ImGui::TextColored(kWarn, "● FG ✗");
-            else if (g_tele.fg_frames > 0) ImGui::TextColored(kAccent, "● FG 开");
-            else ImGui::TextColored(kWarn, "● FG 待");
-        } else
-            ImGui::TextUnformatted("NR 状态：未确认");
-        if (g_layer == LayerState::RawMode || g_layer == LayerState::Hidden ||
-            g_layer == LayerState::UnderGame)
-            ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.45f, 1.0f), "图层：%s", LayerShortName(g_layer));
-        else
-            ImGui::Text("图层：%s", LayerShortName(g_layer));
-        if (ImGui::Button("展开面板 >>", ImVec2(-1, 0))) ToggleExpanded();
-        // 尺寸必须在帧内捕获（End 之后 CurrentWindow 为空，再查尺寸会崩）
-        g_ui_w = ImGui::GetWindowWidth();
-        g_ui_h = ImGui::GetWindowHeight();
-        ImGui::End();
-        ImGui::PopStyleColor();
-        ImGui::PopStyleVar();
+        RenderStrip(dpi);
         return;
     }
 
-    // 展开态：三段式（自绘标题行 / 侧栏+内容页 / 底栏）
     ImGui::SetNextWindowPos(ImVec2(0, 0), ImGuiCond_Always);
     ImGui::SetNextWindowSize(ImVec2(g_panel_w * dpi, g_panel_h * dpi), ImGuiCond_Once);
-    ImGui::SetNextWindowSizeConstraints(ImVec2(400 * dpi, 360 * dpi),
-        ImVec2(900 * dpi, 2400 * dpi));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(480 * dpi, 460 * dpi), ImVec2(900 * dpi, 1800 * dpi));
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(0, 0));
-    ImGui::Begin("WOW-335-NR 面板", nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings |
-        ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoTitleBar |
-        ImGuiWindowFlags_NoScrollbar);
-    ImGui::PopStyleVar();
-
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 12.0f * dpi);
+    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 1.0f * dpi);
+    ImGui::PushStyleColor(ImGuiCol_WindowBg, kColCanvas);
+    ImGui::PushStyleColor(ImGuiCol_Border, kColLine);
+    ImGui::Begin("##panel", nullptr, ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav |
+        ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
     const ImVec2 wpos = ImGui::GetWindowPos();
     const float wtotal = ImGui::GetWindowWidth();
-    const float cap_h = 40.0f * dpi;     // 标题行（与 WM_NCHITTEST 拖拽区高度一致）
-    const float bot_h = 36.0f * dpi;     // 底栏
-    const float nav_w = 118.0f * dpi;    // 侧栏
-    const float body_h = ImGui::GetWindowHeight() - cap_h - bot_h;
+    const float htotal = ImGui::GetWindowHeight();
+    const float cap_h = 48.0f * dpi;
+    const float nav_w = 136.0f * dpi;
+    const float bot_h = 44.0f * dpi;
+    const float body_top = wpos.y + cap_h;
+    const float body_height = htotal - cap_h - bot_h;
     ImDrawList *dl = ImGui::GetWindowDrawList();
-    const ImU32 col_sep = IM_COL32(40, 50, 62, 255);
-    const ImU32 col_title_bg = IM_COL32(11, 15, 20, 255);
 
-    // ---- 标题行：居中标题 + 右侧状态点 + 关闭按钮（红色悬停）----
-    dl->AddRectFilled(wpos, ImVec2(wpos.x + wtotal, wpos.y + cap_h), col_title_bg);
+    // ---- 标题栏 ----
+    dl->AddRectFilled(wpos, ImVec2(wpos.x + wtotal, body_top), kColCanvas);
+    dl->AddLine(ImVec2(wpos.x, body_top - 1.0f * dpi), ImVec2(wpos.x + wtotal, body_top - 1.0f * dpi),
+        kColLineSoft, 1.0f * dpi);
+    DrawBrandMark(dl, wpos.x + 27.0f * dpi, wpos.y + cap_h * 0.5f, 9.0f * dpi);
+    PutText(g_font_body, wpos.x + 42.0f * dpi, wpos.y + cap_h * 0.5f - FontHeight(g_font_body) * 0.5f,
+        kColText, "WOW-335-NR");
+    // 状态胶囊靠右（收起按钮左侧）
+    const bool nr_on = g_tele.available ? g_tele.nr_enabled : g_params.nr;
+    const bool fg_on = g_tele.available ? g_tele.fg : g_params.fg;
+    char nr_text[24]{}, fg_text[24]{};
+    std::snprintf(nr_text, sizeof nr_text, "画面增强 %s", nr_on ? "开" : "关");
+    std::snprintf(fg_text, sizeof fg_text, "补帧 %s", fg_on ? "开" : "关");
+    const float collapse_w = 36.0f * dpi;
+    const float chip_right = wpos.x + wtotal - collapse_w - 8.0f * dpi;
+    const float fg_width = ChipWidth(fg_text);
+    const float nr_width = ChipWidth(nr_text);
+    DrawChip(dl, chip_right - fg_width, wpos.y + (cap_h - 23.0f * dpi) * 0.5f, fg_text, fg_on, true);
+    DrawChip(dl, chip_right - fg_width - 8.0f * dpi - nr_width, wpos.y + (cap_h - 23.0f * dpi) * 0.5f,
+        nr_text, nr_on, true);
+    if (wtotal >= 520.0f * dpi) {
+        const float meta_x = chip_right - fg_width - 8.0f * dpi - nr_width - 12.0f * dpi
+            - MeasureWidth(g_font_small, "Mcode · v1.2.0");
+        PutText(g_font_small, meta_x, wpos.y + (cap_h - FontHeight(g_font_small)) * 0.5f,
+            kColText3, "Mcode · v1.2.0");
+    }
+    // 收起按钮（右上）
     {
-        const float th = ImGui::GetTextLineHeight();
-        const char *title = "WOW-335-NR 画面设置";
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + (wtotal - ImGui::CalcTextSize(title).x) * 0.5f,
-            wpos.y + (cap_h - th) * 0.5f));
-        ImGui::TextUnformatted(title);
+        const float button_x = wpos.x + wtotal - collapse_w - 2.0f * dpi;
+        const float button_y = wpos.y + (cap_h - 26.0f * dpi) * 0.5f;
+        ImGui::SetCursorScreenPos(ImVec2(button_x, button_y));
+        ImGui::InvisibleButton("##collapse", ImVec2(26.0f * dpi, 26.0f * dpi));
+        const bool hovered = ImGui::IsItemHovered();
+        if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (hovered)
+            dl->AddRectFilled(ImVec2(button_x, button_y),
+                ImVec2(button_x + 26.0f * dpi, button_y + 26.0f * dpi), kColSurface2, 6.0f * dpi);
+        const float icon_cx = button_x + 13.0f * dpi, icon_cy = button_y + 13.0f * dpi;
+        dl->AddLine(ImVec2(icon_cx - 4.0f * dpi, icon_cy + 1.5f * dpi),
+            ImVec2(icon_cx, icon_cy - 3.0f * dpi), kColText2, 1.5f * dpi);
+        dl->AddLine(ImVec2(icon_cx, icon_cy - 3.0f * dpi),
+            ImVec2(icon_cx + 4.0f * dpi, icon_cy + 1.5f * dpi), kColText2, 1.5f * dpi);
+        if (ImGui::IsItemClicked()) ToggleExpanded();
+    }
 
-        if (g_tele.available) {
-            char nr_s[16], fg_s[16];
-            std::snprintf(nr_s, sizeof nr_s, "● NR %s", g_tele.nr_enabled ? "开" : "关");
-            std::snprintf(fg_s, sizeof fg_s, "● FG %s",
-                !g_tele.fg ? "关" : g_tele.fg_failed ? "✗" : g_tele.fg_frames > 0 ? "开" : "待");
-            const float gap = 12.0f * dpi;
-            const float total = ImGui::CalcTextSize(nr_s).x + gap + ImGui::CalcTextSize(fg_s).x;
-            ImGui::SetCursorScreenPos(ImVec2(wpos.x + wtotal - 48 * dpi - total - gap,
-                wpos.y + (cap_h - th) * 0.5f));
-            ImGui::TextColored(g_tele.nr_enabled ? kAccent : kMuted, "%s", nr_s);
-            ImGui::SameLine(0, gap);
-            ImGui::TextColored(!g_tele.fg ? kMuted : g_tele.fg_failed ? kWarn
-                : g_tele.fg_frames > 0 ? kAccent : kWarn, "%s", fg_s);
+    // ---- 左侧导航 ----
+    dl->AddRectFilled(ImVec2(wpos.x, body_top), ImVec2(wpos.x + nav_w, body_top + body_height), kColNavBg);
+    dl->AddLine(ImVec2(wpos.x + nav_w, body_top), ImVec2(wpos.x + nav_w, body_top + body_height),
+        kColLineSoft, 1.0f * dpi);
+    static const char *nav_labels[5] = {"状态", "画面增强", "补帧", "模型", "说明"};
+    static const char *nav_eyebrows[2] = {"画质", "其他"};
+    float nav_y = body_top + 16.0f * dpi;
+    PutText(g_font_small, wpos.x + 18.0f * dpi, nav_y, kColText3, nav_eyebrows[0]);
+    nav_y += 22.0f * dpi;
+    for (int i = 0; i < 4; ++i) {
+        const float item_x = wpos.x + 8.0f * dpi;
+        const float item_h = 34.0f * dpi;
+        ImGui::PushID(i);
+        ImGui::SetCursorScreenPos(ImVec2(item_x, nav_y));
+        ImGui::InvisibleButton("##nav", ImVec2(nav_w - 16.0f * dpi, item_h));
+        if (ImGui::IsItemClicked()) g_nav_page = i;
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (g_nav_page == i) {
+            dl->AddRectFilled(ImVec2(item_x, nav_y), ImVec2(item_x + nav_w - 16.0f * dpi, nav_y + item_h),
+                kColAccentSoft, 6.0f * dpi);
+            dl->AddRectFilled(ImVec2(item_x, nav_y), ImVec2(item_x + 3.0f * dpi, nav_y + item_h),
+                kColAccent, 2.0f * dpi);
         }
-
-        const float bx = 30.0f * dpi;
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + wtotal - bx - 10 * dpi,
-            wpos.y + (cap_h - 24 * dpi) * 0.5f));
-        ImGui::PushStyleColor(ImGuiCol_Button, 0);
-        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(0.78f, 0.23f, 0.23f, 0.85f));
-        ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(0.88f, 0.30f, 0.30f, 1.0f));
-        if (ImGui::Button("×", ImVec2(bx, 24 * dpi))) ToggleExpanded();
-        ImGui::PopStyleColor(3);
+        DrawNavIcon(dl, i, item_x + 18.0f * dpi, nav_y + item_h * 0.5f,
+            g_nav_page == i ? kColAccent : kColText3);
+        PutText(g_font_body, item_x + 34.0f * dpi, nav_y + (item_h - FontHeight(g_font_body)) * 0.5f,
+            g_nav_page == i ? kColText : kColText2, nav_labels[i]);
+        nav_y += item_h + 2.0f * dpi;
+        ImGui::PopID();
     }
-
-    // ---- 侧栏 ----
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x, wpos.y + cap_h));
-    // zh: 左内边距 20——此前 10 与窗口边贴得太近（用户反馈），也比内容页 16 更局促。
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(20 * dpi, 12 * dpi));
-    ImGui::BeginChild("##nav", ImVec2(nav_w, body_h));
+    nav_y += 12.0f * dpi;
+    PutText(g_font_small, wpos.x + 18.0f * dpi, nav_y, kColText3, nav_eyebrows[1]);
+    nav_y += 22.0f * dpi;
     {
-        ImGui::TextDisabled("画质");
-        if (NavItem("状态", 0)) g_nav_page = 0;
-        if (NavItem("画面增强", 1)) g_nav_page = 1;
-        if (NavItem("补帧", 2)) g_nav_page = 2;
-        if (NavItem("模型", 3)) g_nav_page = 3;
-        ImGui::Spacing();
-        ImGui::TextDisabled("其他");
-        if (NavItem("说明", 4)) g_nav_page = 4;
+        const float item_x = wpos.x + 8.0f * dpi;
+        const float item_h = 34.0f * dpi;
+        ImGui::PushID(4);
+        ImGui::SetCursorScreenPos(ImVec2(item_x, nav_y));
+        ImGui::InvisibleButton("##nav", ImVec2(nav_w - 16.0f * dpi, item_h));
+        if (ImGui::IsItemClicked()) g_nav_page = 4;
+        if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (g_nav_page == 4) {
+            dl->AddRectFilled(ImVec2(item_x, nav_y), ImVec2(item_x + nav_w - 16.0f * dpi, nav_y + item_h),
+                kColAccentSoft, 6.0f * dpi);
+            dl->AddRectFilled(ImVec2(item_x, nav_y), ImVec2(item_x + 3.0f * dpi, nav_y + item_h),
+                kColAccent, 2.0f * dpi);
+        }
+        DrawNavIcon(dl, 4, item_x + 18.0f * dpi, nav_y + item_h * 0.5f,
+            g_nav_page == 4 ? kColAccent : kColText3);
+        PutText(g_font_body, item_x + 34.0f * dpi, nav_y + (item_h - FontHeight(g_font_body)) * 0.5f,
+            g_nav_page == 4 ? kColText : kColText2, nav_labels[4]);
+        ImGui::PopID();
+    }
+    // 侧栏底部：遥测连接点
+    const bool tele_ok = g_tele.available;
+    dl->AddCircleFilled(ImVec2(wpos.x + 20.0f * dpi, body_top + body_height - 24.0f * dpi),
+        2.4f * dpi, tele_ok ? kColJade : kColText3);
+    PutText(g_font_small, wpos.x + 29.0f * dpi, body_top + body_height - 32.0f * dpi,
+        tele_ok ? kColJadeText : kColText3, tele_ok ? "遥测已连接" : "遥测未连接");
+
+    // ---- 内容页（可滚动） ----
+    ImGui::SetCursorScreenPos(ImVec2(wpos.x + nav_w, body_top));
+    ImGui::BeginChild("##pages", ImVec2(wtotal - nav_w, body_height), ImGuiChildFlags_None,
+        ImGuiWindowFlags_None);
+    {
+        const ImVec2 child_pos = ImGui::GetWindowPos();
+        const float pad_x = 20.0f * dpi;
+        const float content_width = ImGui::GetWindowWidth() - pad_x * 2.0f;
+        float y = child_pos.y + 16.0f * dpi;
+        const float x = child_pos.x + pad_x;
+        switch (g_nav_page) {
+        case 0: RenderStatusPage(x, y, content_width); break;
+        case 1: RenderNrPage(x, y, content_width); break;
+        case 2: RenderFgPage(x, y, content_width); break;
+        case 3: RenderModelPage(x, y, content_width); break;
+        default: RenderHelpPage(x, y, content_width); break;
+        }
+        ImGui::SetCursorScreenPos(ImVec2(child_pos.x + 4.0f * dpi, y));
+        ImGui::Dummy(ImVec2(1.0f, 1.0f));
     }
     ImGui::EndChild();
-    ImGui::PopStyleVar();
-    dl->AddLine(ImVec2(wpos.x + nav_w, wpos.y + cap_h),
-        ImVec2(wpos.x + nav_w, wpos.y + cap_h + body_h), col_sep);
 
-    // ---- 内容页 ----
-    ImGui::SetCursorScreenPos(ImVec2(wpos.x + nav_w + 1, wpos.y + cap_h));
-    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16 * dpi, 12 * dpi));
-    ImGui::BeginChild("##page", ImVec2(wtotal - nav_w - 1, body_h));
-    switch (g_nav_page) {
-    case 0: PageStatus(); break;
-    case 1: PageNr(); break;
-    case 2: PageFg(); break;
-    case 3: PageModel(); break;
-    default: PageHelp(); break;
-    }
-    ImGui::EndChild();
-    ImGui::PopStyleVar();
-
-    // ---- 底栏：状态文字 + 退出 ----
-    const float by = wpos.y + cap_h + body_h;
-    dl->AddLine(ImVec2(wpos.x, by), ImVec2(wpos.x + wtotal, by), col_sep);
+    // ---- 底栏 ----
+    const float footer_y = wpos.y + htotal - bot_h;
+    dl->AddLine(ImVec2(wpos.x, footer_y), ImVec2(wpos.x + wtotal, footer_y), kColLineSoft, 1.0f * dpi);
+    dl->AddCircleFilled(ImVec2(wpos.x + 22.0f * dpi, footer_y + bot_h * 0.5f), 2.2f * dpi,
+        g_save.failed ? kColWarn : kColJade);
+    PutText(g_font_small, wpos.x + 30.0f * dpi, footer_y + (bot_h - FontHeight(g_font_small)) * 0.5f,
+        g_save.failed ? kColWarn : kColText3,
+        g_save.failed ? "参数未保存，正在重试" : "调整即时生效 · 自动保存");
     {
-        const float th = ImGui::GetTextLineHeight();
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + 14 * dpi, by + (bot_h - th) * 0.5f));
-        ImGui::TextDisabled("调整即时生效 · 自动保存");
-        const float bw = 92 * dpi, bh = 25 * dpi;
-        ImGui::SetCursorScreenPos(ImVec2(wpos.x + wtotal - bw - 10 * dpi, by + (bot_h - bh) * 0.5f));
-        if (ImGui::Button("退出面板", ImVec2(bw, bh))) g_running = false;
+        const float exit_w = 92.0f * dpi, exit_h = 30.0f * dpi;
+        const float exit_x = wpos.x + wtotal - exit_w - 14.0f * dpi;
+        const float exit_y = footer_y + (bot_h - exit_h) * 0.5f;
+        if (Btn("panel-exit", exit_x, exit_y, exit_w, exit_h, "退出面板", 1)) g_running = false;
     }
 
     g_ui_w = ImGui::GetWindowWidth();
     g_ui_h = ImGui::GetWindowHeight();
     ImGui::End();
+    ImGui::PopStyleColor(2);
+    ImGui::PopStyleVar(3);
 }
 
 // ===== Win32 / D3D11 =====
@@ -917,7 +1563,7 @@ static LRESULT CALLBACK PanelWndProc(HWND window, UINT message, WPARAM wparam, L
             ScreenToClient(window, &pt);
             RECT rc{};
             GetClientRect(window, &rc);
-            const float cap_h = 40.0f * g_dpi_scale;          // 自绘标题行（与 RenderUi cap_h 一致）
+            const float cap_h = 48.0f * g_dpi_scale;          // 自绘标题行（与 RenderUi cap_h 一致）
             const float btn_zone = 48.0f * g_dpi_scale;       // 右上 ✕ 按钮豁免区（HTCLIENT 才可点击）
             if (pt.y < cap_h) {
                 if (pt.x >= rc.right - static_cast<LONG>(btn_zone)) return HTCLIENT;
@@ -1026,7 +1672,7 @@ int wmain(int argc, wchar_t **argv)
 
     g_window = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
         wc.lpszClassName, L"WOW-335-NR 面板", WS_POPUP, 0, 0,
-        static_cast<int>(216 * g_dpi_scale), static_cast<int>(74 * g_dpi_scale),
+        static_cast<int>(238 * g_dpi_scale), static_cast<int>(176 * g_dpi_scale),
         nullptr, nullptr, wc.hInstance, nullptr);
     if (!g_window) return 5;
 
@@ -1035,11 +1681,7 @@ int wmain(int argc, wchar_t **argv)
     ApplyStyle();
     ImGui_ImplWin32_Init(g_window);
     ImGui_ImplDX11_Init(g_device, g_context);
-    ImFont *zh_font = nullptr;
-    for (const char *font_path : {"C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyhl.ttc",
-                                     "C:/Windows/Fonts/simhei.ttf", "C:/Windows/Fonts/segoeui.ttf"}) {
-        if ((zh_font = ImGui::GetIO().Fonts->AddFontFromFileTTF(font_path, 17.0f * g_dpi_scale))) break;
-    }
+    LoadPanelFonts();
     g_poll_hotkey = RegisterHotKey(g_window, 1, 0, VK_F11) == 0;
     if (g_poll_hotkey) out_line(L"提示：F11 热键被占用，改用按键轮询检测。");
     out_line(L"WOW-335-NR 面板已启动：收起态为信息条，F11 展开完整面板。游戏退出后面板转入等待。");
@@ -1184,11 +1826,9 @@ int wmain(int argc, wchar_t **argv)
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
         ImGui::NewFrame();
-        if (zh_font) ImGui::PushFont(zh_font);
         RenderUi();
-        if (zh_font) ImGui::PopFont();
         ImGui::Render();
-        const float clear[4] = {0.03f, 0.05f, 0.07f, 1.0f};
+        const float clear[4] = {20.0f / 255.0f, 16.0f / 255.0f, 10.0f / 255.0f, 1.0f};
         g_context->OMSetRenderTargets(1, &g_target, nullptr);
         g_context->ClearRenderTargetView(g_target, clear);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());

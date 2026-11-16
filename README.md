@@ -213,8 +213,10 @@ WoW 3.3.5a 集成方式与日常入口。
 
 ### 游戏内悬浮面板
 
-- 独立置顶窗口，D3D11 + ImGui，微软雅黑动态字形；收起态是鼠标穿透的信息条，展开态可交互。
-- 页面：状态、画面增强（NR）、补帧（DLSS-G）、模型、说明。
+- 独立置顶窗口，D3D11 + ImGui，皮革黑 / 古金 / 苔玉配色；展开态 700×800（560×640 设计尺寸 @125%）。
+- 布局：48px 标题栏（品牌标 + 画面增强 / 补帧状态 chip + 收起）、136px 左侧分组导航（状态 / 画面增强 / 补帧 / 模型 / 说明 + 底部遥测连接点）、内容页、44px 底栏。
+- 状态页：输出帧率 hero、档位 / 模型 / 强度 / 管线 4 项快览、分辨率 / 性能 / 计数三组数据表；画面增强页：开关 + 5 档配方 + 4 个微调滑杆（锁定态压暗）与「重新读取当前设置」；补帧页：开关、2× / 3× / 4× 分段与显存提示；模型页：默认 / 自然 / 电影三选项与“重建中”提示；说明页：热键与调参约定。
+- 收起态是 238×176 信息条：品牌、档位、两枚状态 chip、输出帧率、分辨率与展开按钮，可点击展开。
 - `F11` 展开 / 收起。热键注册失败时自动退回按键轮询。
 - 参数写入 `host64\live-params.json`；载体应用后会写回 `ReShade.ini`。
 - 「从载体 ini 重新读取」只同步显示，不写入载体；刚改的值需等载体落盘（约 1 秒）。
@@ -325,6 +327,34 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build-WindowWatch.ps1
 3. 面板 / 窗口助手部署后核对：确认锁中源码 SHA-256 与当前源一致，再把新产物的
    SHA-256 更新进 `panel-lock.json` / `watcher-lock.json`。
 4. 控制台没有独立锁文件；其部署来源以构建记录 `build.json` 的产物哈希追溯。
+
+### 原生控制台候选包与运行依赖审核
+
+`Build-ControlCenter.ps1` 输出 `_scratch/dlss5-aio/native-ui-candidate-<guid>/`（构建记录
+`build.json` 状态 `compiled_candidate_native_ui`），除 `WOW-335-NR-ControlCenter.exe` 外还打包：
+
+- `install-manifest.json`、`payload-lock.json`、`watcher-lock.json`、`panel-lock.json`、`templates/`；
+- `bin/dlss5-panel.exe`、`bin/window_watch.exe`（从工作区 `tools/dlss5/bin/` 拷贝，哈希与锁
+  一致时 `build.json` 的 `portable.panel_lock_match` / `portable.watch_lock_match` 为 true）；
+- exe 内嵌多尺寸应用图标（`native/control_center/app/control_center.ico`，16–256 像素，由
+  `tools/make_control_center_icon.py` 生成、`control_center.rc` 编译为资源），窗口类、任务栏与
+  Alt-Tab 使用同一图标，不额外散落图标文件。
+
+构建脚本生成 `audit.cmd` 并执行 `dumpbin /dependents`，导入表写入 `dependencies.txt` 与
+`build.json` 的 `portable.dependencies`；若出现 VC 运行库导入（`vcruntime`、`msvcp`、
+`ucrtbase` 等）构建直接失败——原生工具要求 `/MT` 静态运行库。运行依赖只有系统 DLL
+（bcrypt、d2d1、dwrite、dxgi、gdi32、kernel32、ole32、shell32、user32）；`pdh.dll` 与
+`version.dll` 由程序按需动态加载，不进入导入表；NVIDIA 运行时 DLL 与 ReShade 仍由用户
+自备，不随包分发。
+
+便携运行：整个候选目录可复制到任意位置直接运行，清单、模板、锁、面板/助手都从产品根读取。
+两种部署布局都支持：
+
+- 便携 / 子目录布局：`<产品根>/WOW-335-NR-ControlCenter.exe` + `<产品根>/bin/dlss5-panel.exe`；
+- 平铺布局：`tools/dlss5/` 放清单、模板、锁，`tools/dlss5/bin/` 放控制台、面板、助手；
+  控制台启动时若自身目录没有 `install-manifest.json`，会把产品根回退到上一级目录。
+
+无论哪种布局，资源都必须与产品根同目录；部署面板 / 助手后仍按上一节更新锁文件哈希。
 
 ### 载体
 

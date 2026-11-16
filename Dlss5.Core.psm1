@@ -14,6 +14,11 @@ $script:ProtectedRoots = @(
 )
 # zh: 调试追踪——环境变量 DLSS5_CORE_DEBUG=1 时把事务关键步骤写入
 # _scratch/dlss5-aio/logs/core-debug.log（20261109）。日志文件不入库（logs/）。
+# zh: 显卡信息短期缓存；文件身份和路径检查不能使用长期缓存。
+$script:GpuCache = $null
+$script:GpuCacheAt = [DateTime]::MinValue
+$script:StatusCache = $null
+$script:StatusCacheAt = [DateTime]::MinValue
 $script:DebugEnabled = ($env:DLSS5_CORE_DEBUG -eq '1')
 $script:DebugLogPath = [IO.Path]::GetFullPath((Join-Path $script:ScratchRoot 'dlss5-aio/logs/core-debug.log'))
 function Write-Dlss5CoreDebug {
@@ -55,11 +60,12 @@ function Test-Within([string]$Path, [string]$Root) {
 function Assert-NoReparse([string]$Path) {
     $current = [IO.Path]::GetFullPath($Path)
     while (-not [string]::IsNullOrEmpty($current)) {
-        $item = Get-Item -LiteralPath $current -Force -ErrorAction SilentlyContinue
-        if ($null -ne $item) {
-            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-                throw "路径含有链接或重解析点：$current"
-            }
+        $attributes = $null
+        try { $attributes = [IO.File]::GetAttributes($current) }
+        catch [IO.FileNotFoundException] { }
+        catch [IO.DirectoryNotFoundException] { }
+        if ($null -ne $attributes -and ($attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "路径含有链接或重解析点：$current"
         }
         $parent = [IO.Path]::GetDirectoryName($current.TrimEnd([IO.Path]::DirectorySeparatorChar))
         if ([string]::IsNullOrEmpty($parent) -or $parent -eq $current) { break }
@@ -79,7 +85,18 @@ function Get-MemberPath([string]$Root, [string]$Relative) {
 }
 
 function Get-Sha256([string]$Path) {
-    return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    # zh: 用 .NET 流式哈希，不依赖 Get-FileHash cmdlet。子进程的 PSModulePath 被别的
+    # PowerShell 7 会话污染时，Windows PowerShell 5.1 无法自动加载 Utility 模块，
+    # Get-FileHash 会报「无法识别为 cmdlet」（20261113 实测控制台日志）。
+    # 同大小文件可保留原时间戳，事务检查必须重新读取文件并拒绝并发写入。
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try { $hashBytes = $algorithm.ComputeHash($stream) } finally { $algorithm.Dispose() }
+    } finally { $stream.Dispose() }
+    $builder = [Text.StringBuilder]::new(64)
+    foreach ($byte in $hashBytes) { [void]$builder.Append($byte.ToString('x2', [Globalization.CultureInfo]::InvariantCulture)) }
+    return $builder.ToString()
 }
 
 function Move-AtomicReplace([string]$Source, [string]$Target) {
@@ -869,7 +886,14 @@ function Read-AioTelemetry([int]$ProcessId) {
                 NrEnabled = [bool]($flags -band 2);
                 PipelineReady = [bool]($flags -band 8); ProcessedOutputSelected = [bool]($flags -band 32);
                 FrameGeneration = [bool]($flags -band 4); ProxyHidden = [bool]($flags -band 256);
-                NrFrames = [BitConverter]::ToUInt64($bytes, 200); SrFrames = [BitConverter]::ToUInt64($bytes, 208) }
+                InputWidth = [BitConverter]::ToUInt32($bytes, 56); InputHeight = [BitConverter]::ToUInt32($bytes, 60);
+                OutputWidth = [BitConverter]::ToUInt32($bytes, 64); OutputHeight = [BitConverter]::ToUInt32($bytes, 68);
+                SourceFps = [BitConverter]::ToUInt32($bytes, 72); ProxyFps = [BitConverter]::ToUInt32($bytes, 76);
+                ActiveNrModel = [BitConverter]::ToUInt32($bytes, 80);
+                GpuTotalUs = [BitConverter]::ToUInt32($bytes, 116);
+                SourceFrameAverageUs = [BitConverter]::ToUInt32($bytes, 152);
+                NrFrames = [BitConverter]::ToUInt64($bytes, 200); SrFrames = [BitConverter]::ToUInt64($bytes, 208);
+                FgFrames = [BitConverter]::ToUInt64($bytes, 216); FramesPresented = [BitConverter]::ToUInt64($bytes, 224) }
         }
         throw '无法取得稳定的遥测快照。'
     } catch {
@@ -904,6 +928,7 @@ function Get-Dlss5Status {
     $lock = Get-Dlss5Lock
     $clientFull = Get-CanonicalPath $Client
     Assert-NoReparse $clientFull
+    $sw = [Diagnostics.Stopwatch]::StartNew()
     $files = @()
     $architectures = @{
         'd3d9.dll' = 'x86'; 'standalone-dlssnr.addon32' = 'x86';
@@ -936,6 +961,7 @@ function Get-Dlss5Status {
         $gameIdentity = if ($machine -eq 'x86') { "存在（x86，$size 字节；不比对哈希）" }
                         else { "存在但架构为 $machine（应为 x86）" }
     }
+    Write-Dlss5CoreDebug ('perf: identity ' + $sw.ElapsedMilliseconds + ' ms')
     $configPath = Get-MemberPath $clientFull 'host64/ReShade.ini'
     $config = [ordered]@{ NeuralRendering = $null; Model = $null; Intensity = $null; FrameGeneration = $null;
         NvidiaOpticalFlowMotion = $null; DetachedPresentation = $null; WindowedInputScaling = $null; PipelineEnabled = $null;
@@ -958,19 +984,40 @@ function Get-Dlss5Status {
         if ($matches.Count -eq 1) { $config.ClassicD3D9CpuBridge = $matches[0].Groups[1].Value.Trim() }
         elseif ($matches.Count -gt 1) { $config.Error = 'classic_d3d9_cpu_fallback 重复。' }
     }
-    $processes = @(Get-CimInstance Win32_Process -ErrorAction Stop | Where-Object {
-        $_.Name -in @('wow.exe', 'AIO DLSS5 32-bit Wrapper.exe')
-    })
+    Write-Dlss5CoreDebug ('perf: config ' + $sw.ElapsedMilliseconds + ' ms')
+    # zh: 进程枚举改用 Get-Process（Win32_Process 的 CIM 查询在本机约 0.7 秒，
+    # 每次切页都会触发，是卡顿主因）。字段口径保持：仅统计与本客户端路径一致的游戏/载体进程。
     $gamePath = Get-MemberPath $clientFull 'wow.exe'
     $hostPath = Get-MemberPath $clientFull 'host64/AIO DLSS5 32-bit Wrapper.exe'
-    $games = @($processes | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($gamePath, [StringComparison]::OrdinalIgnoreCase) })
-    $hosts = @($processes | Where-Object { $_.ExecutablePath -and $_.ExecutablePath.Equals($hostPath, [StringComparison]::OrdinalIgnoreCase) })
-    $unknown = @($processes | Where-Object { -not $_.ExecutablePath }).Count
-    $telemetry = if ($hosts.Count -eq 1 -and $unknown -eq 0) { Read-AioTelemetry ([int]$hosts[0].ProcessId) }
+    $games = @()
+    $hosts = @()
+    $unknown = 0
+    try {
+        foreach ($item in @(Get-Process -Name 'wow' -ErrorAction SilentlyContinue)) {
+            try {
+                if ($item.Path) { if ($item.Path.Equals($gamePath, [StringComparison]::OrdinalIgnoreCase)) { $games += $item } }
+                else { $unknown++ }
+            } catch { $unknown++ }
+        }
+        foreach ($item in @(Get-Process -Name 'AIO DLSS5 32-bit Wrapper' -ErrorAction SilentlyContinue)) {
+            try {
+                if ($item.Path) { if ($item.Path.Equals($hostPath, [StringComparison]::OrdinalIgnoreCase)) { $hosts += $item } }
+                else { $unknown++ }
+            } catch { $unknown++ }
+        }
+    } catch { }
+    $telemetry = if ($hosts.Count -eq 1 -and $unknown -eq 0) { Read-AioTelemetry ([int]$hosts[0].Id) }
                  else { [pscustomobject]@{ Available = $false; Reason = '载体未运行、数量不唯一或身份不可读' } }
-    $graphics = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
-        [pscustomobject]@{ Name = $_.Name; DriverVersion = $_.DriverVersion }
-    })
+    Write-Dlss5CoreDebug ('perf: procs+telemetry ' + $sw.ElapsedMilliseconds + ' ms')
+    $now = [DateTime]::UtcNow
+    if ($null -eq $script:GpuCache -or ($now - $script:GpuCacheAt).TotalSeconds -gt 60) {
+        $script:GpuCache = @(Get-CimInstance Win32_VideoController -ErrorAction Stop | ForEach-Object {
+            [pscustomobject]@{ Name = $_.Name; DriverVersion = $_.DriverVersion }
+        })
+        $script:GpuCacheAt = $now
+    }
+    $graphics = $script:GpuCache
+    Write-Dlss5CoreDebug ('perf: gpu ' + $sw.ElapsedMilliseconds + ' ms')
     $recordInfo = Test-Dlss5ClientRecord $clientFull
     $installRecord = if ($null -eq $recordInfo) { '没有（首次安装或已卸载）' }
                      else { "存在（$(@($recordInfo.Record.entries).Count) 项，$($recordInfo.Record.installed_utc)）" }
@@ -1239,4 +1286,4 @@ Export-ModuleMember -Function Get-Dlss5InstallPreview, Invoke-Dlss5Install, Invo
     Get-Dlss5Operations, Invoke-Dlss5Restore, Invoke-Dlss5Repair, Get-Dlss5Status, Set-Dlss5Settings,
     Set-Dlss5Pipeline, Export-Dlss5Diagnostics, Start-Dlss5WindowWatch, Get-Dlss5AdvancedSettings,
     Set-Dlss5AdvancedSettings, Get-Dlss5Schemes, Save-Dlss5Scheme, Apply-Dlss5Scheme,
-    Get-Dlss5Manifest, Export-Dlss5ManifestList, Test-Dlss5ClientRecord
+    Get-Dlss5Manifest, Export-Dlss5ManifestList, Test-Dlss5ClientRecord, Get-Sha256

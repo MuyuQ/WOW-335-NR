@@ -1,5 +1,9 @@
 # Third-party notices
 
+## JSON for Modern C++
+
+`native/control_center/vendor/nlohmann/json.hpp` is JSON for Modern C++ v3.12.0, upstream commit `55f93686c01528224f448c19128836e7df245f72`, licensed under the MIT license. The accompanying license is in `native/control_center/vendor/nlohmann/LICENSE.MIT`.
+
 The Apache License 2.0 in this repository applies to the original DLSS5 ReShade AIO code and documentation contributed by its copyright holders. It does not relicense third-party software, SDK material, submodules, or proprietary runtime binaries. Those components remain subject to their respective licenses and terms.
 
 ## DLSS5-Feeder and bundled dependencies
