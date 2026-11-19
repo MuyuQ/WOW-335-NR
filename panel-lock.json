@@ -1,8 +1,13 @@
 {
  "schema": 1,
  "files": {
-  "dlss5-panel.exe": "07ac491c5fe7229fb7e1c3023d5a7149b8e42f9838f1135b58291c85927bbbf5",
-  "panel.cpp": "18fe4d408f00f02e3b064a173cd7ea4e464387e400d5abede6a94672fa0bab9aa",
+  "dlss5-panel.exe": "b712c8f536bd9f534d993816e02b042b76985705525730f1b53616f26e7b67d0",
+  "panel.cpp": "7298957ae12e8a532aaf8adaa9e2203e7078859fadfdb5e88dccd615af3d4169",
   "imgui_version": "1.92.5 (vendored)"
+ },
+ "candidate": {
+  "source_path": "_scratch/dlss5-aio/panel-build-1a72ccc3af574383a9c4fc0560bcaf31/dlss5-panel.exe",
+  "size_bytes": 781824,
+  "note": "本轮已验证的面板候选；构建必须用 -PanelCandidate 指定该文件，部署时再同步 tools/dlss5/bin。"
  }
 }

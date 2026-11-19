@@ -105,6 +105,19 @@ function Write-Perf([string]$Label, [long]$Ms) {
     try { [IO.File]::AppendAllText((Join-Path $env:TEMP 'opencode\perf.log'), ((Get-Date).ToString('HH:mm:ss.fff') + '  ' + $Label + '  ' + $Ms + ' ms' + "`r`n")) } catch { }
 }
 
+function Write-UiLog([string]$Message) {
+    # zh: 设置/配置读写的失败日志；启动早期日志框还不存在，同时写文件保证可追溯。
+    $line = '[' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '] ' + $Message
+    try {
+        $dir = Join-Path $env:TEMP 'opencode'
+        [IO.Directory]::CreateDirectory($dir) | Out-Null
+        [IO.File]::AppendAllText((Join-Path $dir 'control-center.log'), ($line + "`r`n"), [Text.UTF8Encoding]::new($false))
+    } catch { }
+    try {
+        if (Get-Command -Name Add-Log -ErrorAction SilentlyContinue) { Add-Log $Message }
+    } catch { }
+}
+
 Import-Module (Join-Path $PSScriptRoot 'Dlss5.Core.psm1') -Force
 [Windows.Forms.Application]::EnableVisualStyles()
 
@@ -129,7 +142,9 @@ function Read-ConsoleSettings {
             }
             $result.Recent = $list
         }
-    } catch { }
+    } catch {
+        Write-UiLog ('读取控制台设置失败，保留默认值：' + $_.Exception.Message)
+    }
     return $result
 }
 
@@ -159,8 +174,19 @@ function Save-ConsoleSettings {
             if ($recent.Count -ge 5) { break }
         }
         $payload = [ordered]@{ client = [string]$script:clientPath; stage = [string]$script:stagePath; recent = @($recent) } | ConvertTo-Json -Depth 4
-        [IO.File]::WriteAllText($script:settingsFile, $payload, [Text.UTF8Encoding]::new($false))
-    } catch { }
+        # A7：先写唯一临时文件再原子替换，避免写到一半留下半截 JSON。
+        $temp = $script:settingsFile + '.new-' + [guid]::NewGuid().ToString('N')
+        try {
+            [IO.File]::WriteAllText($temp, $payload, [Text.UTF8Encoding]::new($false))
+            if ([IO.File]::Exists($script:settingsFile)) {
+                [IO.File]::Replace($temp, $script:settingsFile, [NullString]::Value)
+            } else {
+                [IO.File]::Move($temp, $script:settingsFile)
+            }
+        } finally {
+            if ([IO.File]::Exists($temp)) { [IO.File]::Delete($temp) }
+        }
+    } catch { Write-UiLog ('保存控制台设置失败：' + $_.Exception.Message) }
 }
 
 function Test-ClientRoot([string]$Path) {
@@ -314,6 +340,53 @@ $script:wizBusy = $false
 $script:gpuCache = $null
 $script:gpuCacheAt = [DateTime]::MinValue
 $script:pathTip = $null
+$script:statusAt = [DateTime]::MinValue
+$script:deployCache = $null
+$script:deployCacheAt = [DateTime]::MinValue
+$script:deployCacheKey = ''
+$script:restoreResult = $null
+$script:uiButtons = [Collections.Generic.List[object]]::new()
+$script:uiBusy = 0
+
+# P-A：状态与部署信息缓存。Refresh-Status 全量扫描后存 $script:status + 时间戳，
+# 页面切换 2 秒内复用；Get-DeployInfo 缓存 10 秒；写操作后调用 Reset-UiCache 失效。
+function Reset-UiCache {
+    $script:status = $null
+    $script:statusAt = [DateTime]::MinValue
+    $script:deployCache = $null
+    $script:deployCacheAt = [DateTime]::MinValue
+    $script:deployCacheKey = ''
+}
+
+function Get-UiStatus {
+    if ($null -ne $script:status -and (([DateTime]::UtcNow - $script:statusAt).TotalMilliseconds -lt 2000)) { return $script:status }
+    return (Refresh-Status -Quiet)
+}
+
+function Get-PendingInstallOperations {
+    $pending = @('in_progress', 'rollback_incomplete', 'preparing')
+    try { return @(Get-Dlss5Operations -Client $script:clientPath | Where-Object { $pending -contains [string]$_.Status }) } catch { return @() }
+}
+
+function Get-OperationStatusLabel([string]$Status) {
+    switch ($Status) {
+        'completed' { return '已完成' }
+        'in_progress' { return '未完成' }
+        'rollback_incomplete' { return '回滚未完成' }
+        'preparing' { return '准备中' }
+        default { return $Status }
+    }
+}
+
+function Get-OperationStatusColor([string]$Status) {
+    switch ($Status) {
+        'completed' { return $script:kJade }
+        'rollback_incomplete' { return $script:kDanger }
+        'in_progress' { return $script:kWarn }
+        'preparing' { return $script:kWarn }
+        default { return $script:kText3 }
+    }
+}
 
 $ContentWidth = (U 568)
 
@@ -383,6 +456,8 @@ function New-Button([string]$Text, [string]$Kind = 'secondary', [int]$Width = 96
             $button.FlatAppearance.MouseDownBackColor = $script:kSurface3
         }
     }
+    # A6：登记到统一列表，Invoke-Ui 执行期间临时禁用，避免重复点击/切页。
+    if ($script:uiButtons) { $script:uiButtons.Add($button) }
     return $button
 }
 
@@ -1012,8 +1087,17 @@ function Save-FpsCap([int]$Front, [int]$Back) {
     $path = Get-ConfigWtfPath
     if (-not [IO.File]::Exists($path)) { throw '客户端内没有 WTF\Config.wtf，请先启动一次游戏。' }
     $original = Read-ConfigWtf $path
-    $backup = $path + '.nr-' + (Get-Date -Format 'yyyyMMdd-HHmmss') + '.bak'
-    [IO.File]::Copy($path, $backup, $false)
+    # A7：同一秒内多次保存时追加序号，避免备份名冲突覆盖。
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backup = $path + '.nr-' + $stamp + '.bak'
+    $attempt = 1
+    while ([IO.File]::Exists($backup) -or [IO.Directory]::Exists($backup)) {
+        $backup = $path + '.nr-' + $stamp + '-' + $attempt + '.bak'
+        $attempt++
+        if ($attempt -gt 64) { throw '无法找到可用的 Config.wtf 备份文件名。' }
+    }
+    try { [IO.File]::Copy($path, $backup, $false) }
+    catch { throw ('创建 Config.wtf 备份失败：' + $_.Exception.Message) }
     $text = $original.Text
     $pairs = @(@('maxFPS', $Front), @('maxFPSBK', $Back))
     foreach ($pair in $pairs) {
@@ -1255,9 +1339,9 @@ function Show-View([string]$Name) {
         }
         if ($needsBuild) {
             switch ($Name) {
-                'main' { Update-Main }
+                'main' { Update-Main -Status (Get-UiStatus) }
                 'setup' { Update-Setup }
-                'maint' { Update-Maint }
+                'maint' { Update-Maint -Status (Get-UiStatus) }
                 'uninstall' { Update-Uninstall }
             }
             $script:viewBuilt[$Name] = $true
@@ -1274,6 +1358,13 @@ function Show-View([string]$Name) {
 }
 
 function Get-DeployInfo {
+    [CmdletBinding()]
+    param([switch]$Force)
+    $cacheKey = [string]$script:clientPath
+    if (-not $Force -and $null -ne $script:deployCache -and $script:deployCacheKey -eq $cacheKey -and
+        (([DateTime]::UtcNow - $script:deployCacheAt).TotalMilliseconds -lt 10000)) {
+        return $script:deployCache
+    }
     $info = [pscustomobject]@{ Installed = $false; Version = ''; InstalledAt = ''; Count = 0;
         NewFiles = 0; Replaced = 0; Same = 0; BackupRoot = ''; BackupCount = 0; Record = $null }
     try {
@@ -1296,10 +1387,14 @@ function Get-DeployInfo {
     if ($info.BackupRoot -and [IO.Directory]::Exists($info.BackupRoot)) {
         try { $info.BackupCount = @(Get-ChildItem -LiteralPath $info.BackupRoot -Recurse -File -Force).Count } catch { $info.BackupCount = 0 }
     }
+    $script:deployCache = $info
+    $script:deployCacheAt = [DateTime]::UtcNow
+    $script:deployCacheKey = $cacheKey
     return $info
 }
 
 function Update-Main {
+    param($Status)
     $view = $mainView
     Clear-Panel $view.Extra
     Clear-Panel $view.Body
@@ -1313,19 +1408,22 @@ function Update-Main {
     Write-Perf '  main/Get-DeployInfo' $swStep.ElapsedMilliseconds
     $swStep.Restart()
     $clientOk = Test-ClientRoot $script:clientPath
-    $status = $null
-    if ($clientOk) {
+    $status = if ($null -ne $Status) { $Status } else { $script:status }
+    if (-not $clientOk) {
+        $script:status = $null
+        $status = $null
+    } elseif ($null -eq $status) {
         try {
+            $scanSw = [Diagnostics.Stopwatch]::StartNew()
             $status = Get-Dlss5Status -Client $script:clientPath
-            Write-Perf '  main/Get-Dlss5Status' $swStep.ElapsedMilliseconds
-            $swStep.Restart()
             $script:status = $status
+            $script:statusAt = [DateTime]::UtcNow
+            Write-Perf '  main/Get-Dlss5Status' $scanSw.ElapsedMilliseconds
         } catch {
             $script:status = $null
+            $status = $null
             Add-Log ('读取客户端状态未完成：' + $_.Exception.Message)
         }
-    } else {
-        $script:status = $null
     }
     $config = if ($status) { $status.Config } else { $null }
     $running = if ($status) { $status.GameProcesses -gt 0 } else { Test-GameRunning }
@@ -1508,7 +1606,7 @@ function Update-Main {
     $actions.BackColor = [Drawing.Color]::Transparent
     $actions.Margin = [Windows.Forms.Padding]::new((U 0), (U 10), (U 0), (U 8))
     $check = New-Button '检查状态' 'secondary' (U 96) (U 32)
-    $check.Add_Click({ Invoke-Ui { Add-Log '已刷新客户端状态。'; Show-View 'main' } })
+    $check.Add_Click({ Invoke-Ui { Get-DeployInfo -Force | Out-Null; $null = Refresh-Status -Force; Show-View 'main' } })
     $panelLog = New-Button '打开悬浮面板日志' 'secondary' (U 132) (U 32)
     $panelLog.Add_Click({ Invoke-Ui {
         if (-not $script:lastPanelLog -or -not [IO.Directory]::Exists($script:lastPanelLog)) { throw '本次窗口尚未启动面板。' }
@@ -1656,20 +1754,44 @@ function Update-RuntimeState {
     } catch { }
 }
 function Refresh-Status {
+    [CmdletBinding()]
+    param([switch]$Force, [switch]$Quiet)
+    # P-A：默认复用 2 秒内的状态缓存；-Force 时强制全量扫描一次并记录耗时。
+    $totalSw = [Diagnostics.Stopwatch]::StartNew()
+    if (-not $script:clientPath -or -not (Test-ClientRoot $script:clientPath)) {
+        $script:status = $null
+        $script:statusAt = [DateTime]::MinValue
+        return $null
+    }
+    if (-not $Force -and $null -ne $script:status -and
+        (([DateTime]::UtcNow - $script:statusAt).TotalMilliseconds -lt 2000)) {
+        return $script:status
+    }
     try {
+        $scanSw = [Diagnostics.Stopwatch]::StartNew()
         $script:status = Get-Dlss5Status -Client $script:clientPath
-        Add-Log ("客户端：" + $script:status.GameIdentity + "；游戏进程 " + $script:status.GameProcesses + "；载体进程 " + $script:status.HostProcesses)
-        Add-Log ("安装记录：" + $script:status.InstallRecord)
-        foreach ($file in @($script:status.Files)) {
-            if ($file.Status -ne '与候选一致') { Add-Log ("文件 " + $file.Name + "：" + $file.Status) }
+        $scanMs = $scanSw.ElapsedMilliseconds
+        $script:statusAt = [DateTime]::UtcNow
+        $totalMs = $totalSw.ElapsedMilliseconds
+        if (-not $Quiet) {
+            Add-Log ("客户端：" + $script:status.GameIdentity + "；游戏进程 " + $script:status.GameProcesses + "；载体进程 " + $script:status.HostProcesses)
+            Add-Log ("安装记录：" + $script:status.InstallRecord)
+            foreach ($file in @($script:status.Files)) {
+                if ($file.Status -ne '与候选一致') { Add-Log ("文件 " + $file.Name + "：" + $file.Status) }
+            }
+            Add-Log ('[perf] refresh total=' + $totalMs + 'ms scan=' + $scanMs + 'ms')
         }
+        Write-Perf '[perf] refresh total' $totalMs
+        Write-Perf '[perf] refresh scan' $scanMs
         if ($null -ne $script:mainStatus) {
             $script:mainStatus.Game.Text = if ($script:status.GameProcesses -gt 0) { "运行中（$($script:status.GameProcesses)）" } else { '未运行' }
             $script:mainStatus.Host.Text = if ($script:status.HostProcesses -gt 0) { "运行中（$($script:status.HostProcesses)）" } else { '未运行' }
         }
     } catch {
         Add-Log ('检查状态未完成：' + $_.Exception.Message)
+        Write-Perf '[perf] refresh failed' $totalSw.ElapsedMilliseconds
     }
+    return $script:status
 }
 
 function Test-ClientDir([string]$Path) {
@@ -1921,6 +2043,7 @@ function Start-Precheck {
         $gameIdentity = ''
         try {
             $script:status = Get-Dlss5Status -Client $script:clientPath
+            $script:statusAt = [DateTime]::UtcNow
             $gameIdentity = [string]$script:status.GameIdentity
             $clientOk = $gameIdentity -like '存在*x86*'
         } catch { $clientOk = $false }
@@ -2064,6 +2187,7 @@ function Start-Install {
         Add-Log ('安装未完成：' + $script:installError)
     } finally {
         $form.UseWaitCursor = $false
+        Reset-UiCache
         $script:wizStep = 5
         Update-Setup
     }
@@ -2166,10 +2290,12 @@ function Build-SetupStep5($View) {
     Set-Footer $View '返回维护' { Show-View 'maint' } @(@{ Button = $doneButton })
 }
 function Update-Maint {
+    param($Status)
     $view = $maintView
     Clear-Panel $view.Extra
     Clear-Panel $view.Body
     $deploy = Get-DeployInfo
+    $statusForFiles = if ($null -ne $Status) { $Status } else { $script:status }
 
     $view.Body.Controls.Add((New-SectionTitle '已安装' $(if ($deploy.Installed) { '组件正常' } else { '未安装' })))
     $info = New-Card ((U 36) * 4 + (U 12)) $script:kSurface2 $script:kLineSoft
@@ -2190,7 +2316,16 @@ function Update-Maint {
 
     $view.Body.Controls.Add((New-SectionTitle '组件' ''))
     $files = @()
-    try { $files = @((Get-Dlss5Status -Client $script:clientPath).Files) } catch { Add-Log ('读取组件状态失败：' + $_.Exception.Message) }
+    if ($null -ne $statusForFiles) {
+        $files = @($statusForFiles.Files)
+    } elseif (Test-ClientRoot $script:clientPath) {
+        try {
+            $statusForFiles = Get-Dlss5Status -Client $script:clientPath
+            $script:status = $statusForFiles
+            $script:statusAt = [DateTime]::UtcNow
+            $files = @($statusForFiles.Files)
+        } catch { Add-Log ('读取组件状态失败：' + $_.Exception.Message) }
+    }
     $tierInfo = Get-TierInfo
     $coreFile = @($files | Where-Object { $_.Name -eq 'd3d9.dll' })
     $srFile = @($files | Where-Object { $_.Name -eq 'host64/nvngx_dlss.dll' })
@@ -2223,19 +2358,62 @@ function Update-Maint {
     $actions.Margin = [Windows.Forms.Padding]::new((U 0), (U 4), (U 0), (U 6))
     $actions.BackColor = [Drawing.Color]::Transparent
     $refresh = New-Button '检查更新' 'secondary' (U 252) (U 32)
-    $refresh.Add_Click({ Invoke-Ui { Refresh-Status; Update-Maint } })
+    $refresh.Add_Click({ Invoke-Ui {
+        Get-DeployInfo -Force | Out-Null
+        $null = Refresh-Status -Force
+        Update-Maint -Status $script:status
+    } })
     $repair = New-Button '修复安装' 'secondary' (U 252) (U 32)
     $repair.Add_Click({ Invoke-Ui {
-        $ops = @(Get-Dlss5Operations -Client $script:clientPath | Where-Object { $_.Status -eq 'completed' })
-        if ($ops.Count -eq 0) { throw '没有可修复的安装事务记录；可改用重新安装。' }
-        $result = Invoke-Dlss5Repair -Operation ([string]$ops[$ops.Count - 1].Operation)
+        $info = Test-Dlss5ClientRecord $script:clientPath
+        $recordPath = Join-Path $script:clientPath 'host64/dlss5-install-record.json'
+        $operation = ''
+        $adopt = $false
+        if ($null -ne $info -and [string]$info.Record.operation) {
+            $operation = [string]$info.Record.operation
+        } elseif (-not [IO.File]::Exists($recordPath)) {
+            # R1：没有客户端记录时默认拒绝；这里显式二次确认后才采用 -AdoptUninstalled。
+            $answer = [Windows.Forms.MessageBox]::Show(
+                '客户端内没有安装记录。要用当前最新安装事务的文件清单重新登记为已安装吗？' + "`r`n" + '仅当所有文件回读哈希与组件锁一致时才会写入记录。',
+                '重新登记安装记录', [Windows.Forms.MessageBoxButtons]::YesNo, [Windows.Forms.MessageBoxIcon]::Warning)
+            if ($answer -ne [Windows.Forms.DialogResult]::Yes) { throw '已取消：客户端没有安装记录，无法修复；可改用「重新安装」。' }
+            $ops = @(Get-Dlss5Operations -Client $script:clientPath | Where-Object { [string]$_.Status -eq 'completed' })
+            if ($ops.Count -eq 0) { throw '没有可用的安装事务记录；请改用重新安装。' }
+            $operation = [string]$ops[$ops.Count - 1].Operation
+            $adopt = $true
+        } else {
+            throw '客户端安装记录不可读，保留现状；请先恢复记录或改用重新安装。'
+        }
+        $result = if ($adopt) { Invoke-Dlss5Repair -Operation $operation -AdoptUninstalled } else { Invoke-Dlss5Repair -Operation $operation }
         Add-Log ("修复状态：" + $result.Status + "，修复文件 " + $result.Repaired + " 项。")
+        if ($result.Adopted) { Add-Log '已用事务成员重建客户端安装记录。' }
         Add-Log ('记录：' + $result.Report)
-        if (@($result.Errors).Count) { Add-Log (@($result.Errors) -join '；') }
+        if (@($result.Warnings).Count) { Add-Log (@($result.Warnings) -join '；') }
+        if (@($result.Errors).Count) { Add-Log ('修复未完成：' + (@($result.Errors) -join '；')) }
+        Reset-UiCache
+        $null = Refresh-Status -Force
+        Update-Maint -Status $script:status
     } })
     $actions.Controls.Add($refresh)
     $actions.Controls.Add($repair)
     $view.Body.Controls.Add($actions)
+
+    # A2：安装事务列表展示 completed / in_progress / rollback_incomplete / preparing 状态。
+    $operations = @()
+    try { $operations = @(Get-Dlss5Operations -Client $script:clientPath) } catch { }
+    if ($operations.Count -gt 0) {
+        $view.Body.Controls.Add((New-SectionTitle '安装事务' ('共 ' + $operations.Count + ' 条')))
+        $opCard = New-Card ([Math]::Max((U 40), $operations.Count * (U 40) + (U 8))) $script:kSurface2 $script:kLineSoft
+        $opY = 4
+        foreach ($operation in $operations) {
+            $statusText = [string]$operation.Status
+            $row = New-FileRow (Split-Path ([string]$operation.Operation) -Leaf) (Get-OperationStatusLabel $statusText) (Get-OperationStatusColor $statusText)
+            $row.Location = [Drawing.Point]::new((U 0), $opY)
+            $opCard.Controls.Add($row)
+            $opY += $row.Height + (U 1)
+        }
+        $view.Body.Controls.Add($opCard)
+    }
     $openBackup = New-Button '打开备份目录' 'secondary' $ContentWidth (U 32)
     $openBackup.Margin = [Windows.Forms.Padding]::new((U 0), (U 0), (U 0), (U 6))
     $openBackup.Add_Click({ Invoke-Ui {
@@ -2455,12 +2633,60 @@ function Update-Maint {
         } })
         $restore = New-Button '恢复安装前文件' 'secondary' (U 128) (U 30)
         $restore.Add_Click({ Invoke-Ui {
-            $ops = @(Get-Dlss5Operations -Client $script:clientPath | Where-Object { $_.Status -eq 'completed' })
+            $ops = @(Get-Dlss5Operations -Client $script:clientPath | Where-Object { [string]$_.Status -in @('completed', 'preparing', 'in_progress', 'rollback_incomplete') })
             if ($ops.Count -eq 0) { throw '没有可恢复的安装事务记录。' }
-            $result = Invoke-Dlss5Restore -Operation ([string]$ops[$ops.Count - 1].Operation)
-            Add-Log ("恢复状态：" + $result.Status + "；记录：" + $result.Report)
-            Update-Maint
+            $script:restoreResult = Invoke-Dlss5Restore -Operation ([string]$ops[$ops.Count - 1].Operation) -Recovery
+            Add-Log ("恢复状态：" + $script:restoreResult.Status + "；记录：" + $script:restoreResult.Report)
+            if ([int]$script:restoreResult.SavedModified -gt 0) { Add-Log ('保留改动 ' + $script:restoreResult.SavedModified + ' 项，目录：' + $script:restoreResult.ModifiedRoot) }
+            if ($script:restoreResult.CleanupIncomplete) { Add-Log ('收尾未完成：' + (@($script:restoreResult.CleanupErrors) -join '；')) }
+            Reset-UiCache
+            Update-Maint -Status (Refresh-Status -Force)
         } })
+        $rollback = New-Button '回滚未完成事务' 'secondary' (U 128) (U 30)
+        $rollback.Add_Click({ Invoke-Ui {
+            $pending = @(Get-PendingInstallOperations)
+            if ($pending.Count -eq 0) { throw '没有未完成的安装事务。' }
+            $script:restoreResult = Invoke-Dlss5Restore -Operation ([string]$pending[$pending.Count - 1].Operation) -Recovery
+            Add-Log ("回滚状态：" + $script:restoreResult.Status + "；记录：" + $script:restoreResult.Report)
+            if ($script:restoreResult.CleanupIncomplete) { Add-Log ('收尾未完成：' + (@($script:restoreResult.CleanupErrors) -join '；')) }
+            Reset-UiCache
+            Update-Maint -Status (Refresh-Status -Force)
+        } })
+        $retryCleanup = New-Button '重试清理' 'secondary' (U 112) (U 30)
+        # R4（界面）：回调只做磁盘操作与结果映射；按钮启用状态由页面构建时统一计算
+        # （见下方 $retryCleanupEnabled），不在这里引用页面构建函数的局部变量（$retryCleanup
+        # 在点击回调执行时已离开作用域，旧代码因此抛错且页面没有刷新）。
+        # 清理失败或异常时也必须刷新页面，让结果卡显示原因并保留可重试入口。
+        $retryCleanup.Add_Click({ Invoke-Ui {
+            try {
+                if ($null -eq $script:restoreResult -or -not [string]$script:restoreResult.Operation) { throw '还没有可重试的恢复清理记录。' }
+                $result = Invoke-Dlss5CleanupPending -Operation ([string]$script:restoreResult.Operation) -Recovery
+                $script:restoreResult = Get-Dlss5CleanupRetryState -Previous $script:restoreResult -Result $result
+                Add-Log ('清理状态：' + $script:restoreResult.Status + '；删除备份 ' + $script:restoreResult.RemovedBackups + ' 个。')
+                if ([string]$script:restoreResult.CleanupMessage) { Add-Log ('清理说明：' + [string]$script:restoreResult.CleanupMessage) }
+                if (@($script:restoreResult.CleanupErrors).Count) { Add-Log ('清理未完成：' + (@($script:restoreResult.CleanupErrors) -join '；')) }
+            } finally {
+                Reset-UiCache
+                Update-Maint -Status (Refresh-Status -Force)
+            }
+        } })
+        # R4（界面）：构建页面时根据当前恢复结果计算按钮状态：
+        #  * 无恢复结果：没有可重试的事务，禁用；
+        #  * 首次恢复留下待清理 / 重试仍失败 / 暂缓：启用；
+        #  * 清理成功或已被后续安装永久取代：禁用（永久失效的原因由结果卡显示）。
+        $retryCleanupEnabled = $false
+        if ($null -ne $script:restoreResult) {
+            $retryableProperty = $script:restoreResult.PSObject.Properties['CleanupRetryable']
+            if ($null -ne $retryableProperty) {
+                $retryCleanupEnabled = [bool]$retryableProperty.Value
+            } else {
+                $incompleteProperty = $script:restoreResult.PSObject.Properties['CleanupIncomplete']
+                $permanentProperty = $script:restoreResult.PSObject.Properties['CleanupPermanent']
+                $retryCleanupEnabled = ($null -ne $incompleteProperty -and [bool]$incompleteProperty.Value) -and
+                    -not ($null -ne $permanentProperty -and [bool]$permanentProperty.Value)
+            }
+        }
+        $retryCleanup.Enabled = $retryCleanupEnabled
         $exportList = New-Button '导出移入清单' 'secondary' (U 112) (U 30)
         $exportList.Add_Click({ Invoke-Ui {
             $dialog = [Windows.Forms.SaveFileDialog]::new()
@@ -2492,8 +2718,55 @@ function Update-Maint {
             $result = Set-Dlss5Pipeline -Client $script:clientPath -Enabled $enable
             Add-Log ("已保存：" + $(if ($enable) { '启用' } else { '停用' }) + " AIO 管线；重启游戏后生效。")
         } })
-        foreach ($tool in @($diagnose, $restore, $exportList, $openPanel, $watch, $pipeline)) { $tools.Controls.Add($tool) }
+        foreach ($tool in @($diagnose, $restore, $rollback, $retryCleanup, $exportList, $openPanel, $watch, $pipeline)) { $tools.Controls.Add($tool) }
         $view.Body.Controls.Add($tools)
+
+        # R4：恢复/回滚结果展示，含收尾状态与错误；收尾未完成时用「重试清理」继续，
+        # 已被后续安装永久取代时显示原因并结束重试（见 Get-Dlss5CleanupRetryState）。
+        if ($null -ne $script:restoreResult) {
+            $view.Body.Controls.Add((New-SectionTitle '恢复结果' ''))
+            $cleanupIncompleteProperty = $script:restoreResult.PSObject.Properties['CleanupIncomplete']
+            $cleanupPermanentProperty = $script:restoreResult.PSObject.Properties['CleanupPermanent']
+            $cleanupMessageProperty = $script:restoreResult.PSObject.Properties['CleanupMessage']
+            $hasCleanupIssue = ($null -ne $cleanupIncompleteProperty -and [bool]$cleanupIncompleteProperty.Value) -or
+                ($null -ne $cleanupPermanentProperty -and [bool]$cleanupPermanentProperty.Value)
+            $cleanupStatusText = if ($null -ne $cleanupPermanentProperty -and [bool]$cleanupPermanentProperty.Value) {
+                '已结束（不可重试）'
+            } elseif ($null -ne $cleanupIncompleteProperty -and [bool]$cleanupIncompleteProperty.Value) {
+                '未完成（可重试清理）'
+            } else { '完成' }
+            $restoreCard = New-Card ((U 36) * 4 + (U 12)) $script:kSurface2 $(if ($hasCleanupIssue) { $script:kWarn } else { $script:kLineSoft })
+            $restoreRows = @(
+                @('状态', [string]$script:restoreResult.Status),
+                @('保留改动', ([string]$script:restoreResult.SavedModified + ' 项')),
+                @('收尾', $cleanupStatusText),
+                @('记录', [string]$script:restoreResult.Report)
+            )
+            $restoreY = 6
+            foreach ($pair in $restoreRows) {
+                $row = New-KvRow $pair[0] $pair[1]
+                $row.Location = [Drawing.Point]::new((U 0), $restoreY)
+                $restoreCard.Controls.Add($row)
+                $restoreY += $row.Height + (U 1)
+            }
+            $view.Body.Controls.Add($restoreCard)
+            if ([int]$script:restoreResult.SavedModified -gt 0) {
+                $savedLabel = New-Label ('改动文件已保留到：' + [string]$script:restoreResult.ModifiedRoot) $script:fSmall $script:kText3 (U 520)
+                $view.Body.Controls.Add($savedLabel)
+            }
+            if ($null -ne $cleanupMessageProperty -and [string]$cleanupMessageProperty.Value) {
+                $cleanupMsgLabel = New-Label ('清理说明：' + [string]$cleanupMessageProperty.Value) $script:fSmall $(if ($hasCleanupIssue) { $script:kWarn } else { $script:kText3 }) (U 520)
+                $view.Body.Controls.Add($cleanupMsgLabel)
+            }
+            if (@($script:restoreResult.CleanupErrors).Count) {
+                $cleanupLabel = New-Label ('收尾错误：' + (@($script:restoreResult.CleanupErrors) -join '；')) $script:fSmall $script:kWarn (U 520)
+                $view.Body.Controls.Add($cleanupLabel)
+            }
+            if (@($script:restoreResult.Errors).Count) {
+                $restoreErrorLabel = New-Label ('错误：' + (@($script:restoreResult.Errors) -join '；')) $script:fSmall $script:kWarn (U 520)
+                $view.Body.Controls.Add($restoreErrorLabel)
+            }
+        }
 
         $maintLogView = New-LogBox (U 110)
         $maintLogView.Panel.Margin = [Windows.Forms.Padding]::new((U 0), (U 4), (U 0), (U 0))
@@ -2529,12 +2802,13 @@ function Update-Uninstall {
     Clear-Panel $view.Body
     $deploy = Get-DeployInfo
 
-    if (-not $deploy.Installed) {
+    if (-not $deploy.Installed -and $null -eq $script:unResult) {
         $view.Body.Controls.Add((New-Label '当前客户端没有安装记录。' $script:fBody $script:kText3))
         Set-Footer $view '返回维护' { Show-View 'maint' } @()
         return
     }
 
+    if ($deploy.Installed) {
     $entries = @($deploy.Record.Record.entries)
     $remove = @($entries | Where-Object { [string]$_.pre_state -eq 'absent' })
     $restore = @($entries | Where-Object { [string]$_.pre_state -eq 'present' })
@@ -2620,17 +2894,19 @@ function Update-Uninstall {
     $note = New-Label '卸载成功后同时清理安装记录与 host64\dlss5-backup 备份目录；失败不掩盖，备份缺失时不删当前文件。' $script:fSmall $script:kText3 (U 520)
     $note.Margin = [Windows.Forms.Padding]::new((U 0), (U 6), (U 0), (U 0))
     $view.Body.Controls.Add($note)
+    }
 
     if ($null -ne $script:unResult) {
         $view.Body.Controls.Add((New-SectionTitle '卸载结果' ''))
         $result = $script:unResult
-        $card = New-Card (U 148) $script:kSurface2 $(if (@($result.Errors).Count) { $script:kWarn } else { $script:kLineSoft })
+        $card = New-Card ((U 36) * 6 + (U 12)) $script:kSurface2 $(if (@($result.Errors).Count) { $script:kWarn } else { $script:kLineSoft })
         $rows = @(
             @('状态', [string]$result.Status),
             @('已还原', ([string]$result.Restored + ' 项')),
             @('已删除', ([string]$result.Deleted + ' 项')),
             @('保留改动', ([string]$result.SavedModified + ' 项')),
-            @('清理产物', ([string]$result.ResidueRemoved + ' 项'))
+            @('清理产物', ([string]$result.ResidueRemoved + ' 项')),
+            @('保留备份', $(if (@($result.BackupsKept).Count) { [string]@($result.BackupsKept).Count + ' 个（未登记或已变化）' } else { '无' }))
         )
         $y = 6
         foreach ($pair in $rows) {
@@ -2640,29 +2916,75 @@ function Update-Uninstall {
             $y += $row.Height + (U 1)
         }
         $view.Body.Controls.Add($card)
+        if ([int]$result.SavedModified -gt 0) {
+            $modifiedText = New-Label ('改动文件已保留到：' + $(if ([string]$result.ModifiedRoot) { [string]$result.ModifiedRoot } else { '(未记录)' })) $script:fSmall $script:kText3 (U 520)
+            $view.Body.Controls.Add($modifiedText)
+        }
+        if (@($result.CleanupErrors).Count) {
+            $cleanupText = New-Label ('清理未完成：' + (@($result.CleanupErrors) -join '；')) $script:fSmall $script:kWarn (U 520)
+            $view.Body.Controls.Add($cleanupText)
+        }
         if (@($result.Errors).Count) {
             $errorText = New-Label (@($result.Errors) -join '；') $script:fSmall $script:kWarn (U 520)
             $view.Body.Controls.Add($errorText)
         }
     }
 
-    $run = New-Button '确认卸载' 'danger' (U 112) (U 32)
-    if ($null -ne $script:unResult) { $run.Enabled = $false; $run.BackColor = $script:kSurface3; $run.ForeColor = $script:kText3 }
-    $run.Add_Click({ Invoke-Ui {
-        $script:unResult = Invoke-Dlss5Uninstall -Client $script:clientPath
-        Add-Log ("卸载状态：" + $script:unResult.Status + "；还原 " + $script:unResult.Restored + " 项，删除 " + $script:unResult.Deleted + " 项。")
-        Update-Uninstall
-    } })
-    Set-Footer $view '' $null @(@{ Button = $run })
+    $footerActions = @()
+    if ($deploy.Installed) {
+        $run = New-Button '确认卸载' 'danger' (U 112) (U 32)
+        if ($null -ne $script:unResult) { $run.Enabled = $false; $run.BackColor = $script:kSurface3; $run.ForeColor = $script:kText3 }
+        $run.Add_Click({ Invoke-Ui {
+            $script:unResult = Invoke-Dlss5Uninstall -Client $script:clientPath -Recovery
+            Add-Log ("卸载状态：" + $script:unResult.Status + "；还原 " + $script:unResult.Restored + " 项，删除 " + $script:unResult.Deleted + " 项，保留改动 " + $script:unResult.SavedModified + " 项。")
+            if ([int]$script:unResult.SavedModified -gt 0) { Add-Log ('改动文件已保留到：' + $script:unResult.ModifiedRoot) }
+            if (@($script:unResult.CleanupErrors).Count) { Add-Log ('清理未完成：' + (@($script:unResult.CleanupErrors) -join '；')) }
+            if (@($script:unResult.Errors).Count) { Add-Log ('卸载未完成：' + (@($script:unResult.Errors) -join '；')) }
+            Reset-UiCache
+            Update-Uninstall
+        } })
+        $footerActions += @{ Button = $run }
+    }
+    if ($null -ne $script:unResult -and [string]$script:unResult.ModifiedRoot -and [IO.Directory]::Exists([string]$script:unResult.ModifiedRoot)) {
+        $openModified = New-Button '打开改动目录' 'secondary' (U 120) (U 32)
+        $openModified.Add_Click({ Invoke-Ui {
+            $path = [string]$script:unResult.ModifiedRoot
+            if (-not [IO.Directory]::Exists($path)) { throw '改动备份目录已不存在。' }
+            Start-Process -FilePath 'explorer.exe' -ArgumentList @(('"' + $path + '"'))
+        } })
+        $footerActions += @{ Button = $openModified }
+    }
+    Set-Footer $view '' $null $footerActions
 }
 
 function Invoke-Ui([scriptblock]$Action) {
+    # A6：操作期间禁用所有已登记按钮（含页脚导航）并显示等待光标；结束时记录耗时。
     foreach ($k in @('main', 'setup', 'maint', 'uninstall')) { $script:viewDirty[$k] = $true }
-    $form.UseWaitCursor = $true
-    [Windows.Forms.Application]::DoEvents()
-    try { & $Action }
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $disabled = [Collections.Generic.List[object]]::new()
+    $script:uiBusy = [int]$script:uiBusy + 1
+    try {
+        if ($null -ne $script:uiButtons) {
+            foreach ($button in @($script:uiButtons.ToArray())) {
+                if ($null -eq $button -or $button.IsDisposed -or $button.Disposing) { continue }
+                if ($button.Enabled) { $disabled.Add($button); $button.Enabled = $false }
+            }
+        }
+        $form.UseWaitCursor = $true
+        [Windows.Forms.Application]::DoEvents()
+        & $Action
+    }
     catch { Add-Log ('操作未完成：' + $_.Exception.Message) }
-    finally { $form.UseWaitCursor = $false }
+    finally {
+        foreach ($button in $disabled) {
+            try { if (-not $button.IsDisposed -and -not $button.Disposing) { $button.Enabled = $true } } catch { }
+        }
+        $script:uiBusy = [int]$script:uiBusy - 1
+        if ($script:uiBusy -le 0) { $script:uiBusy = 0; $form.UseWaitCursor = $false }
+        $sw.Stop()
+        Write-Perf '[perf] ui-action' $sw.ElapsedMilliseconds
+        Add-Log ('[perf] action total=' + $sw.ElapsedMilliseconds + 'ms')
+    }
 }
 
 $form.KeyPreview = $true

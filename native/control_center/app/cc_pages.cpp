@@ -34,6 +34,18 @@ bool SamePath(const std::wstring& a, const std::wstring& b) {
     return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
+// 面板进程是否在运行：页面绘制在帧循环里，进程表最多每秒查询一次。
+bool PanelRunningCached() {
+    static ULONGLONG lastQuery = 0;
+    static bool running = false;
+    const ULONGLONG now = GetTickCount64();
+    if (lastQuery == 0 || now - lastQuery >= 1000) {
+        lastQuery = now == 0 ? 1 : now;
+        running = control_center::PanelProcessRunning();
+    }
+    return running;
+}
+
 std::wstring ClientErrorText(ClientError error) {
     switch (error) {
         case ClientError::None: return L"客户端已识别";
@@ -602,10 +614,12 @@ void DrawFooter(App& app) {
         g.Text(Rect(16.0f * u, footer.top + 8.0f * u, textRight, footer.top + 26.0f * u),
                g.Ellipsize(clientLine, smallFmt, textRight - 16.0f * u), smallFmt, Color(kText3));
         const bool installed = app.snapshot.recordState == control_center::CapturedRecordState::Present;
-        const bool game = app.gameRunning || app.snapshot.processState == ProcessState::Running;
+        // R6：页脚状态只反映“所选客户端”的游戏进程，系统级进程快照不再并入。
+        const bool game = app.gameRunning;
+        const std::wstring gameState =
+            game ? (PanelRunningCached() ? L"面板已连接" : L"游戏已启动") : L"客户端未运行";
         const std::wstring stateLine =
-            std::wstring(installed ? L"已安装" : L"未安装") + L"  ·  " +
-            (game ? L"游戏运行中" : L"游戏未运行");
+            std::wstring(installed ? L"已安装" : L"未安装") + L"  ·  " + gameState;
         g.Text(Rect(16.0f * u, footer.top + 27.0f * u, textRight, footer.top + 45.0f * u), stateLine, smallFmt,
                Color(kText3));
     } else {
@@ -623,7 +637,10 @@ void DrawHome(App& app) {
     ScopedClip contentClip(&g, ContentClipRect(app, body.top));
     Ctx c = MakeCtx(app, body.top + 8.0f * u);
     const float cw = c.Cw();
-    const bool running = app.gameRunning || app.snapshot.processState == ProcessState::Running;
+    // R6：主按钮/胶囊只跟随“所选客户端”的游戏是否运行（按客户端路径的进程关联），
+    // 系统级 CheckBlockingProcesses 结果只用于维护页/安装等破坏性操作的门禁。
+    const bool running = app.gameRunning;
+    const bool panelRunning = PanelRunningCached();
     const bool telemetry = app.telemetry.available;
     const bool installed = app.snapshot.recordState == control_center::CapturedRecordState::Present;
     const bool busy = app.installRun.running || app.repairRun.running || app.uninstallRun.running;
@@ -644,7 +661,8 @@ void DrawHome(App& app) {
                     c.Y(22) + gaugeSize.height),
                L"FPS", g.Format(FontUi(), kFontSmall * u, 400, HAlign::Left, VAlign::Middle), Color(kAccent));
 
-        const std::wstring pillText = running ? L"游戏运行中" : L"游戏未运行";
+        const std::wstring pillText =
+            !running ? L"客户端未运行" : (panelRunning ? L"面板已连接" : L"游戏已启动");
         const float pillW = PillWidth(c, L"", pillText);
         const Rect pill(c.X(cw - 16) - pillW, c.Y(12), c.X(cw - 16), c.Y(34));
         Pill(c, pill, L"", pillText, running ? kJade : kMuted, running ? kJadeText : kText3, kSurface, kLine);
@@ -666,9 +684,15 @@ void DrawHome(App& app) {
                 caption = Fmt(L"输出 %.1f FPS  ·  实时采样", app.fpsOutput);
             }
         } else if (running) {
-            caption = app.telemetryNote.empty() ? L"实时采样 · 每秒刷新" : app.telemetryNote;
+            if (!app.telemetryNote.empty()) {
+                caption = app.telemetryNote;
+            } else if (panelRunning) {
+                caption = L"游戏内面板已连接 · 实时采样每秒刷新";
+            } else {
+                caption = L"实时采样 · 每秒刷新";
+            }
         } else {
-            caption = L"启动游戏后显示实时数据；游戏运行后这里显示源/输出帧率。";
+            caption = L"客户端未运行：先启动游戏，再打开游戏内面板。";
         }
         g.Text(c.R(16, 92, cw - 32, 22), caption, note, Color(kText2));
         c.Gap(118);

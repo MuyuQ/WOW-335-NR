@@ -320,6 +320,41 @@ static void DebugLine(const wchar_t *t)
     OutUtf8(t);
     OutUtf8(L"\n");
 }
+static void OutLine(const wchar_t *t)
+{
+    OutUtf8(t);
+    OutUtf8(L"\n");
+}
+
+// zh: 退出/注销前的强制落盘（R8）。复用定时保存同一套原子写路径，但不等
+// 200/1000ms 重试间隔；无论成败都关闭保存通道，退出过程中不再接受新改动。
+// 幂等：已关闭的通道直接返回上次结果，不重复写盘。失败必须留下日志。
+static bool FlushPendingParams(const wchar_t *reason)
+{
+    if (g_save.closed) return !g_save.failed;
+    const bool had_pending = g_save.dirty;
+    const bool ok = g_save.Flush([&] { return WriteParamsAtomic(ParamsPath, g_params) && SaveCustomTier(g_params); });
+    if (!ok) {
+        OutLine(L"退出前参数保存失败，最后一次改动可能未写入 live-params.json。");
+        if (reason) DebugLine(reason);
+    } else if (had_pending) {
+        DebugLine(L"pending parameters flushed before exit");
+    }
+    return ok;
+}
+
+// zh: 定时落盘（主循环的可见/等待两条路径共用）。失败保留 pending 并按 1s 重试。
+static void SavePendingIfDue(DWORD &last_flush, DWORD now)
+{
+    if (!g_save.dirty || g_save.closed || now - last_flush < g_save.IntervalMs()) return;
+    last_flush = now;
+    const bool previously_failed = g_save.failed;
+    if (g_save.Try([&] { return WriteParamsAtomic(ParamsPath, g_params) && SaveCustomTier(g_params); })) {
+        DebugLine(L"live-params.json written (params applied by the carrier within ~0.5s)");
+    } else if (!previously_failed) {
+        OutLine(L"参数保存失败，保留请求并每秒重试。");
+    }
+}
 
 static HWND g_window = nullptr;
 static bool g_dragging = false;         // zh: WM_ENTERSIZEMOVE/EXITSIZEMOVE 之间
@@ -343,6 +378,48 @@ static bool g_hotkey_prev = false;
 static bool g_poll_hotkey = false;
 // 当前 ImGui 窗口尺寸（必须在帧内捕获；帧外 GetWindowWidth 会解引用空窗口 → 0xc0000005）
 static float g_ui_w = 0.0f, g_ui_h = 0.0f;
+
+// ===== 帧率计数差分（纯逻辑；tests/panel_regression.cpp 直接覆盖） =====
+struct FpsDelta {
+    bool sampled = false;   // 时间窗足够，fps 有效
+    bool reset = false;     // 计数回退（宿主重启/映射重建）：调用方必须重置基线
+    float fps = 0.0f;
+};
+// zh: 无符号计数器差分前先判 current < last（宿主重启后计数从 0 重来），
+// 否则相减会回绕成 ~1.8e19 再被当成帧率（R9）。
+static FpsDelta ComputeFpsDelta(unsigned long long current, unsigned long long last,
+    long long now_qpc, long long last_qpc, long long frequency, double min_seconds)
+{
+    FpsDelta result;
+    if (frequency <= 0 || last_qpc <= 0 || now_qpc <= last_qpc) return result;
+    if (current < last) {
+        result.reset = true;
+        return result;
+    }
+    const double seconds = static_cast<double>(now_qpc - last_qpc) / static_cast<double>(frequency);
+    if (seconds < min_seconds) return result;
+    result.sampled = true;
+    result.fps = static_cast<float>(static_cast<double>(current - last) / seconds);
+    return result;
+}
+
+// zh: 宿主进程变化时 SR/Presented 计数从 0 重新开始，差分基线连同平滑值一起清零。
+static void ResetFpsBaselines()
+{
+    g_last_src_frames = 0;
+    g_last_src_qpc = 0;
+    g_last_presented = 0;
+    g_last_presented_qpc = 0;
+    g_src_fps = 0.0f;
+    g_game_fps = 0.0f;
+}
+
+// zh: 同一页统一源帧率口径（README：以遥测 SourceFps 为准）；遥测缺失或为 0 时回退 SR 差分。
+static float SourceFps()
+{
+    if (g_tele.available && g_tele.source_fps > 0) return static_cast<float>(g_tele.source_fps);
+    return g_src_fps;
+}
 
 // ===== 图层覆盖状态（真实窗口可见性 + z 序，不止 F10 配置位） =====
 enum class LayerState { NoHost, NoOutput, RawMode, Hidden, UnderGame, Covered };
@@ -1007,10 +1084,13 @@ static void RenderStatusPage(float x, float &y, float width)
 
     if (!g_tele.available) {
         PutText(g_font_small, x + 14.0f * dpi, y + 84.0f * dpi, kColText3, "启动游戏后显示实时数据");
-    } else if (g_src_fps > 0.0f && g_game_fps > 0.0f) {
-        const float gain = g_src_fps > 0.01f ? g_game_fps / g_src_fps : 0.0f;
+    } else if (SourceFps() > 0.0f && g_game_fps > 0.0f) {
+        // zh: 与下方「运行数据·源帧率」同一口径（遥测 SourceFps 优先）；差分回退时标注
+        const float src = SourceFps();
+        const bool src_from_delta = g_tele.source_fps == 0;
+        const float gain = src > 0.01f ? g_game_fps / src : 0.0f;
         PutTextF(g_font_small, x + 14.0f * dpi, y + 84.0f * dpi, kColText3,
-            "源 %.1f → 输出 %.1f · 增益 %.2f×", g_src_fps, g_game_fps, gain);
+            "源 %.1f%s → 输出 %.1f · 增益 %.2f×", src, src_from_delta ? "（差分）" : "", g_game_fps, gain);
     } else {
         PutText(g_font_small, x + 14.0f * dpi, y + 84.0f * dpi, kColText3, "正在采样帧率…");
     }
@@ -1043,7 +1123,7 @@ static void RenderStatusPage(float x, float &y, float width)
         std::snprintf(res_scale, sizeof res_scale, "%.2f×",
             g_tele.input_w > 0 ? static_cast<double>(g_tele.output_w) / g_tele.input_w : 1.0);
         if (g_tele.gpu_us > 0) std::snprintf(latency, sizeof latency, "%.1f ms", g_tele.gpu_us / 1000.0);
-        std::snprintf(source_fps, sizeof source_fps, "%.1f", g_tele.source_fps > 0 ? static_cast<double>(g_tele.source_fps) : g_src_fps);
+        std::snprintf(source_fps, sizeof source_fps, "%.1f", static_cast<double>(SourceFps()));
         std::snprintf(output_fps, sizeof output_fps, "%.1f", static_cast<double>(g_game_fps));
         std::snprintf(nr_frames, sizeof nr_frames, "%llu", g_tele.nr_frames);
         std::snprintf(sr_frames, sizeof sr_frames, "%llu", g_tele.sr_frames);
@@ -1069,7 +1149,7 @@ static void RenderNrPage(float x, float &y, float width)
     CardRect(ImGui::GetWindowDrawList(), x, y, width, card_height, 8.0f * dpi);
     if (ToggleRow("nr-toggle", x + 14.0f * dpi, y + 10.0f * dpi, width - 28.0f * dpi,
         "画面增强", "关闭时等同原画，保留引擎原始输出", g_params.nr)) {
-        g_save.dirty = true;
+        g_save.Request();
     }
     y += card_height + 16.0f * dpi;
 
@@ -1099,12 +1179,12 @@ static void RenderNrPage(float x, float &y, float width)
         g_params.fg_multiplier = keep_multiplier;
         ClampParams(g_params);
         g_tier_locked = true;
-        g_save.dirty = true;
+        g_save.Request();
     } else if (tier_clicked == 4 && g_tier_locked) {
         g_tier_locked = false;
         if (g_custom_valid && !g_params.Equals(g_custom)) {
             g_params = g_custom;
-            g_save.dirty = true;
+            g_save.Request();
         }
     }
     PutText(g_font_small, x, y, kColText3, "档位是完整配方（强度/色调/结构/皮肤）；原画等于关闭 NR。");
@@ -1132,7 +1212,7 @@ static void RenderNrPage(float x, float &y, float width)
     PutText(g_font_small, x, y - 18.0f * dpi, kColText3, "-1 更平滑，0 中性，+1 保留更多纹理。");
     y += 6.0f * dpi;
     ImGui::EndDisabled();
-    if (dirty) g_save.dirty = true;
+    if (dirty) g_save.Request();
     ClampParams(g_params);
 
     if (Btn("reread", x, y, 150.0f * dpi, 32.0f * dpi, "重新读取当前设置", 1)) {
@@ -1158,7 +1238,7 @@ static void RenderFgPage(float x, float &y, float width)
     CardRect(ImGui::GetWindowDrawList(), x, y, width, card_height, 8.0f * dpi);
     if (ToggleRow("fg-toggle", x + 14.0f * dpi, y + 10.0f * dpi, width - 28.0f * dpi,
         "补帧", "关闭时只输出超分帧", g_params.fg)) {
-        g_save.dirty = true;
+        g_save.Request();
     }
     y += card_height + 16.0f * dpi;
 
@@ -1201,7 +1281,7 @@ static void RenderFgPage(float x, float &y, float width)
     y += 30.0f * dpi + 8.0f * dpi + 8.0f * dpi;
     if (multiplier_clicked >= 0) {
         g_params.fg_multiplier = multiplier_clicked + 2;
-        g_save.dirty = true;
+        g_save.Request();
     }
     if (g_params.fg_multiplier >= 4)
         InfoBlock(x, y, width, "4× 需要 RTX 50 系显卡；其他卡载体自动回落 2×。4× 显著增加显存占用，出现提示时请降低档位。", true);
@@ -1239,7 +1319,7 @@ static void RenderModelPage(float x, float &y, float width)
         ImGui::InvisibleButton("##model", ImVec2(width, row_height));
         if (ImGui::IsItemClicked() && g_params.model != m) {
             g_params.model = m;
-            g_save.dirty = true;
+            g_save.Request();
             g_model_busy_until = GetTickCount64() + 1200;
         }
         if (ImGui::IsItemHovered()) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
@@ -1513,7 +1593,10 @@ static void RenderUi()
         const float exit_w = 92.0f * dpi, exit_h = 30.0f * dpi;
         const float exit_x = wpos.x + wtotal - exit_w - 14.0f * dpi;
         const float exit_y = footer_y + (bot_h - exit_h) * 0.5f;
-        if (Btn("panel-exit", exit_x, exit_y, exit_w, exit_h, "退出面板", 1)) g_running = false;
+        if (Btn("panel-exit", exit_x, exit_y, exit_w, exit_h, "退出面板", 1)) {
+            FlushPendingParams(L"exit button");
+            g_running = false;
+        }
     }
 
     g_ui_w = ImGui::GetWindowWidth();
@@ -1597,7 +1680,23 @@ static LRESULT CALLBACK PanelWndProc(HWND window, UINT message, WPARAM wparam, L
             }
         }
         break;
-    case WM_DESTROY: g_running = false; return 0;
+    case WM_QUERYENDSESSION:
+        // zh: 注销/关机前强制落盘；系统不保证随后还会走正常退出路径。
+        FlushPendingParams(L"WM_QUERYENDSESSION");
+        return TRUE;
+    case WM_ENDSESSION:
+        // zh: 关机被取消时恢复保存通道；确认结束时让主循环正常收尾。
+        if (!wparam) {
+            g_save.Reopen();
+            DebugLine(L"end-session cancelled; pending-save channel reopened");
+        } else {
+            g_running = false;
+        }
+        return 0;
+    case WM_DESTROY:
+        FlushPendingParams(L"WM_DESTROY");
+        g_running = false;
+        return 0;
     case WM_HOTKEY:
         // zh: RegisterHotKey 成功路径此前无人处理，F11 会静默失效
         //（只有热键被占用走轮询兜底的机器上才碰巧可用）。
@@ -1696,7 +1795,10 @@ int wmain(int argc, wchar_t **argv)
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {
             TranslateMessage(&message);
             DispatchMessageW(&message);
-            if (message.message == WM_QUIT) g_running = false;
+            if (message.message == WM_QUIT) {
+                FlushPendingParams(L"WM_QUIT");
+                g_running = false;
+            }
         }
         if (!g_running) break;
 
@@ -1709,7 +1811,6 @@ int wmain(int argc, wchar_t **argv)
                 if (saw_game) out_line(L"所选游戏已退出，面板转入等待（下次启动游戏自动显示）。");
                 saw_game = false;
                 ShowWindow(g_window, SW_HIDE);
-                Sleep(500);
                 continue;
             }
             if (!saw_game) out_line(L"已检测到游戏，面板显示。");
@@ -1722,6 +1823,17 @@ int wmain(int argc, wchar_t **argv)
                     static_cast<unsigned long>(procs.host_pid), procs.uncertain ? 1 : 0);
                 DebugLine(buf);
             }
+        }
+
+        // zh: 面板不可见（未检测到游戏）时不渲染、不 Present；阻塞等待窗口消息，
+        // 最多 1 秒后重新探测进程（保留原有 1 秒检查节奏）。隐藏时 CPU 接近 0。
+        if (!IsWindowVisible(g_window)) {
+            SavePendingIfDue(last_flush, now);
+            const DWORD hidden_now = static_cast<DWORD>(GetTickCount64());
+            const DWORD elapsed = hidden_now - last_tick;
+            const DWORD wait_ms = elapsed < 1000 ? 1000 - elapsed : 0;
+            MsgWaitForMultipleObjects(0, nullptr, FALSE, wait_ms, QS_ALLINPUT);
+            continue;
         }
         // 游戏窗口矩形：按窗口类查找并校验属于已匹配的游戏进程
         HWND game_window = FindWindowExW(nullptr, nullptr, L"GxWindowClassD3d", nullptr);
@@ -1746,7 +1858,12 @@ int wmain(int argc, wchar_t **argv)
         static DWORD last_tele = 0;
         if (now - last_tele >= 500) {
             last_tele = now;
-            g_last_host_pid = procs.host_pid;
+            if (procs.host_pid != g_last_host_pid) {
+                // zh: 宿主重启后遥测计数从 0 重新开始；沿用旧基线会让无符号差值回绕（R9）。
+                g_last_host_pid = procs.host_pid;
+                ResetFpsBaselines();
+                DebugLine(L"host pid changed; FPS counter baselines reset");
+            }
             g_tele = g_last_host_pid ? ReadTelemetry(g_last_host_pid) : Telemetry{};
             g_layer = EvaluateLayerCover();
             {
@@ -1759,33 +1876,36 @@ int wmain(int argc, wchar_t **argv)
                     DebugLine(buf);
                 }
             }
-            if (g_tele.presented > 0 && g_last_presented_qpc) {
-                LARGE_INTEGER now_qpc{}, freq{};
-                QueryPerformanceCounter(&now_qpc);
-                QueryPerformanceFrequency(&freq);
-                const double seconds = (now_qpc.QuadPart - g_last_presented_qpc) / static_cast<double>(freq.QuadPart);
-                if (seconds > 0.5) g_game_fps = (g_tele.presented - g_last_presented) / static_cast<float>(seconds);
+            LARGE_INTEGER now_qpc{}, freq{};
+            QueryPerformanceCounter(&now_qpc);
+            QueryPerformanceFrequency(&freq);
+            if (g_tele.presented > 0 && g_last_presented_qpc > 0) {
+                const FpsDelta delta = ComputeFpsDelta(g_tele.presented, g_last_presented,
+                    now_qpc.QuadPart, g_last_presented_qpc, freq.QuadPart, 0.5);
+                if (delta.reset) {
+                    g_game_fps = 0.0f;   // 计数回退：丢弃回绕值，下一窗口重新采样
+                } else if (delta.sampled) {
+                    g_game_fps = delta.fps;
+                }
                 g_last_presented = g_tele.presented;
                 g_last_presented_qpc = now_qpc.QuadPart;
             } else if (g_tele.presented > 0) {
                 g_last_presented = g_tele.presented;
-                LARGE_INTEGER now_qpc{};
-                QueryPerformanceCounter(&now_qpc);
                 g_last_presented_qpc = now_qpc.QuadPart;
             }
-            // zh: 真实帧率（SR 逐真实帧计数差分）——与输出帧率对照可定位丢帧层级
-            if (g_tele.sr_frames > 0 && g_last_src_qpc) {
-                LARGE_INTEGER now_qpc{}, freq{};
-                QueryPerformanceCounter(&now_qpc);
-                QueryPerformanceFrequency(&freq);
-                const double seconds = (now_qpc.QuadPart - g_last_src_qpc) / static_cast<double>(freq.QuadPart);
-                if (seconds > 0.25) g_src_fps = (g_tele.sr_frames - g_last_src_frames) / static_cast<float>(seconds);
+            // zh: 真实帧率（SR 逐真实帧计数差分）——仅作遥测 SourceFps 缺失时的回退
+            if (g_tele.sr_frames > 0 && g_last_src_qpc > 0) {
+                const FpsDelta delta = ComputeFpsDelta(g_tele.sr_frames, g_last_src_frames,
+                    now_qpc.QuadPart, g_last_src_qpc, freq.QuadPart, 0.25);
+                if (delta.reset) {
+                    g_src_fps = 0.0f;
+                } else if (delta.sampled) {
+                    g_src_fps = delta.fps;
+                }
                 g_last_src_frames = g_tele.sr_frames;
                 g_last_src_qpc = now_qpc.QuadPart;
             } else if (g_tele.sr_frames > 0) {
                 g_last_src_frames = g_tele.sr_frames;
-                LARGE_INTEGER now_qpc{};
-                QueryPerformanceCounter(&now_qpc);
                 g_last_src_qpc = now_qpc.QuadPart;
             }
         }
@@ -1793,16 +1913,8 @@ int wmain(int argc, wchar_t **argv)
         // 所有权维护（面板始终位于 AIO 输出窗上方，系统级保证）
         MaintainOutputOwnership(procs.host_pid);
 
-        // 参数落盘（用户改动时）
-        if (g_save.dirty && now - last_flush >= g_save.IntervalMs()) {
-            last_flush = now;
-            const bool previously_failed = g_save.failed;
-            if (g_save.Try([&] { return WriteParamsAtomic(ParamsPath, g_params) && SaveCustomTier(g_params); })) {
-                DebugLine(L"live-params.json written (params applied by the carrier within ~0.5s)");
-            } else {
-                if (!previously_failed) out_line(L"参数保存失败，保留请求并每秒重试。");
-            }
-        }
+        // 参数落盘（用户改动时；可见/等待两条路径共用同一节流逻辑）
+        SavePendingIfDue(last_flush, now);
 
         // 热键轮询兜底（RegisterHotKey 失败时用 Alt+F10 边沿检测切换）
         if (g_poll_hotkey) {
@@ -1836,6 +1948,8 @@ int wmain(int argc, wchar_t **argv)
         Sleep(10);
     }
 
+    // 兜底：任何未显式 flush 的退出路径都要落盘（幂等：已 flush 的通道不重复写）
+    FlushPendingParams(L"teardown");
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();

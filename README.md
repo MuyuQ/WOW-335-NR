@@ -326,7 +326,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build-WindowWatch.ps1
 1. `dlss5-console.exe` → 复制并重命名为 `DLSS5控制台.exe`（脚本不改名，部署时处理）。
 2. `dlss5-panel.exe`、`window_watch.exe` → 同名复制到同一目录（面板必须与控制台同目录）。
 3. 面板 / 窗口助手部署后核对：确认锁中源码 SHA-256 与当前源一致，再把新产物的
-   SHA-256 更新进 `panel-lock.json` / `watcher-lock.json`。
+   SHA-256 更新进 `panel-lock.json` / `watcher-lock.json`。面板候选须先按锁验证，再用
+   `-PanelCandidate` 构建候选包；构建不写 `tools/dlss5/bin/`，部署到该目录时再同步。
 4. 控制台没有独立锁文件；其部署来源以构建记录 `build.json` 的产物哈希追溯。
 
 ### 原生控制台候选包与运行依赖审核
@@ -335,8 +336,11 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\Build-WindowWatch.ps1
 `build.json` 状态 `compiled_candidate_native_ui`），除 `WOW-335-NR-ControlCenter.exe` 外还打包：
 
 - `install-manifest.json`、`payload-lock.json`、`watcher-lock.json`、`panel-lock.json`、`templates/`；
-- `bin/dlss5-panel.exe`、`bin/window_watch.exe`（从工作区 `tools/dlss5/bin/` 拷贝，哈希与锁
-  一致时 `build.json` 的 `portable.panel_lock_match` / `portable.watch_lock_match` 为 true）；
+- `bin/dlss5-panel.exe`（必须用 `-PanelCandidate <exe>` 或 `-PanelCandidateDirectory <dir>`
+  指定已验证候选；脚本校验候选 SHA-256 与 `panel-lock.json` 一致后复制，并回读包内文件哈希，
+  记录在 `build.json` 的 `panel_candidate`）、`bin/window_watch.exe`（从工作区
+  `tools/dlss5/bin/` 拷贝并按 `watcher-lock.json` 校验；哈希与锁一致时
+  `portable.panel_lock_match` / `portable.watch_lock_match` 为 true）；
 - exe 内嵌多尺寸应用图标（`native/control_center/app/control_center.ico`，16–256 像素，由
   `tools/make_control_center_icon.py` 生成、`control_center.rc` 编译为资源），窗口类、任务栏与
   Alt-Tab 使用同一图标，不额外散落图标文件。
@@ -400,14 +404,29 @@ python -B prepare_stage.py `
   --reshade-fxh <ReShade.fxh> `
   --nr <nvngx_dlssnr.dll> `
   --sr <nvngx_dlss.dll> `
+  --addon32 <已部署的 standalone-dlssnr.addon32> `
   --batch _scratch/dlss5-aio/20261106-093536 `
   --name my-stage
 ```
 
-- 使用本地重编译的桥接插件时，加 `--addon32 <standalone-dlssnr.addon32>`；输入必须匹配当前组件锁，不能回退使用压缩包内的旧插件。
+- `--addon32` 不是可选优化：锁内 `standalone-dlssnr.addon32` 的 sha256 是
+  `8a31df57235a60508f22e723e020ad3a2d34ceb7edad3056407c47cfab3149b6`（297,472 B），
+  上游 AIO ZIP 内同名成员是 143,360 B 的旧桥接，两者哈希不同。省略该参数会在预检阶段
+  直接失败，不会回退使用 ZIP 内的旧插件。
+- 桥接文件从已部署产物复制：部署暂存目录
+  `_scratch/dlss5-aio/<部署批次>/stage/standalone-dlssnr.addon32`，或已部署隔离客户端的
+  同名文件。不要使用 `carrier\x86-host\build\x86\standalone-dlssnr.addon32` 等重编产物：
+  编译会嵌入 `__DATE__` / `__TIME__`，即使源码相同，哈希也与锁内值不同（实测
+  `3558a0e0c5f68c1d63823cf28f003320b6651ae5a69a381e43f60dce54360367`），无法通过预检，
+  也不可复现。用 `(Get-FileHash -Algorithm SHA256 <path>).Hash.ToLower()` 核对锁值。
 - `--batch` 必须是 `_scratch/dlss5-aio/` 下已存在的隔离批次；`--name` 只允许字母、数字、`-`、`_`。
 - 脚本拒绝符号链接 / 重解析点、绝对路径、`..`、重复成员和越界目标。
-- 每个成员写入后立即回读哈希；失败写 `stage-failure.json`，成功写 `stage-record.json`。
+- 创建暂存目录之前先做完整预检：本地注入成员的哈希、压缩包内其余 stage 成员的存在性
+  与哈希都必须等于锁值。任一不符会报错，并给出组件相对路径、锁内期望 sha256 和
+  「需要 --addon32 指向锁匹配的本地桥接（或压缩包版本不可用）」；此时不会创建任何目录。
+- 每个成员写入后立即回读哈希。暂存目录创建后任一异常都会删除整个目录，并把失败标记写到
+  目录外的 `candidate/staged/stage-failure-<name>.json`；同名命令可直接重试，无需手工
+  删除目录。成功后写 `candidate/staged/<name>/stage-record.json`，并清除该名称残留的失败标记。
 - `prepare_stage.py` 只复制 `source_kind=stage` 的成员；NR / SR 运行库通过 `--nr`/`--sr` 注入。
 - 需要帧生成时，把 `nvngx_dlssg.dll` 另行放入生成的暂存目录；控制中心会把
   `payload-lock.json` 中 `source_kind=runtime` 的成员一并校验并安装。
@@ -786,6 +805,19 @@ NR + DLSS/DLAA → DLSS/DLAA + FG → NR + DLSS/DLAA + FG → 恢复用户设置
   ReShade 预设目录、`%LOCALAPPDATA%\RHI` 只报告不删除。
 - **运行时分发**：NVIDIA DLL 与 ReShade 不在仓库内；缺失时管线无法启动或帧生成不可用。
 - **在线环境**：不绕过反作弊；是否允许使用取决于具体服务条款。
+- **桥接 Vulkan / GL 传输**：宿主异常退出时的无界 GPU 等待已加源码护栏（宿主已死 / 被终止时
+  跳过 `wait_idle`，并保留导入信号量交给驱动回收），但本机没有可用的 Vulkan ICD，未做崩溃注入；
+  宿主「存活但卡死」仍可能长时间阻塞，实验性 DXVK / Vulkan 游戏需单独验收。
+- **面板退出保存**：退出按钮、`WM_DESTROY`、`WM_QUIT` 与 `WM_QUERYENDSESSION` 会强制落盘；
+  系统强杀进程或注销窗口极短时，最后一次未提交改动仍可能丢失。
+- **修复安装**：默认要求活动安装记录（`host64\dlss5-install-record.json`）。卸载后如需复写文件，
+  PowerShell 入口需显式使用 `-AdoptUninstalled`，控制中心会二次确认；成功后重新登记安装记录。
+- **组件暂存**：`--addon32` 必须指向锁匹配的已部署桥接（`8a31df57…`）；重编产物会嵌入编译时间，
+  哈希不可复现，不能通过预检。
+- **原生控制中心构建**：默认严格校验 `panel-lock.json` / `watcher-lock.json`；面板不从
+  `tools/dlss5/bin` 取件，必须用 `-PanelCandidate`（或 `-PanelCandidateDirectory`）指定已验证候选，
+  候选 SHA-256 与 `panel-lock.json` 不符时构建在编译前终止。修改面板或窗口助手源码后必须同步
+  重算对应锁与候选（可显式 `-AllowUnverified` 生成带标注的未校验候选，仅供对照，不作为验收包）。
 
 ## 开发与维护
 

@@ -8,6 +8,7 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import time
 import zipfile
 
 PROJECT = Path(__file__).resolve().parents[2]
@@ -21,13 +22,18 @@ EXTRA = {
     "host64/nvngx_dlssnr.dll": "nr",
     "host64/nvngx_dlss.dll": "sr",
 }
+BRIDGE_HINT = "需要 --addon32 指向锁匹配的本地桥接（或压缩包版本不可用）"
 
 
 def sha(path):
-    value = hashlib.sha256()
     with path.open("rb") as stream:
-        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
-            value.update(block)
+        return stream_sha(stream)
+
+
+def stream_sha(stream):
+    value = hashlib.sha256()
+    for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+        value.update(block)
     return value.hexdigest()
 
 
@@ -49,6 +55,20 @@ def safe_member(name):
             "\\" in name or ":" in name or any(ord(ch) < 32 for ch in name)):
         raise ValueError(f"unsafe package member: {name}")
     return path
+
+
+def remove_tree(path):
+    """Remove a partially written staging tree, tolerating transient Windows locks."""
+    for attempt in range(3):
+        try:
+            shutil.rmtree(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 2:
+                raise
+            time.sleep(0.1)
 
 
 def main():
@@ -82,9 +102,12 @@ def main():
     expected = {item["source"]: item["sha256"] for item in members}
     if any(rel not in expected for rel in extra):
         parser.error("EXTRA inputs do not map to stage members in the lock")
+    # 完整预检：本地注入输入与压缩包内 stage 成员都必须在创建任何目录之前匹配组件锁。
     for relative, key in extra.items():
-        if relative not in expected or sha(paths[key]) != expected[relative]:
-            parser.error(f"{key} identity differs from the lock")
+        actual = sha(paths[key])
+        if actual != expected[relative]:
+            parser.error(f"component {relative} does not match the lock: expected sha256={expected[relative]}, "
+                         f"local {key} sha256={actual}; {BRIDGE_HINT}")
     batch = no_links(args.batch)
     if not batch.is_dir() or not batch.is_relative_to(SCRATCH) or batch == SCRATCH:
         parser.error("batch must be an existing isolated DLSS scratch directory")
@@ -98,9 +121,16 @@ def main():
         names = [item.filename for item in archive.infolist() if not item.is_dir()]
         if len(names) != len(set(names)) or archive.testzip() is not None:
             parser.error("AIO archive has duplicate or invalid members")
-        for relative in expected:
-            if relative not in extra and relative not in names:
-                parser.error(f"AIO archive lacks {relative}")
+        for relative, expected_hash in expected.items():
+            if relative in extra:
+                continue
+            if relative not in names:
+                parser.error(f"AIO archive lacks component {relative}: expected sha256={expected_hash}; {BRIDGE_HINT}")
+            with archive.open(relative, "r") as stream:
+                actual = stream_sha(stream)
+            if actual != expected_hash:
+                parser.error(f"component {relative} does not match the lock: expected sha256={expected_hash}, "
+                             f"archive sha256={actual}; {BRIDGE_HINT}")
         target.mkdir(parents=True, exist_ok=False)
         try:
             for relative, expected_hash in expected.items():
@@ -125,11 +155,26 @@ def main():
             with (target / "stage-record.json").open("x", encoding="utf-8", newline="\n") as stream:
                 json.dump(result, stream, ensure_ascii=False, indent=2)
                 stream.write("\n")
-        except Exception as exc:
-            failed = {"state": "preparation_incomplete", "error": f"{type(exc).__name__}: {exc}"}
-            with (target / "stage-failure.json").open("x", encoding="utf-8", newline="\n") as stream:
-                json.dump(failed, stream, ensure_ascii=False, indent=2)
-                stream.write("\n")
+            try:
+                (stage_root / f"stage-failure-{args.name}.json").unlink()
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+        except BaseException as exc:
+            # 失败标记写在暂存目录之外；随后整体清理目标目录，同名命令可直接重试。
+            failed = {"state": "preparation_incomplete", "name": args.name,
+                      "error": f"{type(exc).__name__}: {exc}"}
+            try:
+                with (stage_root / f"stage-failure-{args.name}.json").open("w", encoding="utf-8", newline="\n") as stream:
+                    json.dump(failed, stream, ensure_ascii=False, indent=2)
+                    stream.write("\n")
+            except OSError:
+                pass
+            try:
+                remove_tree(target)
+            except OSError:
+                pass
             raise
     print(f"private staging prepared: {target}")
 

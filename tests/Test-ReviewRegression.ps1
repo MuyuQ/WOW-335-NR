@@ -35,6 +35,10 @@ cl /nologo /std:c++17 /EHsc /O2 /Gy /MT /utf-8 /DUNICODE /D_UNICODE /I"%NR_REVIE
 if errorlevel 1 exit /b 1
 console-regression.exe "%NR_REVIEW_OUT%"
 if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /EHsc /O2 /MT /W4 /WX /utf-8 "%NR_REVIEW_REPO%\tests\wrapper_teardown_policy.cpp" /Fe:wrapper-teardown-policy.exe
+if errorlevel 1 exit /b 1
+wrapper-teardown-policy.exe
+if errorlevel 1 exit /b 1
 call "%NR_REVIEW_VS%" -no_logo -arch=x86 >nul
 if errorlevel 1 exit /b 1
 cd x86

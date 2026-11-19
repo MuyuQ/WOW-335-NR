@@ -56,6 +56,7 @@
 #include "feed_vk.h"   // raw-Vulkan interop, likewise -- compiled x86 here
 #include "feed_vk_hook.h"   // in-process vkCreateDevice hook: appends the interop extensions
 #include "aio-menu-schema.hpp"
+#include "teardown_policy.hpp"   // pure host-exit vs GPU-retired decisions, unit-tested separately
 
 #define FEED_VERSION "2.2.4"
 
@@ -559,12 +560,171 @@ static void FeedFail(const char *what)
     Log("[feed32] failure: %s (attempt %d; retrying in %lu ms)", what, n, wait_ms);
 }
 
+// The loader file is how an outside tool (the control centre, a script) changes the
+// feed at runtime. The frame gate in FeedFrame now returns before any transport runs,
+// so the per-transport "every 60 frames" reload never fires again once the feed has
+// been switched off -- writing enabled=1 back would be ignored until the game was
+// restarted. Poll from the gate itself on a timer instead, and keep the transport
+// reloads on the same throttle so a single presented frame never reads the file twice.
+static constexpr UINT64 kCfgPollIntervalMs = 1000;
+static UINT64 g_next_cfg_poll;   // GetTickCount64 deadline
+
+static void ReloadConfigThrottled()
+{
+    const UINT64 now = GetTickCount64();
+    if (now < g_next_cfg_poll) return;
+    g_next_cfg_poll = now + kCfgPollIntervalMs;
+    if (CfgReload()) g.built = false;
+}
+
+// True when there is no live host: either none was started, or the one we started
+// has exited/been terminated. Imported fences and semaphores are advanced by the
+// host's D3D12 queue, so both cases mean any wait on them here is unsatisfiable.
+static bool HostGone()
+{
+    return g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT;
+}
+
+// The inverse, for the places that must decide whether a GPU-side wait is bounded:
+// blocking on progress (queue wait_idle, glFinish, fence waits) is only safe while
+// the host can still advance the imported timelines.
+static bool CanBlockOnGpu()
+{
+    return g.hproc != nullptr && WaitForSingleObject(g.hproc, 0) == WAIT_TIMEOUT;
+}
+
+// ---------------------------------------------------------------------------
+// Teardown evidence (the rules themselves live in teardown_policy.hpp)
+// ---------------------------------------------------------------------------
+// The host process handle answers "is the host alive". It does NOT answer "did the GPU
+// work that references our imports retire", and the host can die between those two
+// facts -- the audit's R3 gap: the exit wait returns WAIT_OBJECT_0 while the last frame
+// was never signalled, so an unconditional wait_idle() would hang forever. Track the
+// second question explicitly: every frame submission marks the state Pending, and only
+// an observed completion (a bounded timeline wait, a drained queue, or the device
+// dying) may clear it. HostClose/ReleaseShared turn this into teardown_policy decisions.
+static teardown_policy::GpuState g_teardown_gpu = teardown_policy::GpuState::Untouched;
+static bool   g_teardown_wait_depends_on_host = false;  // an unsatisfied GPU Wait(fence_out) is queued
+static UINT64 g_teardown_last_frame = 0;                // timeline value of the last submission
+static int    g_imports_retired = 0;                    // retired, never destroyed: counted for the log
+
+static void TeardownMarkSubmitted(UINT64 frame, bool waits_on_host)
+{
+    g_teardown_gpu = teardown_policy::GpuState::Pending;
+    g_teardown_last_frame = frame;
+    // Once a host wait has been enqueued, a later submission cannot retire it on its own:
+    // the new commands are queued BEHIND that wait, so a stream drain would still depend on
+    // the host. Only an observed completion (TeardownMarkRetired) clears the flag.
+    g_teardown_wait_depends_on_host = g_teardown_wait_depends_on_host || waits_on_host;
+}
+
+static void TeardownMarkRetired()
+{
+    g_teardown_gpu = teardown_policy::GpuState::Retired;
+    g_teardown_wait_depends_on_host = false;
+}
+
+static teardown_policy::HostObservation ObserveHost()
+{
+    if (g.hproc == nullptr) return teardown_policy::HostObservation::NotStarted;
+    return HostGone() ? teardown_policy::HostObservation::Exited : teardown_policy::HostObservation::Alive;
+}
+
+// Has the host signalled the last frame an outstanding GPU wait is blocked on? This is
+// what makes a queued Wait(fence_out) satisfiable: a dead host that already signalled
+// is fine, a live host that never signals is not. GL has no readable value -- there the
+// bounded idle wait is the proof instead (FeedGlWaitIdle covers the whole stream).
+static bool TeardownHostFenceReached()
+{
+    if (g_teardown_gpu != teardown_policy::GpuState::Pending || g_teardown_last_frame == 0) return true;
+    if (g.is_vulkan)
+        return g.vk.ok && g.vk_sem_out != VK_NULL_HANDLE && FeedVkHasTimelineQueries(&g.vk) &&
+               FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g_teardown_last_frame;
+    if (g.is_gl) return false;
+    if (g.fence_out != nullptr) return g.fence_out->GetCompletedValue() >= g_teardown_last_frame;
+    return false;
+}
+
+static bool TeardownBackendCallable()
+{
+    if (g.is_vulkan) return g.vk.ok && g.rs_queue != nullptr;
+    if (g.is_gl) return g.gl.ok && g.gl_ctx != nullptr && g.gl.wglGetCurrentContext() == g.gl_ctx;
+    return true;   // D3D11/D3D9 release references through COM; no queue call is gated here
+}
+
+static bool TeardownBoundedWaitAvailable()
+{
+    if (g.is_vulkan)
+        return g.vk.ok && g.vk_sem_out != VK_NULL_HANDLE && FeedVkHasTimelineQueries(&g.vk);
+    if (g.is_gl) return g.gl.ok && g.gl_ctx != nullptr && g.gl.wglGetCurrentContext() == g.gl_ctx;
+    return false;
+}
+
+static teardown_policy::Evidence CollectTeardownEvidence(teardown_policy::HostObservation host_at_entry,
+                                                         teardown_policy::HostObservation host_after_wait)
+{
+    teardown_policy::Evidence ev;
+    ev.host_at_entry = host_at_entry;
+    ev.host_after_wait = host_after_wait;
+    ev.gpu = g_teardown_gpu;
+    ev.gpu_wait_depends_on_host = g_teardown_wait_depends_on_host;
+    ev.host_fence_reached = TeardownHostFenceReached();
+    ev.backend_can_teardown = TeardownBackendCallable();
+    ev.bounded_wait_supported = TeardownBoundedWaitAvailable();
+    return ev;
+}
+
+// Applies teardown_policy::Decide until it settles on Skip or Retire. Each wait tier is
+// entered at most once -- one bounded host-timeline wait, then one queue drain, then the
+// final decision -- so a host that dies between the process sample and its last signal
+// costs no unbounded wait and no destroy. The lambdas must record the proof their own
+// mechanism produced (host_fence_reached / queue_idle_observed) in `ev`.
+template <typename BoundedWait, typename QueueDrain>
+static teardown_policy::Decision RunTeardownPolicy(teardown_policy::Evidence &ev,
+                                                   BoundedWait bounded_wait, QueueDrain queue_drain)
+{
+    for (int step = 0; step < 4; ++step)
+    {
+        const teardown_policy::Decision d = teardown_policy::Decide(ev);
+        if (d.wait == teardown_policy::WaitAction::Bounded)
+        {
+            ev.bounded_wait_tried = true;
+            ev.bounded_wait_ok = bounded_wait(d.wait_timeout_ms);
+            continue;
+        }
+        if (d.wait == teardown_policy::WaitAction::DrainQueue)
+        {
+            ev.queue_drain_tried = true;
+            if (queue_drain(d.wait_timeout_ms)) ev.queue_idle_observed = true;
+            continue;
+        }
+        return d;
+    }
+    teardown_policy::Decision stuck;
+    stuck.wait = teardown_policy::WaitAction::Retire;
+    stuck.destroy = teardown_policy::DestroyAction::Retire;
+    stuck.reason = "the teardown policy did not settle after bounding every wait";
+    return stuck;
+}
+
 // ---------------------------------------------------------------------------
 // Host process + pipe
 // ---------------------------------------------------------------------------
 
-static void HostDrain()
+// What a drain attempt actually proved: `attempted` means a bounded wait was spent,
+// `ok` means it observed the awaited completion, `queue_idle` means the whole GL stream
+// was driven to completion. HostClose feeds these into teardown_policy; every early
+// return (nothing queued, no query support, unsatisfiable value) proves nothing.
+struct HostDrainOutcome
 {
+    bool attempted = false;
+    bool ok = false;
+    bool queue_idle = false;
+};
+
+static HostDrainOutcome HostDrain()
+{
+    HostDrainOutcome outcome;
     // A GPU-side Wait(fence_out, frame_n) is queued on the immediate context every
     // frame BEFORE the host has signalled it. If the host goes away first, that wait
     // can never be satisfied, and everything queued behind it -- Present included --
@@ -577,33 +737,36 @@ static void HostDrain()
     // entire desktop) hostage. It can still have one host frame outstanding, so
     // drain that fence value from the CPU before releasing its shared resources.
     const UINT64 cpu_pending = g.d3d9_cpu_bridge ? g.d3d9_pending_frame : 0;
-    if (!g.fence_wait_queued && cpu_pending == 0) return;
+    if (!g.fence_wait_queued && cpu_pending == 0) return outcome;
     if (g.is_vulkan)
     {
         // The imported timeline semaphore IS the host's D3D12 fence, so it can be both
         // read and waited on with a deadline -- the same shape as the D3D11 arm below.
         g.fence_wait_queued = false;
-        if (!g.vk.ok || g.vk_sem_out == VK_NULL_HANDLE) return;
+        if (!g.vk.ok || g.vk_sem_out == VK_NULL_HANDLE) return outcome;
         if (!FeedVkHasTimelineQueries(&g.vk))
         {
             // No way to ask or wait on the value (a device that imported a D3D12 fence
-            // without vkWaitSemaphores should not exist, but do not guess). Driving the
-            // queue to completion answers the same question the long way round.
-            Log("[feed32] drain: no timeline query on this device; draining the queue instead");
-            if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
-            return;
+            // without vkWaitSemaphores should not exist, but do not guess). Do NOT drive
+            // the queue to completion here: without a readable value the drain has no
+            // bounded proof and would never return if the host died before signalling.
+            // The teardown policy retires the imports instead of guessing.
+            Log("[feed32] drain: no timeline query on this device; not draining the queue (no bounded proof)");
+            return outcome;
         }
-        if (FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g.frame_n) return;
-        if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
+        if (FeedVkTimelineValue(&g.vk, g.vk_sem_out) >= g.frame_n) return outcome;   // already signalled
+        if (HostGone())
         {
             Log("[feed32] drain: host died before signalling frame %llu",
                 static_cast<unsigned long long>(g.frame_n));
-            return;
+            return outcome;
         }
-        if (!FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.frame_n, 2000))
+        outcome.attempted = true;
+        outcome.ok = FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.frame_n, 2000);
+        if (!outcome.ok)
             Log("[feed32] drain: frame %llu never signalled by the host",
                 static_cast<unsigned long long>(g.frame_n));
-        return;
+        return outcome;
     }
     if (g.is_gl)
     {
@@ -613,55 +776,79 @@ static void HostDrain()
         // Only the context that queued the wait can drain it; from anywhere else the
         // wait dies with the context anyway.
         g.fence_wait_queued = false;
-        if (!g.gl.ok || g.gl.wglGetCurrentContext() != g.gl_ctx || g.gl_ctx == nullptr) return;
-        if (!FeedGlWaitIdle(&g.gl, 2000))
+        if (!g.gl.ok || g.gl.wglGetCurrentContext() != g.gl_ctx || g.gl_ctx == nullptr) return outcome;
+        outcome.attempted = true;
+        outcome.ok = FeedGlWaitIdle(&g.gl, 2000);
+        outcome.queue_idle = outcome.ok;   // the idle fence covers the whole stream, glWaitSemaphoreEXT included
+        if (!outcome.ok)
             Log("[feed32] drain: the GL stream did not finish within 2 s (frame %llu never signalled by the host)",
                 static_cast<unsigned long long>(g.frame_n));
-        return;
+        return outcome;
     }
-    if (g.fence_out == nullptr) return;
+    if (g.fence_out == nullptr) return outcome;
     if (cpu_pending != 0)
     {
         g.d3d9_pending_frame = 0;
         g.d3d9_pending_deadline = 0;
-        if (g.fence_out->GetCompletedValue() >= cpu_pending) return;
+        if (g.fence_out->GetCompletedValue() >= cpu_pending) return outcome;
         HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
         if (evt != nullptr)
         {
-            if (SUCCEEDED(g.fence_out->SetEventOnCompletion(cpu_pending, evt)) &&
-                WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
+            outcome.attempted = true;
+            outcome.ok = SUCCEEDED(g.fence_out->SetEventOnCompletion(cpu_pending, evt)) &&
+                         WaitForSingleObject(evt, 2000) == WAIT_OBJECT_0;
+            if (!outcome.ok)
                 Log("[feed32] drain: classic D3D9 host frame %llu never signalled",
                     static_cast<unsigned long long>(cpu_pending));
             CloseHandle(evt);
         }
-        return;
+        return outcome;
     }
     g.fence_wait_queued = false;
-    if (g.fence_out->GetCompletedValue() >= g.frame_n) return;
+    if (g.fence_out->GetCompletedValue() >= g.frame_n) return outcome;
     if (g.hproc == nullptr || WaitForSingleObject(g.hproc, 0) != WAIT_TIMEOUT)
     {
         // The host is already dead and can no longer signal: the wait (if the GPU
         // reached it) is unsatisfiable and there is nothing we can do from D3D11.
         Log("[feed32] drain: host died before signalling frame %llu",
             static_cast<unsigned long long>(g.frame_n));
-        return;
+        return outcome;
     }
     HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (evt == nullptr) return;
-    if (SUCCEEDED(g.fence_out->SetEventOnCompletion(g.frame_n, evt)) &&
-        WaitForSingleObject(evt, 2000) != WAIT_OBJECT_0)
+    if (evt == nullptr) return outcome;
+    outcome.attempted = true;
+    outcome.ok = SUCCEEDED(g.fence_out->SetEventOnCompletion(g.frame_n, evt)) &&
+                 WaitForSingleObject(evt, 2000) == WAIT_OBJECT_0;
+    if (!outcome.ok)
         Log("[feed32] drain: frame %llu never signalled by the host",
             static_cast<unsigned long long>(g.frame_n));
     CloseHandle(evt);
+    return outcome;
 }
 
-static void HostClose(bool wait_for_exit = true)
+static void HostClose(bool wait_for_exit = true, bool process_exit = false)
 {
-    if (wait_for_exit) HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
+    // The host can already be gone before the pipe is closed, and then the GPU waits
+    // below can never be satisfied. Snapshot that while the handle is still around:
+    // ObserveHost() also covers "no host was ever started".
+    const teardown_policy::HostObservation host_at_entry = ObserveHost();
+
+    if (process_exit)
+        Log("[feed32] process exit: skipping the host drain, the GPU waits and the semaphore teardown");
+
+    HostDrainOutcome drain;
+    if (wait_for_exit && !process_exit)
+        drain = HostDrain();   // BEFORE the pipe closes: the host must still be around to signal
     if (g.pipe != nullptr)  { CloseHandle(g.pipe); g.pipe = nullptr; }
+
+    // Re-sample the host AFTER the exit wait. WAIT_OBJECT_0 means "the process ended",
+    // NOT "it signalled the last frame": the R3 gap is exactly a host that dies between
+    // the entry sample and its last signal. This post-wait sample is what the policy
+    // below reads, so that gap can never turn into an unbounded wait_idle().
+    teardown_policy::HostObservation host_after = teardown_policy::HostObservation::NotStarted;
     if (g.hproc != nullptr)
     {
-        if (wait_for_exit)
+        if (wait_for_exit && !process_exit)
         {
             // The host drains for up to 2 s after the pipe break, then signals
             // UINT64_MAX and exits. 2 s was too tight and could kill a host
@@ -673,6 +860,12 @@ static void HostClose(bool wait_for_exit = true)
                 TerminateProcess(g.hproc, 0);
             }
         }
+        host_after = WaitForSingleObject(g.hproc, 0) == WAIT_TIMEOUT
+                         ? teardown_policy::HostObservation::Alive
+                         : teardown_policy::HostObservation::Exited;
+        if (host_after == teardown_policy::HostObservation::Alive)
+            Log("[feed32] host pid %lu is still alive after the close wait; no GPU completion is assumed",
+                static_cast<unsigned long>(GetProcessId(g.hproc)));
         CloseHandle(g.hproc);
         g.hproc = nullptr;
     }
@@ -681,24 +874,103 @@ static void HostClose(bool wait_for_exit = true)
     // reopen from the new host's BuildAck instead of waiting on dead fences forever.
     SafeRelease(g.fence_in);
     SafeRelease(g.fence_out);
-    if (g.gl.ok && g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
+    // Process liveness and GPU completion are separate questions: WAIT_OBJECT_0 above
+    // only says the host PROCESS ended, not that its last signal reached the GPU. Collect
+    // what was actually observed and let the shared, unit-tested policy decide which waits
+    // and which destroys are safe. No branch below may enter an unbounded wait: the game
+    // queue is drained only once every host dependency has been proven resolved.
+    if (process_exit)
     {
-        if (g.gl_sem_in  != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);  g.gl_sem_in  = 0; }
-        if (g.gl_sem_out != 0) { g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_out); g.gl_sem_out = 0; }
+        // The loader lock is held: no Vulkan/GL call, no GPU wait, no destroy. The OS
+        // reclaims the host, the imports and the device together with the process.
+        if (g.vk_sem_in != VK_NULL_HANDLE || g.vk_sem_out != VK_NULL_HANDLE ||
+            g.gl_sem_in != 0 || g.gl_sem_out != 0)
+            Log("[feed32] process exit: leaving the imported Vulkan/GL objects to the process teardown");
     }
-    g.gl_sem_in = g.gl_sem_out = 0;
-    if (g.vk.ok)
+    else
     {
-        // HostDrain above waits on the semaphore's VALUE, which the HOST's D3D12 queue
-        // advances -- it says nothing about the GAME's queue having retired the batches
-        // that signal fence_in and wait on fence_out, and vkDestroySemaphore requires
-        // exactly that. The gap is not theoretical: if the frame message fails to write,
-        // FeedFrameVk has already enqueued signal(rs_fence_in, n) but never set
-        // fence_wait_queued, so the drain returns instantly and we would destroy a
-        // semaphore with a signal still in flight on it.
-        if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
-        if (g.vk_sem_in  != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr); }
-        if (g.vk_sem_out != VK_NULL_HANDLE) { g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr); }
+        teardown_policy::Evidence ev = CollectTeardownEvidence(host_at_entry, host_after);
+        ev.queue_idle_observed = drain.queue_idle;
+        if (drain.attempted)
+        {
+            ev.bounded_wait_tried = true;
+            ev.bounded_wait_ok = drain.ok;
+        }
+        // A successful HostDrain on the vulkan/D3D11 paths means the host timeline reached
+        // frame_n: the host's signal is emitted, which is the only proof that the game
+        // queue's wait on that value can retire.
+        if (drain.ok) ev.host_fence_reached = true;
+        if (g.gl.ok)
+        {
+            // GL waits and destroys need the importing context current; without it the
+            // evidence stays "not callable" and the policy retires the aliases untouched.
+            const teardown_policy::Decision d = RunTeardownPolicy(
+                ev,
+                [&ev](uint32_t timeout) {
+                    const bool ok = FeedGlWaitIdle(&g.gl, timeout);
+                    if (ok) { ev.queue_idle_observed = true; TeardownMarkRetired(); }
+                    return ok;
+                },
+                [&ev](uint32_t /*timeout*/) {
+                    const bool ok = FeedGlWaitIdle(&g.gl, teardown_policy::kDefaultWaitTimeoutMs);
+                    if (ok) { ev.queue_idle_observed = true; TeardownMarkRetired(); }
+                    return ok;
+                });
+            if (d.destroy == teardown_policy::DestroyAction::Destroy)
+            {
+                if (g.gl_sem_in  != 0) g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_in);
+                if (g.gl_sem_out != 0) g.gl.DeleteSemaphoresEXT(1, &g.gl_sem_out);
+                g.gl_sem_in = g.gl_sem_out = 0;
+                TeardownMarkRetired();
+            }
+            else
+            {
+                ++g_imports_retired;
+                Log("[feed32] GL teardown: the imported semaphores are retired, not destroyed (%s). "
+                    "The host end of the import is gone; the game's GL context destruction, the driver "
+                    "or process exit reclaims them. Local handles dropped; no wait was left unbounded.",
+                    d.reason);
+            }
+        }
+        if (g.vk.ok)
+        {
+            // HostDrain above waits on the semaphore's VALUE, which the HOST's D3D12 queue
+            // advances -- it says nothing about the GAME's queue having retired the batches
+            // that signal fence_in and wait on fence_out, and vkDestroySemaphore requires
+            // exactly that. If the frame message fails to write, FeedFrameVk has already
+            // enqueued signal(rs_fence_in, n) but never set fence_wait_queued; the tracked
+            // submission keeps that signal visible to this policy instead.
+            const teardown_policy::Decision d = RunTeardownPolicy(
+                ev,
+                [&ev](uint32_t timeout) {
+                    const bool ok = FeedVkHasTimelineQueries(&g.vk) &&
+                                    g.vk_sem_out != VK_NULL_HANDLE &&
+                                    FeedVkWaitTimeline(&g.vk, g.vk_sem_out, g.frame_n, timeout);
+                    if (ok) ev.host_fence_reached = true;
+                    return ok;
+                },
+                [](uint32_t /*timeout*/) {
+                    if (g.rs_queue == nullptr) return false;
+                    g.rs_queue->wait_idle();   // only reached once the host fence proved resolved
+                    TeardownMarkRetired();
+                    return true;
+                });
+            if (d.destroy == teardown_policy::DestroyAction::Destroy)
+            {
+                if (g.vk_sem_in  != VK_NULL_HANDLE) g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_in,  nullptr);
+                if (g.vk_sem_out != VK_NULL_HANDLE) g.vk.DestroySemaphore(g.vk.dev, g.vk_sem_out, nullptr);
+                g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
+                TeardownMarkRetired();
+            }
+            else
+            {
+                ++g_imports_retired;
+                Log("[feed32] Vulkan teardown: the imported semaphores are retired, not destroyed (%s). "
+                    "The host's D3D12 queue is gone; the game's vkDestroyDevice, the driver or process "
+                    "exit reclaims them. Local handles dropped; no wait was left unbounded.",
+                    d.reason);
+            }
+        }
     }
     g.vk_sem_in = g.vk_sem_out = VK_NULL_HANDLE;
     g.rs_fence_in = g.rs_fence_out = {};
@@ -1090,7 +1362,7 @@ static void LogHostNR(const char *what)
     Log("%s", line);
 }
 
-static void HostClose(bool wait_for_exit);   // defined above; default argument is on the definition
+static void HostClose(bool wait_for_exit, bool process_exit);   // defined above; default arguments are on the definition
 static HWND FindHostProxyWindow();
 static void HideClassicD3D9Proxy();
 static void RestoreD3D9StartupFocusIfReady();
@@ -1181,17 +1453,45 @@ static void HostApplySettings()
 
 static void ReleaseShared()
 {
-    // Vulkan: drop our VkImage aliases of the host's D3D12 textures. The memory belongs
-    // to the host's resource; freeing the import does not free it. Nothing may still be
-    // reading them, and the frame in flight is only one of the things that could be --
-    // so drain the whole queue, not just our own fence.
+    // Vulkan/OpenGL imports: the resource and its memory belong to the host. Dropping our
+    // alias does not free the host resource, but destroying an import the GPU may still be
+    // reading is undefined behaviour. The shared policy decides -- from what was actually
+    // observed -- whether the queue can be proven drained. If it cannot, the import is
+    // RETIRED: aliases dropped, nothing destroyed, and the game's device destruction, the
+    // driver or process exit reclaims it (see teardown_policy.hpp).
+    teardown_policy::Evidence ev = CollectTeardownEvidence(ObserveHost(), ObserveHost());
     if (g.vk.ok)
     {
-        if (g.rs_queue != nullptr) g.rs_queue->wait_idle();
-        for (int i = 0; i < FEED_SLOTS; ++i)
+        const UINT64 pending_frame = g_teardown_last_frame;
+        const teardown_policy::Decision d = RunTeardownPolicy(
+            ev,
+            [&ev, pending_frame](uint32_t timeout) {
+                const bool ok = FeedVkHasTimelineQueries(&g.vk) && g.vk_sem_out != VK_NULL_HANDLE &&
+                                FeedVkWaitTimeline(&g.vk, g.vk_sem_out, pending_frame, timeout);
+                if (ok) ev.host_fence_reached = true;
+                return ok;
+            },
+            [&ev](uint32_t /*timeout*/) {
+                if (g.rs_queue == nullptr) return false;
+                g.rs_queue->wait_idle();   // only reached once the policy proved this is safe
+                ev.queue_idle_observed = true;
+                return true;
+            });
+        if (d.destroy == teardown_policy::DestroyAction::Destroy)
         {
-            if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
-            if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
+            for (int i = 0; i < FEED_SLOTS; ++i)
+            {
+                if (g.vk_img[i] != VK_NULL_HANDLE) { g.vk.DestroyImage(g.vk.dev, g.vk_img[i], nullptr); g.vk_img[i] = VK_NULL_HANDLE; }
+                if (g.vk_mem[i] != VK_NULL_HANDLE) { g.vk.FreeMemory(g.vk.dev, g.vk_mem[i], nullptr);   g.vk_mem[i] = VK_NULL_HANDLE; }
+            }
+        }
+        else
+        {
+            for (int i = 0; i < FEED_SLOTS; ++i) { g.vk_img[i] = VK_NULL_HANDLE; g.vk_mem[i] = VK_NULL_HANDLE; }
+            ++g_imports_retired;
+            Log("[feed32] Vulkan shared release: the imported images/memory are retired, not destroyed (%s). "
+                "Aliases dropped; the game's vkDestroyDevice, the driver or process exit reclaims them.",
+                d.reason);
         }
         g.vk_layout_init = false;   // the next set starts from UNDEFINED again
     }
@@ -1202,20 +1502,49 @@ static void ReleaseShared()
     {
         if (g.gl.wglGetCurrentContext() == g.gl_ctx && g.gl_ctx != nullptr)
         {
-            g.gl.Finish();   // the shared textures must be idle before the handles go
-            for (int i = 0; i < FEED_SLOTS; ++i)
+            const teardown_policy::Decision d = RunTeardownPolicy(
+                ev,
+                [&ev](uint32_t timeout) {
+                    const bool ok = FeedGlWaitIdle(&g.gl, timeout);
+                    if (ok) ev.queue_idle_observed = true;
+                    return ok;
+                },
+                [&ev](uint32_t /*timeout*/) {
+                    const bool ok = FeedGlWaitIdle(&g.gl, teardown_policy::kDefaultWaitTimeoutMs);
+                    if (ok) ev.queue_idle_observed = true;
+                    return ok;
+                });
+            if (d.destroy == teardown_policy::DestroyAction::Destroy)
             {
-                if (g.gl_tex[i]    != 0) { g.gl.DeleteTextures(1, &g.gl_tex[i]);            g.gl_tex[i]    = 0; }
-                if (g.gl_memobj[i] != 0) { g.gl.DeleteMemoryObjectsEXT(1, &g.gl_memobj[i]); g.gl_memobj[i] = 0; }
+                for (int i = 0; i < FEED_SLOTS; ++i)
+                {
+                    if (g.gl_tex[i]    != 0) { g.gl.DeleteTextures(1, &g.gl_tex[i]);            g.gl_tex[i]    = 0; }
+                    if (g.gl_memobj[i] != 0) { g.gl.DeleteMemoryObjectsEXT(1, &g.gl_memobj[i]); g.gl_memobj[i] = 0; }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < FEED_SLOTS; ++i) { g.gl_tex[i] = 0; g.gl_memobj[i] = 0; }
+                ++g_imports_retired;
+                Log("[feed32] GL shared release: the imported textures are retired, not deleted (%s). "
+                    "Aliases dropped; the game's GL context destruction, the driver or process exit reclaims them.",
+                    d.reason);
             }
         }
         else
         {
             bool any = false;
             for (int i = 0; i < FEED_SLOTS; ++i) if (g.gl_tex[i] != 0) { any = true; g.gl_tex[i] = 0; g.gl_memobj[i] = 0; }
-            if (any) Log("[feed32] the GL context is not current here; the imported textures are left to the driver");
+            if (any)
+            {
+                ++g_imports_retired;
+                Log("[feed32] GL shared release: the context is not current here; the imported textures are retired to the driver");
+            }
         }
     }
+    // Every alias this rebuild used is now gone (destroyed or retired), so the tracking for
+    // it is finished; the next import set starts with nothing pending.
+    TeardownMarkRetired();
     SafeRelease(g.d3d9_zero_mv_srv);
     SafeRelease(g.d3d9_zero_depth_srv);
     SafeRelease(g.d3d9_zero_mv);
@@ -1456,8 +1785,15 @@ static bool WaitForD3D9Copy()
     if (g.query9 == nullptr || FAILED(g.query9->Issue(D3DISSUE_END))) return false;
     const ULONGLONG deadline = GetTickCount64() + 2000;
     HRESULT hr = S_FALSE;
+    unsigned spins = 0;
     while ((hr = g.query9->GetData(nullptr, 0, D3DGETDATA_FLUSH)) == S_FALSE && GetTickCount64() < deadline)
-        SwitchToThread();
+    {
+        // SwitchToThread still spins a core when the GPU is a while away; after the
+        // first few spins give the scheduler a 1 ms slice instead. Still bounded by
+        // the same 2 s deadline.
+        if (++spins <= 64) SwitchToThread();
+        else Sleep(1);
+    }
     return hr == S_OK;
 }
 
@@ -1468,8 +1804,12 @@ static bool WaitForD3D11Copy()
     g.ctx4->Flush();
     const ULONGLONG deadline = GetTickCount64() + 2000;
     HRESULT hr = S_FALSE;
+    unsigned spins = 0;
     while ((hr = g.ctx4->GetData(g.query11, nullptr, 0, 0)) == S_FALSE && GetTickCount64() < deadline)
-        SwitchToThread();
+    {
+        if (++spins <= 64) SwitchToThread();
+        else Sleep(1);
+    }
     return hr == S_OK;
 }
 
@@ -1478,12 +1818,30 @@ static bool WaitForHostFenceCpu(UINT64 value, DWORD timeout_ms)
     if (g.fence_out == nullptr) return false;
     if (g.fence_out->GetCompletedValue() >= value) return true;
 
-    HANDLE evt = CreateEventW(nullptr, FALSE, FALSE, nullptr);
-    if (evt == nullptr) return false;
-    const HRESULT hr = g.fence_out->SetEventOnCompletion(value, evt);
-    const DWORD wait = SUCCEEDED(hr) ? WaitForSingleObject(evt, timeout_ms) : WAIT_FAILED;
-    CloseHandle(evt);
-    return wait == WAIT_OBJECT_0;
+    // This runs once per classic-D3D9 frame; creating a fresh kernel event every time
+    // was the only per-frame allocation left on that bridge. Keep one auto-reset event
+    // and reuse it. A wait that times out leaves its completion registration armed, so
+    // close the event in that case instead of reusing it -- the stale signal could
+    // otherwise release the next wait before its fence value has been reached.
+    static HANDLE s_event = nullptr;
+    if (s_event == nullptr)
+    {
+        s_event = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        if (s_event == nullptr) return false;
+    }
+    if (FAILED(g.fence_out->SetEventOnCompletion(value, s_event)))
+    {
+        CloseHandle(s_event);
+        s_event = nullptr;
+        return false;
+    }
+    const bool done = WaitForSingleObject(s_event, timeout_ms) == WAIT_OBJECT_0;
+    if (!done)
+    {
+        CloseHandle(s_event);
+        s_event = nullptr;
+    }
+    return done;
 }
 
 static void HideClassicD3D9Proxy()
@@ -2246,6 +2604,10 @@ static bool EnsureVulkanLoaded(reshade::api::effect_runtime *rt)
 static bool BuildSharedVk(UINT w, UINT h, DXGI_FORMAT bb_fmt)
 {
     Breadcrumb("building the shared textures (Vulkan)");
+    // Release before EnsureHost on purpose: a live host is reused by the 'B' build
+    // message below, so closing it first would pay the full host respawn on every
+    // rebuild. If the host is already gone, ReleaseShared skips the unbounded GPU
+    // waits and EnsureHost then spawns a fresh one before the imports are rebuilt.
     ReleaseShared();
 
     g.width  = w;
@@ -2653,7 +3015,7 @@ static void FeedFrameD3D9(reshade::api::effect_runtime *rt, reshade::api::resour
         Log("[feed32] classic D3D9 device recovered; rebuilding the bridge on the new device state");
     }
     if (ApplyPendingWorkResolution()) g.built = false;
-    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    ReloadConfigThrottled();   // same 1 s throttle as the gate in FeedFrame
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
     if (!InitializeD3D9Transport(device9))
     { FeedDisable("native D3D9 transport initialization failed"); return; }
@@ -2885,7 +3247,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
-    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    ReloadConfigThrottled();   // same 1 s throttle as the gate in FeedFrame
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
     device *dev_api = rt->get_device();
@@ -3012,6 +3374,10 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
             {
                 const GLuint inputs[3] = { g.gl_tex[FEED_COLOR], g.gl_tex[FEED_DEPTH], g.gl_tex[FEED_MV] };
                 FeedGlSignal(&g.gl, g.gl_sem_in, n, inputs, 3);   // includes the glFlush the host's wait needs
+                // The game's stream now carries signal(gl_sem_in, n) -- the host consumes it.
+                // Track it even if the message write below fails, so teardown never destroys
+                // a semaphore with a signal still in flight.
+                TeardownMarkSubmitted(n, false);
             }
 
             BYTE tag = 'F';
@@ -3024,6 +3390,7 @@ static void FeedFrameGl(reshade::api::effect_runtime *rt, reshade::api::resource
                 const GLuint outputs[1] = { g.gl_tex[FEED_OUTPUT] };
                 FeedGlWait(&g.gl, g.gl_sem_out, n, outputs, 1);   // server-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;                       // HostDrain must resolve this before any close
+                g_teardown_wait_depends_on_host = true;           // ... and only the host can advance gl_sem_out
                 FeedGlBlit(&g.gl, g.gl_fbo_read, g.gl_fbo_draw,
                            g.gl_tex[FEED_OUTPUT], true, bb_res.handle, false, w, h);
                 const UINT64 done = ++g.frames_done;
@@ -3055,7 +3422,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
     LARGE_INTEGER t0, t1;
     QueryPerformanceCounter(&t0);
 
-    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    ReloadConfigThrottled();   // same 1 s throttle as the gate in FeedFrame
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
     device *dev_api = rt->get_device();
@@ -3110,6 +3477,9 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
         g.rs_fence_in = g.rs_fence_out = {};
         g.vk_layout_init = false;
         g.rs_queue = nullptr;
+        // The old device is gone, so its objects (and any wait the old queue still had on
+        // the host) went with it: nothing tracked here is still owned by a live device.
+        TeardownMarkRetired();
         HostClose();
         ReleaseShared();
     }
@@ -3181,6 +3551,10 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
             Breadcrumb("signalling the host (Vulkan)");
             g.rs_queue->flush_immediate_command_list();
             g.rs_queue->signal(g.rs_fence_in, n);
+            // The game's queue now carries signal(rs_fence_in, n). Track it before the
+            // message write: if the write fails the signal is still in flight, and tearing
+            // the imported semaphore down then would be a destroy-while-in-use.
+            TeardownMarkSubmitted(n, false);
 
             BYTE tag = 'F';
             FeedFrameMsg fm = { n, static_cast<uint32_t>(reset) };
@@ -3192,6 +3566,7 @@ static void FeedFrameVk(reshade::api::effect_runtime *rt, reshade::api::command_
                 Breadcrumb("waiting for the host's result (Vulkan)");
                 g.rs_queue->wait(g.rs_fence_out, n);   // GPU-side; the host CPU-signals on failure
                 g.fence_wait_queued = true;            // HostDrain must resolve this before any close
+                g_teardown_wait_depends_on_host = true;   // ... and only the host can advance rs_fence_out
                 cb = FeedVkDispatch<VkCommandBuffer>(cl->get_native());   // fresh buffer after the flush
                 // Prefer the raw copy: vkCmdBlitImage CONVERTS, and that conversion is
                 // sRGB-aware, so blitting our linear-typed output into a VK_FORMAT_*_SRGB
@@ -3260,7 +3635,7 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
     g.is_d3d10 = true;
     g.is_d3d9 = false;
     if (ApplyPendingWorkResolution()) g.built = false;
-    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    ReloadConfigThrottled();   // same 1 s throttle as the gate in FeedFrame
     if (!g_cfg.enabled || g_cfg.mode == 0) { SafeRelease(device10); SafeRelease(source10); return; }
     if (!InitializeD3D10Transport(device10))
     {
@@ -3334,6 +3709,11 @@ static void FeedFrameD3D10(reshade::api::effect_runtime *rt, reshade::api::resou
 static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_list *cl, reshade::api::resource_view rtv)
 {
 
+    // Reload BEFORE the gate. Once enabled/mode switch the feed off, this gate returns
+    // before any transport runs, and the transport reload below was the only reader of
+    // the file: an outside write of enabled=1 could never be picked up again. The poll
+    // is throttled, so presenting at frame rate does not touch the disk per frame.
+    ReloadConfigThrottled();
     if (!g_cfg.enabled || g.disabled || g_cfg.mode == 0) return;
 
     LARGE_INTEGER t0, t1;
@@ -3355,7 +3735,7 @@ static void FeedFrame(reshade::api::effect_runtime *rt, reshade::api::command_li
     if (ctx == nullptr || ctx->GetType() != D3D11_DEVICE_CONTEXT_IMMEDIATE) return;
 
     if (ApplyPendingWorkResolution()) g.built = false;
-    if ((g.frames_done % 60) == 0 && CfgReload()) g.built = false;
+    ReloadConfigThrottled();   // same 1 s throttle as the gate in FeedFrame
     if (!g_cfg.enabled || g_cfg.mode == 0) return;
 
     reshade::api::resource_view mv_srv = {}, mv_srgb = {}, d_srv = {}, d_srgb = {};
@@ -4520,9 +4900,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
         FeedVkHookRemove();   // before this code is unmapped -- ReShade reloads add-ons per Vulkan instance
         // lpReserved != nullptr means the process is exiting: the OS reclaims the
         // child and its handles, and waiting (let alone TerminateProcess) under
-        // the loader lock is the hazard. An explicit unload keeps the full wait
-        // so the pipe name is free before a replacement host is spawned.
-        HostClose(reserved == nullptr);
+        // the loader lock is the hazard. Pass that in so even the GPU drain and the
+        // Vulkan/GL semaphore teardown are skipped. An explicit unload keeps the
+        // full wait so the pipe name is free before a replacement host is spawned.
+        HostClose(reserved == nullptr, reserved != nullptr);
         reshade::unregister_addon(module);
         Log("shut down cleanly.");
     }

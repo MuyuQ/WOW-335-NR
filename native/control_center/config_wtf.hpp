@@ -51,6 +51,8 @@ struct ConfigWtfWriteResult {
     ConfigWtfWriteError error = ConfigWtfWriteError::None;
     DWORD win32Error = 0;
     std::wstring backupPath;
+    // 备份内容对应第几轮读取（从 1 起）；0 表示没有可恢复的备份。
+    int backupAttempt = 0;
     std::string detail;
 
     explicit operator bool() const { return error == ConfigWtfWriteError::None; }
@@ -314,25 +316,24 @@ inline bool IsClientGameRunning(const std::wstring& clientRoot) {
     return running;
 }
 
-// Replaces the maxFPS / maxFPSBK values while keeping every other byte of the file.
-// Returns the full path of the backup file on success.
-inline ConfigWtfWriteResult SaveConfigFpsCap(const std::wstring& clientRoot, int front, int back) {
-    using namespace config_wtf_detail;
-    ConfigWtfWriteResult result;
-    const auto fail = [&result](ConfigWtfWriteError error, DWORD win32Error) {
-        result.error = error;
-        result.win32Error = win32Error;
-        return result;
-    };
-    if (front < 0 || front > 999 || back < 0 || back > 999) return fail(ConfigWtfWriteError::InvalidRange, 0);
-    const std::wstring path = ConfigWtfPath(clientRoot);
-    if (path.empty() || !FileExistsNoReparse(path)) return fail(ConfigWtfWriteError::MissingFile, 0);
-    if (IsClientGameRunning(clientRoot)) return fail(ConfigWtfWriteError::GameRunning, 0);
+// 写入过程的测试注入点。两个回调都只在测试中设置，生产调用方使用默认值（nullptr）。
+struct ConfigWtfWriteHooks {
+    // 替换前：临时文件已写好、ReplaceFileW 尚未执行时调用，用于确定性地模拟
+    // “另一写者在我们读完原文之后、替换之前”提交内容的时序。
+    void (*beforeCommit)(const std::wstring& path, int attempt, void* context) = nullptr;
+    // 替换后：在原子替换完成、回读校验之前调用，用于确定性地模拟并发写者。
+    void (*afterWrite)(const std::wstring& path, int attempt, void* context) = nullptr;
+    void* context = nullptr;
+};
 
-    DWORD win32Error = ERROR_SUCCESS;
-    std::string original;
-    if (!ReadWholeBytes(path, original, win32Error)) return fail(ConfigWtfWriteError::Read, win32Error);
+// 最多写入尝试次数。回读字节与本轮期望不一致时说明有并发写者（例如用户另开了
+// 配置工具或游戏退出时回写 Config.wtf），重新读取最新内容并把两个帧率值重新应用。
+constexpr int kConfigWtfWriteAttempts = 3;
 
+namespace config_wtf_detail {
+
+// 只替换 maxFPS / maxFPSBK 的数字区段，BOM 与其余字节原样保留。
+inline std::string BuildUpdatedConfigBytes(const std::string& original, int front, int back) {
     bool bom = false;
     const std::string body = [&original, &bom]() {
         if (original.size() >= 3 && static_cast<unsigned char>(original[0]) == 0xEF &&
@@ -381,55 +382,125 @@ inline ConfigWtfWriteResult SaveConfigFpsCap(const std::wstring& clientRoot, int
     finalBytes.reserve(updated.size() + 3);
     if (bom) finalBytes.append("\xEF\xBB\xBF", 3);
     finalBytes += updated;
+    return finalBytes;
+}
 
-    // Backup first: a failed write must not leave the user without the original bytes.
-    std::wstring backup = path + L".nr-" + TimestampSuffix() + L".bak";
-    bool backupCreated = false;
-    for (int attempt = 0; attempt < 64 && !backupCreated; ++attempt) {
-        std::wstring candidate = attempt == 0 ? backup
-                                              : path + L".nr-" + TimestampSuffix() + L"-" +
-                                                    std::to_wstring(attempt) + L".bak";
-        if (!WriteAllBytes(candidate, original, CREATE_NEW, win32Error)) {
+// 在 path 旁创建一个不冲突的备份文件，内容为 bytes；成功时返回备份路径。
+inline bool CreateBackupFile(const std::wstring& path, const std::string& bytes, std::wstring& backup,
+                             DWORD& win32Error) {
+    for (int attempt = 0; attempt < 64; ++attempt) {
+        std::wstring candidate = attempt == 0
+                                     ? path + L".nr-" + TimestampSuffix() + L".bak"
+                                     : path + L".nr-" + TimestampSuffix() + L"-" + std::to_wstring(attempt) + L".bak";
+        if (!WriteAllBytes(candidate, bytes, CREATE_NEW, win32Error)) {
             if (win32Error == ERROR_FILE_EXISTS || win32Error == ERROR_ALREADY_EXISTS) continue;
-            return fail(ConfigWtfWriteError::Backup, win32Error);
+            return false;
         }
         backup = candidate;
-        backupCreated = true;
+        return true;
     }
-    if (!backupCreated) return fail(ConfigWtfWriteError::Backup, ERROR_ALREADY_EXISTS);
+    win32Error = ERROR_ALREADY_EXISTS;
+    return false;
+}
 
-    // Unique temporary name in the same directory, then an atomic replace.
+}  // namespace config_wtf_detail
+
+// Replaces the maxFPS / maxFPSBK values while keeping every other byte of the file.
+// Returns the full path of the backup file on success.
+//
+// 并发保护（R10）：每一轮“读取快照 -> 计算期望字节 -> 备份 -> 写临时文件 -> 替换前复核
+// -> 原子替换 -> 逐字节回读”，最多 3 轮。替换前复核会再次读取目标文件并与本轮快照逐
+// 字节比较：若另一写者已在我们读取之后提交了内容，本轮放弃替换，下一轮以磁盘最新内容
+// 为准重新应用两个帧率值，因此对方提交的无关设置不会被旧快照覆盖。3 轮都检测到并发写
+// 者时不再回填旧快照/旧备份：目标文件保持其他写者的最新内容，只保留一份对应最后一轮
+// 读取的备份供人工恢复，并返回校验错误（detail 指明并发写者）。
+inline ConfigWtfWriteResult SaveConfigFpsCap(const std::wstring& clientRoot, int front, int back,
+                                             const ConfigWtfWriteHooks& hooks = ConfigWtfWriteHooks()) {
+    using namespace config_wtf_detail;
+    ConfigWtfWriteResult result;
+    const auto fail = [&result](ConfigWtfWriteError error, DWORD win32Error) {
+        result.error = error;
+        result.win32Error = win32Error;
+        return result;
+    };
+    if (front < 0 || front > 999 || back < 0 || back > 999) return fail(ConfigWtfWriteError::InvalidRange, 0);
+    const std::wstring path = ConfigWtfPath(clientRoot);
+    if (path.empty() || !FileExistsNoReparse(path)) return fail(ConfigWtfWriteError::MissingFile, 0);
+    if (IsClientGameRunning(clientRoot)) return fail(ConfigWtfWriteError::GameRunning, 0);
+
     const std::wstring directory = DirectoryOf(path);
-    wchar_t temporaryName[64] = {};
-    std::swprintf(temporaryName, sizeof(temporaryName) / sizeof(temporaryName[0]), L"Config.wtf.nr-%lu-%llu.tmp",
-                  static_cast<unsigned long>(GetCurrentProcessId()),
-                  static_cast<unsigned long long>(GetTickCount64()));
-    const std::wstring temporary = directory.empty() ? std::wstring(temporaryName)
-                                                    : directory + L"\\" + temporaryName;
-    if (!WriteAllBytes(temporary, finalBytes, CREATE_NEW, win32Error)) {
-        DeleteFileW(backup.c_str());
-        return fail(ConfigWtfWriteError::Write, win32Error);
-    }
-    if (!ReplaceFileW(path.c_str(), temporary.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
-        win32Error = GetLastError();
-        if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-            DeleteFileW(temporary.c_str());
+    DWORD win32Error = ERROR_SUCCESS;
+    std::wstring lastBackup;      // 最后一轮读取时的快照，仅供人工恢复。
+    int lastBackupAttempt = 0;    // 该备份对应的轮次（从 1 起，0 表示没有）。
+    bool concurrentDetected = false;
+    for (int attempt = 1; attempt <= kConfigWtfWriteAttempts; ++attempt) {
+        // 1) 每一轮都以磁盘上的最新快照为准，避免覆盖并发写者已提交的内容。
+        std::string original;
+        if (!ReadWholeBytes(path, original, win32Error)) return fail(ConfigWtfWriteError::Read, win32Error);
+        const std::string expected = BuildUpdatedConfigBytes(original, front, back);
+
+        // 2) 备份本轮读取到的字节；并发失败时它就是留给人工恢复的那一份。
+        std::wstring backup;
+        if (!CreateBackupFile(path, original, backup, win32Error)) {
+            return fail(ConfigWtfWriteError::Backup, win32Error);
+        }
+        lastBackup = backup;
+        lastBackupAttempt = attempt;
+
+        // 3) 同目录唯一临时文件，替换前先写好。
+        wchar_t temporaryName[96] = {};
+        std::swprintf(temporaryName, sizeof(temporaryName) / sizeof(temporaryName[0]),
+                      L"Config.wtf.nr-%lu-%llu-%d.tmp", static_cast<unsigned long>(GetCurrentProcessId()),
+                      static_cast<unsigned long long>(GetTickCount64()), attempt);
+        const std::wstring temporary =
+            directory.empty() ? std::wstring(temporaryName) : directory + L"\\" + temporaryName;
+        if (!WriteAllBytes(temporary, expected, CREATE_NEW, win32Error)) {
             DeleteFileW(backup.c_str());
             return fail(ConfigWtfWriteError::Write, win32Error);
         }
+
+        // 4) 替换前复核：目标文件必须仍等于本轮读取时的快照。否则说明另一写者在我们
+        //    读完原文之后、ReplaceFileW 之前提交了新内容，用旧快照替换会丢掉对方设置，
+        //    因此删除临时文件并以磁盘最新内容进入下一轮。
+        if (hooks.beforeCommit != nullptr) hooks.beforeCommit(path, attempt, hooks.context);
+        std::string current;
+        const bool currentRead = ReadWholeBytes(path, current, win32Error);
+        if (!currentRead || current != original) {
+            DeleteFileW(temporary.c_str());
+            concurrentDetected = true;
+            if (attempt < kConfigWtfWriteAttempts) Sleep(10);  // 给并发写者短暂让路
+            continue;
+        }
+
+        // 5) 原子替换。
+        if (!ReplaceFileW(path.c_str(), temporary.c_str(), nullptr, REPLACEFILE_WRITE_THROUGH, nullptr, nullptr)) {
+            win32Error = GetLastError();
+            if (!MoveFileExW(temporary.c_str(), path.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                DeleteFileW(temporary.c_str());
+                DeleteFileW(backup.c_str());
+                return fail(ConfigWtfWriteError::Write, win32Error);
+            }
+        }
+
+        if (hooks.afterWrite != nullptr) hooks.afterWrite(path, attempt, hooks.context);
+
+        // 6) 逐字节回读：与期望一致才算成功；否则视为并发写入，重新读取后重试。
+        std::string actual;
+        if (ReadWholeBytes(path, actual, win32Error) && actual == expected) {
+            result.backupPath = backup;
+            result.backupAttempt = attempt;
+            return result;
+        }
+        concurrentDetected = true;
+        if (attempt < kConfigWtfWriteAttempts) Sleep(10);  // 给并发写者短暂让路
     }
 
-    const ConfigWtfCap check = ReadConfigFpsCap(clientRoot);
-    if (!check.exists || !check.readable || check.front != front) {
-        CopyFileW(backup.c_str(), path.c_str(), FALSE);
-        return fail(ConfigWtfWriteError::VerifyFront, 0);
-    }
-    if (check.back != back) {
-        CopyFileW(backup.c_str(), path.c_str(), FALSE);
-        return fail(ConfigWtfWriteError::VerifyBack, 0);
-    }
-    result.backupPath = backup;
-    return result;
+    // 7) 持续冲突：绝不回填旧快照或旧备份，目标文件保持其他写者最后提交的内容；
+    //    仅报告一份对应最后一轮读取的备份供人工恢复。
+    result.backupPath = lastBackup;
+    result.backupAttempt = lastBackupAttempt;
+    result.detail = concurrentDetected ? "concurrent writer detected" : "config write could not be verified";
+    return fail(ConfigWtfWriteError::VerifyFront, win32Error);
 }
 
 }  // namespace control_center

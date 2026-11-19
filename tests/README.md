@@ -12,6 +12,14 @@ python -X utf8 -B tests/test_stage_override.py
 
 `Build-ControlCenter.ps1` 另负责最终产物的四个内置方案复制与哈希检查；编译与隔离检查不代替真实游戏、驱动挂起和干净系统验收。
 
+发布打包检查（工作区 `src/WOW-335-NR` 布局下）：
+
+```powershell
+pwsh -NoProfile -File tests/Test-ReleasePackaging.ps1
+```
+
+该入口按 `panel-lock.json` 从 `_scratch/dlss5-aio/panel-build-*` 选出哈希匹配的面板候选并实际执行严格构建，核对包内 `bin/dlss5-panel.exe` 与 `build.json` 的 `panel_candidate` 及锁校验字段；再验证旧部署面板作为候选时严格构建必须失败、不创建输出目录、不改写 `tools/dlss5/bin/`，并覆盖互斥参数与缺候选的快速失败。可用 `-CandidatePath` 指定候选、`-IncludeUnverifiedContrast` 追加 `-AllowUnverified` 旧行为对照（仅对照，不作为验收包）。
+
 原生控制中心核心检查在维护仓库运行：
 
 ```powershell

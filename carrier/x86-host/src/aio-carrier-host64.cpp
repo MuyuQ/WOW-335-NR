@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <vector>
 #include <algorithm>
+#include <process.h>   // _beginthreadex for the teardown watchdog
 
 #include <nvsdk_ngx.h>
 #include <nvsdk_ngx_helpers.h>
@@ -35,6 +36,9 @@
 // ---------------------------------------------------------------------------
 
 static char g_log_path[MAX_PATH];
+// The teardown watchdog logs concurrently with the frame loop; a single lock keeps
+// file and stdout lines from interleaving.
+static SRWLOCK g_log_lock = SRWLOCK_INIT;
 static bool g_show_window = false;
 static HWND g_game_window_hint = nullptr;
 static DWORD g_game_pid;
@@ -217,6 +221,7 @@ static void Log(const char *fmt, ...)
     va_end(ap);
     SYSTEMTIME st;
     GetLocalTime(&st);
+    AcquireSRWLockExclusive(&g_log_lock);
     printf("%02u:%02u:%02u.%03u  %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
     FILE *f = nullptr;
     if (fopen_s(&f, g_log_path, "a") == 0 && f != nullptr)
@@ -224,6 +229,7 @@ static void Log(const char *fmt, ...)
         fprintf(f, "%02u:%02u:%02u.%03u  %s\n", st.wHour, st.wMinute, st.wSecond, st.wMilliseconds, line);
         fclose(f);
     }
+    ReleaseSRWLockExclusive(&g_log_lock);
 }
 
 static const char *NgxResultName(NVSDK_NGX_Result r)
@@ -276,6 +282,116 @@ struct Host
 };
 
 static Host h;
+
+// ---------------------------------------------------------------------------
+// Teardown watchdog
+// ---------------------------------------------------------------------------
+// The game queues a GPU wait on fence_out for every frame message it writes, and a
+// successful pipe write does not mean this process ever read it. The normal teardown
+// below releases those waits, but it only runs once the frame loop returns -- and the
+// loop can be blocked inside NGX or a D3D12 submit when the game exits or is killed.
+// This thread watches the game process and the pipe independently and releases the
+// waits exactly once, even while the main thread is stuck.
+//
+// Limit, stated because it is load-bearing: an in-process watchdog cannot cover this
+// process itself being killed. If the host dies between the game's pipe write and the
+// fence signal, nothing here ever runs again, so no UINT64_MAX can be sent. That case is
+// detected and handled on the 32-bit side: it observes "host process exited" separately
+// from "the host fence reached the frame" and RETIRES the imported images/semaphores
+// instead of entering an unbounded GPU wait (carrier/x86-host/src/teardown_policy.hpp).
+// Reclamation responsibility in that case is explicit: the game's device destruction
+// (vkDestroyDevice / GL context teardown / D3D11 device release), the driver, or process
+// exit -- never a destroy of an object a GPU wait may still reference.
+static HANDLE g_watchdog_stop;      // manual-reset: main thread asks the thread to end
+static HANDLE g_watchdog_thread;
+static HANDLE g_watchdog_game;      // SYNCHRONIZE handle to the game process (optional)
+static HANDLE g_watchdog_pipe;      // owned by Serve; only peeked, never closed here
+static volatile LONG g_fence_out_released;
+
+static void ReleaseGameFenceWaits(const char *why)
+{
+    if (h.fence_out == nullptr) return;
+    // One shot: the watchdog and the normal exit path must not both signal UINT64_MAX.
+    if (InterlockedCompareExchange(&g_fence_out_released, 1, 0) != 0) return;
+    Log("[host] releasing the game's pending fence waits (UINT64_MAX): %s", why);
+    // Best effort only: this retires the game-side wait while THIS process is alive.
+    // A killed host never reaches this line; the wrapper then retires the imports.
+    h.fence_out->Signal(UINT64_MAX);
+}
+
+static unsigned __stdcall HostWatchdogThread(void *)
+{
+    for (;;)
+    {
+        HANDLE waits[2];
+        DWORD count = 0;
+        waits[count++] = g_watchdog_stop;
+        if (g_watchdog_game != nullptr) waits[count++] = g_watchdog_game;
+        const DWORD wait = WaitForMultipleObjects(count, waits, FALSE, 250);
+        if (wait == WAIT_OBJECT_0) return 0;               // asked to stop
+        if (wait == WAIT_OBJECT_0 + 1)                     // game process exited
+        {
+            ReleaseGameFenceWaits("the game process exited");
+            return 0;
+        }
+        if (wait == WAIT_FAILED) return 0;
+        // Timed out: also notice a broken pipe while the game itself is still alive
+        // (a settings apply or an explicit host restart closes it first).
+        HANDLE pipe = g_watchdog_pipe;
+        if (pipe != nullptr)
+        {
+            DWORD avail = 0;
+            if (!PeekNamedPipe(pipe, nullptr, 0, nullptr, &avail, nullptr))
+            {
+                ReleaseGameFenceWaits("the pipe to the game broke");
+                return 0;
+            }
+        }
+    }
+}
+
+static void StartHostWatchdog(HANDLE pipe, DWORD game_pid)
+{
+    g_watchdog_pipe = pipe;
+    g_watchdog_stop = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    // A separate handle: hgame only has PROCESS_DUP_HANDLE, and waiting on the game
+    // process is what makes a killed game visible while our own queue is blocked.
+    g_watchdog_game = OpenProcess(SYNCHRONIZE, FALSE, game_pid);
+    if (g_watchdog_stop == nullptr)
+    {
+        Log("[host] watchdog unavailable (CreateEvent failed %lu); relying on the normal teardown path",
+            GetLastError());
+        if (g_watchdog_game != nullptr) { CloseHandle(g_watchdog_game); g_watchdog_game = nullptr; }
+        g_watchdog_pipe = nullptr;
+        return;
+    }
+    unsigned id = 0;
+    g_watchdog_thread = reinterpret_cast<HANDLE>(_beginthreadex(nullptr, 0, HostWatchdogThread, nullptr, 0, &id));
+    if (g_watchdog_thread == nullptr)
+    {
+        Log("[host] watchdog thread creation failed; relying on the normal teardown path");
+        CloseHandle(g_watchdog_stop);
+        g_watchdog_stop = nullptr;
+        if (g_watchdog_game != nullptr) { CloseHandle(g_watchdog_game); g_watchdog_game = nullptr; }
+        g_watchdog_pipe = nullptr;
+    }
+}
+
+static void StopHostWatchdog()
+{
+    g_watchdog_pipe = nullptr;   // stop peeking before Serve's pipe is closed
+    if (g_watchdog_stop != nullptr) SetEvent(g_watchdog_stop);
+    if (g_watchdog_thread != nullptr)
+    {
+        // The thread returns after at most one more Log/Signal; join it so a winning
+        // watchdog signal always sees a live fence object while the loop drains.
+        WaitForSingleObject(g_watchdog_thread, 1000);
+        CloseHandle(g_watchdog_thread);
+        g_watchdog_thread = nullptr;
+    }
+    if (g_watchdog_stop != nullptr) { CloseHandle(g_watchdog_stop); g_watchdog_stop = nullptr; }
+    if (g_watchdog_game != nullptr) { CloseHandle(g_watchdog_game); g_watchdog_game = nullptr; }
+}
 
 static BOOL CALLBACK FindGameWindowProc(HWND window, LPARAM parameter)
 {
@@ -1139,6 +1255,10 @@ static int Serve(DWORD game_pid)
     DuplicateHandle(GetCurrentProcess(), hin, hgame, &game_in, 0, FALSE, DUPLICATE_SAME_ACCESS);
     DuplicateHandle(GetCurrentProcess(), hout, hgame, &game_out, 0, FALSE, DUPLICATE_SAME_ACCESS);
 
+    // From here on the game can hold frame waits on fence_out; cover the case where
+    // this loop never reaches the teardown below (killed game, blocked submit).
+    StartHostWatchdog(pipe, hello.pid);
+
     bool transport_only = true;
 
     for (;;)
@@ -1282,11 +1402,18 @@ static int Serve(DWORD game_pid)
     // GPU-side wait on fence_out for every frame message it writes, and a successful
     // pipe write does not mean we ever read it: exiting now could leave a wait that
     // nothing will ever satisfy, wedging the game's whole GPU queue -- Present
-    // included -- until the driver TDRs (seen once as a system-wide freeze). Drain our
-    // own queue, then release every wait the game could possibly hold.
+    // included -- until the driver TDRs (seen once as a system-wide freeze). The
+    // watchdog above covers the case where this loop never gets here; stop it first so
+    // the two release paths cannot race. Drain our own queue, then release every wait
+    // the game could possibly hold.
+    StopHostWatchdog();
     WaitFenceValue(h.fence, h.fence_value, 2000);
-    if (h.fence_out != nullptr) h.fence_out->Signal(UINT64_MAX);
-    Log("[host] pending game fence waits released; exiting");
+    // Last in-process guarantee: every wait the game may already hold is retired with
+    // UINT64_MAX before this process exits. If the process is killed instead, this
+    // release cannot happen -- the wrapper then observes the exit and retires the imports
+    // rather than waiting unbounded, and the game device/driver/process exit reclaims them.
+    ReleaseGameFenceWaits("the host is shutting down");
+    Log("[host] pending game fence waits released (UINT64_MAX); exiting");
     return 0;
 }
 

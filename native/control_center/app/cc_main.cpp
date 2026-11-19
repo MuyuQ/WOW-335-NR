@@ -2142,7 +2142,9 @@ void AppLaunchOrPanel(App& app) {
         AppSetStatus(app, L"请先在「切换客户端」中选择含 wow.exe 的目录。");
         return;
     }
-    const bool running = app.gameRunning || app.snapshot.processState == ProcessState::Running;
+    // R6：主按钮只跟随“所选客户端”的游戏进程（app.gameRunning 由按客户端路径的
+    // 进程关联得到）；系统级进程快照只用于安装/修复/卸载等破坏性操作的拦截。
+    const bool running = app.gameRunning;
     if (running) {
         AppStartPanel(app);
         return;
@@ -2209,18 +2211,39 @@ void AppStartPanel(App& app) {
     app.toolRun.token = ++app.toolToken;
     const std::uint64_t token = app.toolRun.token;
     app.dirty = true;
-    auto result = std::make_shared<PanelStartTaskResult>();
+    auto result = std::make_shared<control_center::PanelStartResult>();
     const std::wstring exeDir = app.paths.exeDir;
     const std::wstring dataDir = app.paths.dataDir;
     const std::wstring client = app.clientRoot;
     const bool posted = app.jobs.Post(
-        [exeDir, dataDir, client, result]() { *result = RunPanelStartTask(exeDir, dataDir, client); },
+        [exeDir, dataDir, client, result]() {
+            // R6：只有所选客户端的 wow.exe 在运行时才允许启动/复用面板，避免把面板
+            // 常驻在错误的客户端上并占用 DLSS5PanelMutex；同时可选校验面板哈希。
+            *result = control_center::panel_detail::StartPanel(
+                exeDir, dataDir, client, control_center::PanelStartOptions{true, true});
+        },
         [&app, token, result, autoRequest](const std::wstring& error) {
             if (token != app.toolRun.token) return;
             app.toolRun.running = false;
             app.toolRun.finished = true;
             app.dirty = true;
-            const std::wstring failure = !error.empty() ? error : (result->ok ? std::wstring() : result->error);
+            if (!error.empty()) {
+                const std::wstring message = (autoRequest ? L"面板自动拉起未执行：" : L"操作未完成：") + error;
+                app.toolRun.error = error;
+                app.log.Add(message);
+                AppSetStatus(app, message);
+                return;
+            }
+            if (!result->hashWarning.empty()) app.log.Add(result->hashWarning);
+            if (result->status == control_center::PanelStartStatus::AlreadyRunning) {
+                // 面板已经在运行且已连接所选客户端：视为“已连接”，不算失败。
+                app.toolRun.ok = true;
+                if (!result->logDir.empty()) app.lastPanelLog = result->logDir;
+                app.log.Add(L"游戏内面板已在运行，已连接所选客户端。");
+                AppSetStatus(app, L"已连接游戏内面板。");
+                return;
+            }
+            const std::wstring failure = result->ok ? std::wstring() : result->error;
             if (!failure.empty()) {
                 const std::wstring message = (autoRequest ? L"面板自动拉起未执行：" : L"操作未完成：") + failure;
                 app.toolRun.error = failure;
