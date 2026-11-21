@@ -6,6 +6,7 @@
 #include "copy_verified.hpp"
 #include "install_preview.hpp"
 #include "journal.hpp"
+#include "registered_install_config.hpp"
 #include "rename_verified.hpp"
 #include "capture_client_record.hpp"
 
@@ -193,12 +194,16 @@ inline MemberInstallResult InstallMember(const MemberInstallContext& context, co
         return fail("journal requires recovery", true);
     if (MemberProcesses(context).state != ProcessState::Stopped) return fail("game or launcher running or process state unknown");
     CatalogResult one; one.members.push_back(*member);
-    const auto now = PreviewInstall(client.root, context.stageRoot, context.templateRoot, one);
+    const auto registered = LoadRegisteredInstallConfig(client.root, one);
+    const auto now = PreviewInstall(client.root, context.stageRoot, context.templateRoot, one,
+                                    registered.trusted ? &registered.policy : nullptr);
     if (!now.filesReady || now.items.size() != 1) return fail("file preview failed");
     const auto& current = now.items[0];
-    if (current.state != selected.state || (current.state == PreviewState::Present && !SameIdentity(current.existing, selected.existing)))
+    if (current.state != selected.state ||
+        (current.state == PreviewState::Present && !SameIdentity(current.existing, selected.existing)))
         return fail("preview changed");
-    if (current.state == PreviewState::Same || current.state == PreviewState::MissingOptional) {
+    if (current.state == PreviewState::Same || current.state == PreviewState::MissingOptional ||
+        current.state == PreviewState::PreservedConfig) {
         result.state = MemberInstallState::NoChange; return result;
     }
     if (current.state != PreviewState::Absent && current.state != PreviewState::Present) return fail("preview not installable");

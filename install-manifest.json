@@ -57,7 +57,7 @@
       "pre_state": "absent",
       "replaces_original": false,
       "required": true,
-      "note": "客户端已有 ReShade.ini 时安装预览会报冲突，需先决定保留哪一个"
+      "note": "重复安装时，若活动安装记录登记过此文件且登记的源哈希与当前清单一致，则保留现有个性化内容（显示为“保留配置”，不写入、不备份）；首次安装遇到内容不同的同名文件仍报目标冲突"
     },
     {
       "target": "standalone-dlssnr.addon32",
@@ -218,7 +218,7 @@
       "pre_state": "absent",
       "replaces_original": false,
       "required": true,
-      "note": "载体运行后会把面板改动写回这个文件"
+      "note": "载体运行后会把面板改动写回这个文件；重复安装时若该文件已登记在活动安装记录中且登记的源哈希与当前清单一致，则保留现有内容（显示为“保留配置”，不写入、不备份）"
     },
     {
       "target": "host64/ReShadePreset.ini",

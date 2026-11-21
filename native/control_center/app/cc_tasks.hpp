@@ -18,6 +18,7 @@
 #include "../coordinated_uninstall.hpp"
 #include "../install_job.hpp"
 #include "../install_preview.hpp"
+#include "../registered_install_config.hpp"
 #include "../repair_job.hpp"
 #include "../repair_preview.hpp"
 #include "../start_with_recovery.hpp"
@@ -152,11 +153,37 @@ struct InstallTaskResult {
     std::wstring error;
     control_center::InstallJobState state = control_center::InstallJobState::PreconditionFailed;
     size_t applied = 0;
+    size_t preserved = 0;
+    bool noChange = false;
     bool committedAfterRecovery = false;
+    // 组件文件全部就绪，但客户端没有本工具的安装记录：既不是成功（不得当作
+    // 已安装、也不带卸载权），也不是普通的安装失败，UI 需要单独说明。
+    bool recordMissing = false;
+    // 组件文件全部就绪，但磁盘上的安装记录属于另一个客户端目录：保留原记录，
+    // 不得当作“无需写入”的成功，也不得让首页显示已安装。
+    bool recordForeign = false;
 };
 
-struct RepairTaskResult {
-    bool ok = false;
+// 安装结果页与日志共用：无需写入和实际写入使用不同措辞，且必须列出保留的
+// 已登记个性化配置数量；页面只消费这里生成的文本，避免两处各写一套。
+inline std::wstring InstallOutcomeDetail(const InstallTaskResult& result) {
+    if (!result.ok) return L"";
+    if (result.noChange) {
+        return result.preserved ? (L"无需写入：其余组件已就绪，保留 " + std::to_wstring(result.preserved) + L" 份已登记配置")
+                                : std::wstring(L"无需写入：所有组件已就绪");
+    }
+    std::wstring detail = L"已应用 " + std::to_wstring(result.applied) + L" 个成员";
+    if (result.preserved) detail += L"，保留 " + std::to_wstring(result.preserved) + L" 份已登记配置";
+    return detail;
+}
+
+inline std::wstring InstallOutcomeStateText(const InstallTaskResult& result) {
+    if (!result.ok) return L"";
+    return result.noChange ? std::wstring(L"无需变更（安装记录与备份保持原样）")
+                           : std::wstring(L"已提交（安装记录已发布）");
+}
+
+struct RepairTaskResult {    bool ok = false;
     std::wstring error;
     control_center::RepairJobState state = control_center::RepairJobState::PreconditionFailed;
     size_t repaired = 0;
@@ -167,6 +194,7 @@ struct RepairTaskResult {
 struct UninstallTaskResult {
     bool ok = false;
     bool recovered = false;
+    bool recordForeign = false;
     std::wstring error;
     size_t processed = 0;
     bool finalized = false;
@@ -190,17 +218,20 @@ inline std::wstring PreviewIssueReason(const std::string& issue) {
 }
 
 // 把安装预检失败翻译成可读的逐项原因；用于安装作业与检查步骤的提示。
-inline std::wstring PreviewIssueText(const control_center::InstallPreview& preview) {
+// category 为 "source"/"target" 时只汇总该类别的原因（源文件损坏与目标冲突
+// 必须分开提示），空值汇总全部。
+inline std::wstring PreviewIssueText(const control_center::InstallPreview& preview, const char* category = nullptr) {
     std::vector<std::wstring> parts;
     size_t invalid = 0;
     for (const auto& item : preview.items) {
         if (item.state != control_center::PreviewState::Invalid) continue;
+        if (category && item.issue.rfind(category, 0) != 0) continue;
         ++invalid;
         if (parts.size() < 3) {
             parts.push_back(item.member.target + L"（" + PreviewIssueReason(item.issue) + L"）");
         }
     }
-    if (invalid == 0) return L"部分文件不可用";
+    if (invalid == 0) return L"";
     std::wstring text = std::to_wstring(invalid) + L" 个文件未通过检查：";
     for (size_t i = 0; i < parts.size(); ++i) {
         if (i) text += L"、";
@@ -208,6 +239,12 @@ inline std::wstring PreviewIssueText(const control_center::InstallPreview& previ
     }
     if (invalid > parts.size()) text += L" 等 " + std::to_wstring(invalid) + L" 项";
     return text;
+}
+
+inline bool PreviewHasIssueCategory(const control_center::InstallPreview& preview, const char* category) {
+    for (const auto& item : preview.items)
+        if (item.state == control_center::PreviewState::Invalid && item.issue.rfind(category, 0) == 0) return true;
+    return false;
 }
 
 inline InstallTaskResult RunInstallTask(const std::wstring& clientRoot, const std::wstring& stageRoot,
@@ -235,10 +272,31 @@ inline InstallTaskResult RunInstallTask(const std::wstring& clientRoot, const st
             return result;
         }
         progress->stage.store(0);
-        const auto preview = PreviewInstall(clientRoot, stageRoot, templateRoot, catalog);
-        if (!preview.error.empty() || !preview.filesReady) {
-            result.error = L"安装源文件校验失败：" +
-                           (preview.error.empty() ? PreviewIssueText(preview) : Utf8ToWide(preview.error));
+        // Verify record ownership before any transaction directory is created or
+        // any member is written. A record published for another client directory
+        // must never be silently adopted by this client.
+        const auto activeRecord = CaptureClientRecord(clientRoot);
+        if (activeRecord.state == CapturedRecordState::Present && !ClientRecordOwnedBy(activeRecord.record, clientRoot)) {
+            result.state = control_center::InstallJobState::NeedsAttention;
+            result.recordForeign = true;
+            result.error = L"安装记录属于其他客户端：现有安装记录（host64\\dlss5-install-record.json）是为另一个客户端目录发布的。已保留该记录，未做任何写入。";
+            return result;
+        }
+        const auto registered = LoadRegisteredInstallConfig(clientRoot, catalog);
+        const auto preview = PreviewInstall(clientRoot, stageRoot, templateRoot, catalog,
+                                            registered.trusted ? &registered.policy : nullptr);
+        if (!preview.error.empty()) {
+            result.error = L"安装源文件校验失败：" + Utf8ToWide(preview.error);
+            return result;
+        }
+        if (!preview.filesReady) {
+            const auto sourceIssues = PreviewIssueText(preview, "source");
+            const auto targetIssues = PreviewIssueText(preview, "target");
+            if (!sourceIssues.empty() || !PreviewHasIssueCategory(preview, "target")) {
+                result.error = L"安装源文件校验失败：" + (sourceIssues.empty() ? PreviewIssueText(preview) : sourceIssues);
+            } else {
+                result.error = L"安装目标文件冲突：" + targetIssues;
+            }
             return result;
         }
         MemberInstallContext context;
@@ -264,10 +322,20 @@ inline InstallTaskResult RunInstallTask(const std::wstring& clientRoot, const st
                                                UtcTimestamp(), lock);
         result.state = run.installation.state;
         result.applied = run.installation.applied;
+        result.preserved = run.installation.preserved;
         result.committedAfterRecovery = run.installation.committedAfterRecovery;
-        result.ok = run.attemptedInstallation && run.installation.state == InstallJobState::Completed;
+        result.recordMissing = run.installation.recordMissing;
+        result.recordForeign = run.installation.recordForeign;
+        result.noChange = run.installation.state == InstallJobState::AlreadyCurrent;
+        result.ok = run.attemptedInstallation && !result.recordMissing && !result.recordForeign &&
+                    (run.installation.state == InstallJobState::Completed ||
+                     run.installation.state == InstallJobState::AlreadyCurrent);
         if (!result.ok) {
-            if (!run.attemptedInstallation)
+            if (result.recordForeign)
+                result.error = L"安装记录属于其他客户端：现有安装记录（host64\\dlss5-install-record.json）是为另一个客户端目录发布的。已保留该记录，未做任何写入。";
+            else if (result.recordMissing)
+                result.error = L"安装记录缺失：组件文件已存在，当前没有本工具的安装记录。";
+            else if (!run.attemptedInstallation)
                 result.error = L"恢复检查未通过：" + Utf8ErrorText(run.recovery.reason);
             else
                 result.error = StateText(run.installation.state) + L"：" + Utf8ErrorText(run.installation.reason);
@@ -371,6 +439,14 @@ inline UninstallTaskResult RunUninstallTask(const std::wstring& clientRoot, cons
     if (!lock.Acquire(clientRoot)) {
         result.error = L"无法获取客户端锁：" +
                        (lock.Error() == ClientLockError::Busy ? std::wstring(L"另一个操作正在进行") : Win32ErrorText(lock.Win32Error()));
+        return result;
+    }
+    // The page preview is advisory and may be stale. Re-check record ownership
+    // under the lock before a plan, a move, or a record deletion can happen.
+    const auto activeRecord = CaptureClientRecord(clientRoot);
+    if (activeRecord.state == CapturedRecordState::Present && !ClientRecordOwnedBy(activeRecord.record, clientRoot)) {
+        result.recordForeign = true;
+        result.error = L"卸载预检失败：安装记录属于其他客户端（host64\\dlss5-install-record.json 是为另一个客户端目录发布的）。已保留该记录与文件，未做任何更改。";
         return result;
     }
     std::wstring rootError;

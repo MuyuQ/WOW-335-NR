@@ -10,6 +10,14 @@ struct InstallJobResult {
     DWORD win32Error = ERROR_SUCCESS;
     bool committedAfterRecovery = false;
     size_t applied = 0;
+    size_t preserved = 0;
+    // Files all match but no usable install record exists: distinct from both
+    // success and a genuine precondition failure (see BatchInstallResult).
+    bool recordMissing = false;
+    // Files are current but the only install record belongs to another client:
+    // preserve that record, report a distinct non-success state, and never
+    // publish or adopt anything for the current client.
+    bool recordForeign = false;
     PendingRecoveryResult previousRecovery, failureRecovery;
 };
 
@@ -34,7 +42,34 @@ inline InstallJobResult RunInstallJob(const std::wstring& operationsRoot, const 
     result.previousRecovery = start.recovery;
     if (!start.attemptedInstallation) return fail(InstallJobState::NeedsAttention, start.recovery.reason, start.recovery.win32Error);
     result.applied = start.installation.applied;
-    if (start.installation.state == BatchInstallState::AlreadyCurrent) { result.state = InstallJobState::AlreadyCurrent; return result; }
+    result.preserved = start.installation.preserved;
+    if (start.installation.recordMissing) {
+        // Files are current, but this client has no record that this tool installed
+        // them. Do not publish a record here: adoption requires an explicit user
+        // decision. Remove only this attempt's empty session directory.
+        DiscardFreshOperation(context.journalRoot);
+        result.state = InstallJobState::NeedsAttention;
+        result.recordMissing = true;
+        result.reason = start.installation.reason;
+        return result;
+    }
+    if (start.installation.recordForeign) {
+        // Files are current, but the record on disk belongs to another client
+        // directory. Preserve that record (never overwrite it) and report the
+        // ownership mismatch as its own state.
+        DiscardFreshOperation(context.journalRoot);
+        result.state = InstallJobState::NeedsAttention;
+        result.recordForeign = true;
+        result.reason = start.installation.reason;
+        return result;
+    }
+    if (start.installation.state == BatchInstallState::AlreadyCurrent) {
+        // Nothing was written: the operation directory created by this attempt only
+        // holds session.json, so discard it instead of accumulating empty history.
+        DiscardFreshOperation(context.journalRoot);
+        result.state = InstallJobState::AlreadyCurrent;
+        return result;
+    }
     if (start.installation.state == BatchInstallState::PreconditionFailed)
         return fail(InstallJobState::PreconditionFailed, start.installation.reason, start.installation.win32Error);
     if (start.installation.state == BatchInstallState::RolledBack)

@@ -1,6 +1,8 @@
 #pragma once
 
 #include "recover_operation.hpp"
+#include "registered_install_config.hpp"
+#include "capture_client_record.hpp"
 
 namespace control_center {
 enum class BatchInstallState { ReadyToFinalize, AlreadyCurrent, PreconditionFailed, RolledBack, RecoveryRequired };
@@ -9,6 +11,16 @@ struct BatchInstallResult {
     std::string reason;
     DWORD win32Error = ERROR_SUCCESS;
     size_t applied = 0;
+    size_t preserved = 0;
+    // Set when every member already matches but the client has no usable install
+    // record: the files are present, yet this tool never installed them. Such a
+    // client must not be reported as installed, and its files must not be adopted
+    // silently (adoption would grant uninstall rights over unmanaged files).
+    bool recordMissing = false;
+    // Set when every member already matches but the only install record belongs
+    // to a different client directory. Such a record is preserved untouched: it
+    // must never authorize AlreadyCurrent or uninstall rights for this client.
+    bool recordForeign = false;
     RecoveryResult recovery;
 };
 
@@ -30,7 +42,9 @@ inline BatchInstallResult InstallBatch(const MemberInstallContext& context, cons
     if (!journalGuard.Open(journalRoot, L"__journal_root__")) return fail("operation directory unavailable");
     const auto journal = LoadJournal(journalRoot);
     if (!journal || journal.cursor.Next() != 1) return fail("operation directory is not new");
-    const auto current = PreviewInstall(client.root, context.stageRoot, context.templateRoot, catalog);
+    const auto registered = LoadRegisteredInstallConfig(client.root, catalog);
+    const auto current = PreviewInstall(client.root, context.stageRoot, context.templateRoot, catalog,
+                                        registered.trusted ? &registered.policy : nullptr);
     if (!current.filesReady || current.items.size() != approved.items.size()) return fail("preview no longer valid");
     for (size_t i = 0; i < current.items.size(); ++i) {
         const auto& expected = approved.items[i];
@@ -47,7 +61,10 @@ inline BatchInstallResult InstallBatch(const MemberInstallContext& context, cons
     for (const auto& item : approved.items) {
         const auto installed = InstallMember(context, catalog, item, lock);
         if (installed.state == MemberInstallState::Applied) { ++result.applied; continue; }
-        if (installed.state == MemberInstallState::NoChange) continue;
+        if (installed.state == MemberInstallState::NoChange) {
+            if (item.state == PreviewState::PreservedConfig) ++result.preserved;
+            continue;
+        }
         result.reason = installed.reason; result.win32Error = installed.win32Error;
         const auto interrupted = LoadJournal(journalRoot);
         if (!interrupted) { result.state = BatchInstallState::RecoveryRequired; return result; }
@@ -82,6 +99,27 @@ inline BatchInstallResult InstallBatch(const MemberInstallContext& context, cons
             result.reason = "could not preserve repair source"; result.win32Error = error;
             result.recovery = RecoverOperation(context, catalog, lock);
             result.state = result.recovery.state == RecoveryState::Recovered ? BatchInstallState::RolledBack : BatchInstallState::RecoveryRequired;
+            return result;
+        }
+    }
+    if (!result.applied) {
+        // "Nothing to write" only means "already installed" when the client still
+        // carries a trustworthy install record. Without one the matching files are
+        // merely present: report a distinct, non-success state instead of adopting
+        // them (the home page must agree with the result page).
+        const auto record = CaptureClientRecord(client.root);
+        if (record.state != CapturedRecordState::Present) {
+            result.state = BatchInstallState::PreconditionFailed;
+            result.recordMissing = true;
+            result.reason = "component files are current but the client installation record is missing";
+            return result;
+        }
+        if (!ClientRecordOwnedBy(record.record, client.root)) {
+            // The record parses, but it was published for another client directory.
+            // Keep it byte-for-byte and do not treat this client as installed.
+            result.state = BatchInstallState::PreconditionFailed;
+            result.recordForeign = true;
+            result.reason = "client installation record belongs to another client";
             return result;
         }
     }

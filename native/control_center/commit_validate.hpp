@@ -2,6 +2,7 @@
 
 #include "final_records.hpp"
 #include "recover_operation.hpp"
+#include "registered_install_config.hpp"
 
 namespace control_center {
 struct CommitValidation {
@@ -61,7 +62,17 @@ inline CommitValidation ValidateCommit(const MemberInstallContext& context, cons
     std::vector<std::wstring> missingOptional;
     if (!parsed.value.contains("missing_optional") || !DecodeMissingOptional(parsed.value["missing_optional"], catalog, missingOptional))
         return fail("invalid optional member list");
-    const auto snapshot = SnapshotInstalledForRecords(client.root, catalog, missingOptional);
+    // Preserved personalised configurations are part of the record but not of
+    // the release identity; the plan's client record proves they were
+    // registered before this transaction.
+    std::vector<std::wstring> preservedTargets;
+    if (!parsed.value.contains("client_record") || !parsed.value["client_record"].is_string())
+        return fail("invalid plan record");
+    const auto planRecord = ReadClientRecord(parsed.value["client_record"].get<std::string>());
+    if (!planRecord || !planRecord.error.empty() || !ClientRecordOwnedBy(planRecord, client.root))
+        return fail("plan record is not usable");
+    preservedTargets = PreservedTargetsFromRecord(planRecord, catalog);
+    const auto snapshot = SnapshotInstalledForRecords(client.root, catalog, missingOptional, preservedTargets);
     if (!snapshot.filesReady) { result.error = snapshot.error; return result; }
     if (!VerifyPersistentSources(operation, snapshot, error)) return fail("repair sources incomplete or changed", error);
     const auto& applied = result.membersBeforeComplete.Applied();

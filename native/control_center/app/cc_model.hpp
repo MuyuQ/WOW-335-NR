@@ -1,4 +1,4 @@
-﻿// WOW-335-NR 原生控制中心：只读数据模型。
+// WOW-335-NR 原生控制中心：只读数据模型。
 // 本文件只做文件/系统读取与纯计算，不创建窗口、不触碰 UI；重活由 cc_jobs.hpp 在
 // 后台线程调用。所有结果都带 generation，切换客户端后旧结果必须被调用方丢弃。
 #pragma once
@@ -25,6 +25,7 @@
 #include "../client_record.hpp"
 #include "../config_wtf.hpp"
 #include "../guarded_path.hpp"
+#include "../registered_install_config.hpp"
 
 namespace cc {
 
@@ -390,6 +391,8 @@ struct ClientSnapshot {
     size_t requiredMembers = 0;
 
     CapturedRecordState recordState = CapturedRecordState::Unavailable;
+    // 磁盘上的记录存在，但属于另一个客户端目录：不可用于“已安装”判定、卸载或修复。
+    bool recordForeign = false;
     std::string recordError;
     DWORD recordWin32 = ERROR_SUCCESS;
     size_t recordEntries = 0;
@@ -475,7 +478,13 @@ inline ClientSnapshot SnapshotClient(const std::wstring& clientRoot, const Catal
     snapshot.recordState = captured.state;
     snapshot.recordWin32 = captured.win32Error;
     snapshot.recordError = captured.record.error;
-    if (captured.state == CapturedRecordState::Present) {
+    if (captured.state == CapturedRecordState::Present &&
+        !control_center::ClientRecordOwnedBy(captured.record, client.root)) {
+        snapshot.recordForeign = true;
+        snapshot.recordState = CapturedRecordState::Absent;
+        snapshot.recordError = "client record belongs to another client";
+    }
+    if (captured.state == CapturedRecordState::Present && !snapshot.recordForeign) {
         snapshot.recordEntries = captured.record.entries.size();
         snapshot.recordResidue = captured.record.residue.size();
         std::vector<bool> covered(catalog.catalog.members.size(), false);
@@ -489,7 +498,8 @@ inline ClientSnapshot SnapshotClient(const std::wstring& clientRoot, const Catal
         }
         snapshot.recordMatchesCatalog = std::find(covered.begin(), covered.end(), false) == covered.end();
     }
-    const ClientRecord* record = (captured.state == CapturedRecordState::Present) ? &captured.record : nullptr;
+    const ClientRecord* record =
+        (captured.state == CapturedRecordState::Present && !snapshot.recordForeign) ? &captured.record : nullptr;
 
     const auto blocking = control_center::CheckBlockingProcesses();
     snapshot.processState = blocking.state;

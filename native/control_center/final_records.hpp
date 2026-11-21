@@ -69,13 +69,16 @@ inline bool DecodeMissingOptional(const Json& json, const CatalogResult& catalog
     return true;
 }
 inline InstallPreview SnapshotInstalledForRecords(const std::wstring& clientRoot, const CatalogResult& catalog,
-                                                   const std::vector<std::wstring>& missingOptional) {
+                                                   const std::vector<std::wstring>& missingOptional,
+                                                   const std::vector<std::wstring>& preservedTargets = {}) {
     InstallPreview snapshot; snapshot.filesReady = true;
     for (const auto& member : catalog.members) {
         PreviewItem item; item.member = member;
         bool wasMissing = false;
         for (const auto& target : missingOptional) if (SameTarget(target, member.target)) { wasMissing = true; break; }
         if (wasMissing) { item.state = PreviewState::MissingOptional; snapshot.items.push_back(item); continue; }
+        bool wasPreserved = false;
+        for (const auto& target : preservedTargets) if (SameTarget(target, member.target)) { wasPreserved = true; break; }
         GuardedPath target;
         if (!target.Open(clientRoot, member.target)) {
             snapshot.filesReady = false; snapshot.error = "member path unavailable"; return snapshot;
@@ -85,7 +88,16 @@ inline InstallPreview SnapshotInstalledForRecords(const std::wstring& clientRoot
             snapshot.filesReady = false; snapshot.error = "member unavailable"; return snapshot;
         }
         if (HexSha256(file.identity.sha256) != member.sha256) {
-            snapshot.filesReady = false; snapshot.error = "installed member changed"; return snapshot;
+            if (!wasPreserved || !IsPreservedConfigTarget(member.target)) {
+                snapshot.filesReady = false; snapshot.error = "installed member changed"; return snapshot;
+            }
+            // The registered personalised configuration is intentionally left
+            // untouched; its bytes are not part of the release identity.
+            item.state = PreviewState::PreservedConfig;
+            item.existing = file.identity;
+            item.source = file.identity;
+            snapshot.items.push_back(item);
+            continue;
         }
         item.state = PreviewState::Same; item.existing = file.identity; item.source.sha256 = file.identity.sha256;
         snapshot.items.push_back(item);
@@ -97,7 +109,7 @@ inline bool VerifyPersistentSources(const std::wstring& operation, const Install
     if (!snapshot.filesReady) return false;
     for (const auto& item : snapshot.items) {
         if (item.state == PreviewState::MissingOptional) continue;
-        if (item.state != PreviewState::Same) return false;
+        if (item.state != PreviewState::Same && item.state != PreviewState::PreservedConfig) return false;
         GuardedPath source;
         if (!source.Open(operation, L"stage/" + item.member.target)) { error = source.Error(); return false; }
         const auto hash = HashFile(source.Path());
@@ -139,11 +151,22 @@ inline FinalRecordsResult BuildFinalRecords(const MemberInstallContext& context,
         if (!SameTarget(trusted.source, item.member.source) || trusted.sourceKind != item.member.sourceKind ||
             trusted.sha256 != item.member.sha256 || trusted.required != item.member.required ||
             trusted.replacesOriginal != item.member.replacesOriginal ||
-            (item.state != PreviewState::Same && !(item.state == PreviewState::MissingOptional && !trusted.required)))
+            (item.state != PreviewState::Same && item.state != PreviewState::PreservedConfig &&
+             !(item.state == PreviewState::MissingOptional && !trusted.required)))
             return fail("snapshot not ready");
         if (item.state == PreviewState::Same &&
             (HexSha256(item.source.sha256) != trusted.sha256 || item.source.sha256 != item.existing.sha256))
             return fail("snapshot hashes do not match");
+        if (item.state == PreviewState::PreservedConfig) {
+            // A personalised configuration may only survive because the prior
+            // record proves this exact target was installed from the current
+            // release template; never preserve an unregistered third-party file.
+            if (!IsPreservedConfigTarget(trusted.target) || !trusted.required) return fail("preserved member not supported");
+            bool registered = false;
+            if (previous) for (const auto& old : previous->entries)
+                if (SameTarget(old.target, trusted.target)) { registered = old.sha256 == trusted.sha256; break; }
+            if (!registered) return fail("preserved member is not registered");
+        }
         observed[match] = true;
     }
     Json merged = Json::array();

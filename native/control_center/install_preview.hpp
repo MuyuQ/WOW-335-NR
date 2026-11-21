@@ -9,12 +9,34 @@
 #include "guarded_path.hpp"
 
 namespace control_center {
-enum class PreviewState { Absent, Present, Same, MissingOptional, Invalid };
+enum class PreviewState { Absent, Present, Same, MissingOptional, Invalid, PreservedConfig };
 struct PreviewItem {
     CatalogMember member;
     PreviewState state = PreviewState::Invalid;
     std::string issue;
     FileIdentity source{}, existing{};
+};
+
+// The two ReShade configuration files are written by the tool once but can be
+// personalised afterwards by ReShade, the addon or the user. A repeat install
+// keeps such a file when the active client record shows that this exact member
+// was installed with the hash of the current release template.
+inline bool IsPreservedConfigTarget(const std::wstring& target) {
+    return SameTarget(target, L"ReShade.ini") || SameTarget(target, L"host64/ReShade.ini");
+}
+struct RegisteredConfigEntry {
+    std::wstring target;
+    std::string sha256;
+};
+struct RegisteredConfigPolicy {
+    bool trusted = false;
+    std::vector<RegisteredConfigEntry> entries;
+    bool Matches(const std::wstring& target, const std::string& sha256) const {
+        if (!trusted) return false;
+        for (const auto& entry : entries)
+            if (SameTarget(entry.target, target) && entry.sha256 == sha256) return true;
+        return false;
+    }
 };
 struct InstallPreview {
     std::vector<PreviewItem> items;
@@ -37,7 +59,8 @@ inline bool MissingPathError(DWORD error) {
 // by the future transaction immediately before mutation; no preview identity
 // grants permission to overwrite a file later.
 inline InstallPreview PreviewInstall(const std::wstring& clientRoot, const std::wstring& stageRoot,
-                                     const std::wstring& templateRoot, const CatalogResult& catalog) {
+                                     const std::wstring& templateRoot, const CatalogResult& catalog,
+                                     const RegisteredConfigPolicy* registered = nullptr) {
     InstallPreview result;
     if (!catalog || catalog.members.empty()) return result;
     GuardedPath clientRootGuard, stageRootGuard;
@@ -83,6 +106,9 @@ inline InstallPreview PreviewInstall(const std::wstring& clientRoot, const std::
         item.existing = current.identity;
         if (current.identity.sha256 == item.source.sha256) item.state = PreviewState::Same;
         else if (member.replacesOriginal) item.state = PreviewState::Present;
+        else if (registered != nullptr && IsPreservedConfigTarget(member.target) &&
+                 registered->Matches(member.target, member.sha256))
+            item.state = PreviewState::PreservedConfig;
         else fail("target conflicts with existing file");
         result.items.push_back(std::move(item));
     }

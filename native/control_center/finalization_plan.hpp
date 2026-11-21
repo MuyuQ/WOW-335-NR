@@ -43,8 +43,26 @@ inline FinalizationPlanResult PrepareFinalization(const MemberInstallContext& co
     if (!session.Open(operation, L"session.json")) return fail("session unavailable", true, session.Error());
     const auto sessionHash = HashFile(session.Path());
     if (!sessionHash) return fail("session unavailable", true, sessionHash.win32Error);
-    const auto snapshot = PreviewInstall(client.root, context.stageRoot, context.templateRoot, catalog);
+    RegisteredConfigPolicy registered;
+    if (prior.state == CapturedRecordState::Present && ClientRecordOwnedBy(prior.record, client.root)) {
+        registered.trusted = true;
+        for (const auto& member : catalog.members) {
+            if (!IsPreservedConfigTarget(member.target)) continue;
+            for (const auto& entry : prior.record.entries)
+                if (SameTarget(entry.target, member.target) && entry.sha256 == member.sha256) {
+                    registered.entries.push_back({member.target, member.sha256});
+                    break;
+                }
+        }
+    }
+    const auto snapshot = PreviewInstall(client.root, context.stageRoot, context.templateRoot, catalog,
+                                         registered.trusted ? &registered : nullptr);
     if (!snapshot.filesReady) return fail("final file snapshot unavailable", true);
+    for (const auto& item : snapshot.items) {
+        if (item.state != PreviewState::PreservedConfig) continue;
+        if (!registered.trusted || !registered.Matches(item.member.target, item.member.sha256))
+            return fail("preserved configuration is no longer registered", true);
+    }
     DWORD sourceError = ERROR_SUCCESS;
     if (!VerifyPersistentSources(operation, snapshot, sourceError)) return fail("repair sources incomplete or changed", true, sourceError);
     Json missingOptional = Json::array();
