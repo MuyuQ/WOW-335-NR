@@ -512,7 +512,9 @@ void AppRequestInstallPreview(App& app) {
 
     const bool posted = app.jobs.Post(
         [result, client, stage, templ, catalog]() {
-            result->preview = PreviewInstall(client, stage, templ, catalog->catalog);
+            const auto registered = LoadRegisteredInstallConfig(client, catalog->catalog);
+            result->preview = PreviewInstall(client, stage, templ, catalog->catalog,
+                                             registered.trusted ? &registered.policy : nullptr);
         },
         [&app, result, token, generation, client, stage, templ](const std::wstring& error) {
             if (token != app.installToken || generation != app.generation) return;
@@ -527,10 +529,15 @@ void AppRequestInstallPreview(App& app) {
                 return;
             }
             app.install.preview = std::move(result->preview);
-            app.install.ok = app.install.preview.error.empty();
+            app.install.ok = app.install.preview.error.empty() && app.install.preview.filesReady;
             app.install.error = Utf8ToWide(app.install.preview.error);
             if (app.install.error.empty() && !app.install.preview.filesReady) {
-                app.install.error = PreviewIssueText(app.install.preview);
+                const auto sourceIssues = PreviewIssueText(app.install.preview, "source");
+                const auto targetIssues = PreviewIssueText(app.install.preview, "target");
+                if (!sourceIssues.empty() || !PreviewHasIssueCategory(app.install.preview, "target"))
+                    app.install.error = L"安装源文件校验失败：" + (sourceIssues.empty() ? PreviewIssueText(app.install.preview) : sourceIssues);
+                else
+                    app.install.error = L"安装目标文件冲突：" + targetIssues;
             }
             app.log.Add(Fmt(L"安装预检：%zu 项，%s。", app.install.preview.items.size(),
                             app.install.preview.filesReady ? L"文件齐全"
@@ -588,6 +595,11 @@ void AppRequestUninstallPreview(App& app) {
             if (captured.state != control_center::CapturedRecordState::Present) {
                 result->recordState = 1;
                 result->error = "client installation record unavailable";
+                return;
+            }
+            if (!control_center::ClientRecordOwnedBy(captured.record, client)) {
+                result->recordState = 1;
+                result->error = "client installation record belongs to another client";
                 return;
             }
             const auto record = control_center::ReadClientRecord(captured.bytes);
@@ -1048,19 +1060,24 @@ void AppStartInstall(App& app) {
             state.finished = true;
             state.ok = result->ok;
             state.error = result->error;
-            if (result->ok)
-                state.detail = Fmt(L"已应用 %zu 个成员", result->applied);
-            else if (state.error.empty())
-                state.error = error.empty() ? L"安装未完成。" : error;
+            state.noChange = result->noChange;
+            state.preserved = result->preserved;
+            state.recordMissing = result->recordMissing;
+            state.recordForeign = result->recordForeign;
+            if (result->ok) state.detail = InstallOutcomeDetail(*result);
+            else if (state.error.empty()) state.error = error.empty() ? L"安装未完成。" : error;
             if (!state.ok) {
-                app.log.Add(L"安装失败：" + state.error);
-                AppSetStatus(app, L"安装失败：" + state.error);
+                // 记录缺失/不属于本客户端不是安装失败：文件已就绪但未纳入本工具管理，不能当成功。
+                const std::wstring prefix = (state.recordMissing || state.recordForeign) ? L"安装未完成：" : L"安装失败：";
+                app.log.Add(prefix + state.error);
+                AppSetStatus(app, prefix + state.error);
                 app.dirty = true;
                 return;
             }
             app.log.Add(Fmt(L"安装完成：%s，%s。", state.detail.c_str(),
-                            result->committedAfterRecovery ? L"恢复后已提交" : L"已提交"));
-            AppSetStatus(app, L"安装完成。");
+                            result->noChange ? L"无需写入，安装记录保持原样"
+                                             : (result->committedAfterRecovery ? L"恢复后已提交" : L"已提交")));
+            AppSetStatus(app, result->noChange ? L"无需写入，配置与安装记录保持原样。" : L"安装完成。");
             AppGotoWizard(app, WizardStep::Done);
             AppRequestSnapshot(app, true);
             app.dirty = true;
@@ -1359,11 +1376,64 @@ void AppTick(App& app) {
         lastGpu = now;
         AppRequestGpuStats(app);
     }
-    // 面板自动拉起：游戏已运行且没有面板进程时，每 10 秒尝试一次。
+    // 面板归属：只有带完整归属标记（PID+创建时间+映像）且属于所选客户端的
+    // 实例才算“已连接”。每秒在后台任务中计算一次（进程枚举 + 窗口检查 +
+    // 标记目录读取），UI 线程只读结果，避免切页/拖动时卡顿。
+    if (now - app.lastPanelConnectedCheck >= 1000 && !app.panelSnapshotInFlight) {
+        app.lastPanelConnectedCheck = now;
+        if (!app.clientRoot.empty()) {
+            const std::wstring dataDir = app.paths.dataDir;
+            const std::wstring clientRoot = app.clientRoot;
+            const std::wstring expectedImage = app.paths.exeDir + L"\\bin\\dlss5-panel.exe";
+            const std::uint64_t generation = app.generation;
+            auto snapshot = std::make_shared<control_center::PanelOwnershipSnapshot>();
+            const bool posted = app.jobs.Post(
+                [dataDir, clientRoot, expectedImage, snapshot]() {
+                    *snapshot = control_center::CollectPanelOwnership(dataDir, clientRoot, expectedImage);
+                },
+                [&app, snapshot, generation](const std::wstring& error) {
+                    app.panelSnapshotInFlight = false;
+                    if (!error.empty() || generation != app.generation) return;  // 过期结果丢弃
+                    const bool connected = snapshot->connected;
+                    const bool anyRunning = snapshot->anyRunning;
+                    const bool hiddenOwn = snapshot->hiddenOwn;
+                    const bool hiddenOwnExited = snapshot->hiddenOwnExited;
+                    const bool hiddenOwnUncertain = snapshot->hiddenOwnUncertain;
+                    const bool blockedOther = snapshot->blockedByOther;
+                    const bool unverified = snapshot->blockedByUnverified;
+                    if (connected != app.panelConnected || anyRunning != app.panelAnyRunning ||
+                        hiddenOwn != app.panelHiddenOwn || hiddenOwnExited != app.panelHiddenOwnExited ||
+                        hiddenOwnUncertain != app.panelHiddenOwnUncertain ||
+                        blockedOther != app.panelBlockedOther || unverified != app.panelUnverified) {
+                        app.panelConnected = connected;
+                        app.panelAnyRunning = anyRunning;
+                        app.panelHiddenOwn = hiddenOwn;
+                        app.panelHiddenOwnExited = hiddenOwnExited;
+                        app.panelHiddenOwnUncertain = hiddenOwnUncertain;
+                        app.panelBlockedOther = blockedOther;
+                        app.panelUnverified = unverified;
+                        app.dirty = true;
+                    }
+                });
+            if (posted) app.panelSnapshotInFlight = true;
+        } else if (app.panelConnected || app.panelAnyRunning || app.panelHiddenOwn ||
+                   app.panelHiddenOwnExited || app.panelHiddenOwnUncertain || app.panelBlockedOther ||
+                   app.panelUnverified) {
+            app.panelConnected = false;
+            app.panelAnyRunning = false;
+            app.panelHiddenOwn = false;
+            app.panelHiddenOwnExited = false;
+            app.panelHiddenOwnUncertain = false;
+            app.panelBlockedOther = false;
+            app.panelUnverified = false;
+            app.dirty = true;
+        }
+    }
+    // 面板自动拉起：游戏已运行且没有“属于本客户端”的面板时，每 10 秒尝试一次。
     if (!app.toolRun.running && now - app.lastPanelCheck >= 10000) {
         app.lastPanelCheck = now;
         if (app.gameRunning) {
-            if (!app.panelAutoLaunchTried && !control_center::PanelProcessRunning()) {
+            if (!app.panelAutoLaunchTried && !app.panelConnected) {
                 app.panelAutoLaunchTried = true;
                 app.panelAutoRequest = true;
                 AppStartPanel(app);
@@ -1820,6 +1890,10 @@ void AppHandleClick(App& app) {
             AppStartPanel(app);
             return;
         }
+        if (tool == "panelrestart") {
+            AppRestartPanel(app);
+            return;
+        }
         if (tool == "watch") {
             AppStartWindowWatch(app);
             return;
@@ -2193,9 +2267,13 @@ void AppLaunchOrPanel(App& app) {
     }
 }
 
-void AppStartPanel(App& app) {
-    const bool autoRequest = app.panelAutoRequest;
-    app.panelAutoRequest = false;
+namespace {
+
+// 面板启动/重开的共同实现：
+// - forceRestart=true：即使已有属于所选客户端的面板，也先结束再启动（“重新打开面板”）；
+// - 其余情况由 StartPanel 依据归属标记决定复用/接管，避免把其它客户端遗留的
+//   等待态实例误认为“已连接所选客户端”。
+void AppStartPanelImpl(App& app, bool forceRestart, bool autoRequest) {
     if (app.toolRun.running) {
         AppSetStatus(app, L"另一个工具操作正在执行，请等待完成。");
         return;
@@ -2216,13 +2294,16 @@ void AppStartPanel(App& app) {
     const std::wstring dataDir = app.paths.dataDir;
     const std::wstring client = app.clientRoot;
     const bool posted = app.jobs.Post(
-        [exeDir, dataDir, client, result]() {
+        [exeDir, dataDir, client, result, forceRestart]() {
             // R6：只有所选客户端的 wow.exe 在运行时才允许启动/复用面板，避免把面板
             // 常驻在错误的客户端上并占用 DLSS5PanelMutex；同时可选校验面板哈希。
-            *result = control_center::panel_detail::StartPanel(
-                exeDir, dataDir, client, control_center::PanelStartOptions{true, true});
+            control_center::PanelStartOptions options;
+            options.requireSelectedClientRunning = true;
+            options.verifyPanelHash = true;
+            options.forceRestart = forceRestart;
+            *result = control_center::panel_detail::StartPanel(exeDir, dataDir, client, options);
         },
-        [&app, token, result, autoRequest](const std::wstring& error) {
+        [&app, token, result, autoRequest, forceRestart](const std::wstring& error) {
             if (token != app.toolRun.token) return;
             app.toolRun.running = false;
             app.toolRun.finished = true;
@@ -2236,15 +2317,18 @@ void AppStartPanel(App& app) {
             }
             if (!result->hashWarning.empty()) app.log.Add(result->hashWarning);
             if (result->status == control_center::PanelStartStatus::AlreadyRunning) {
-                // 面板已经在运行且已连接所选客户端：视为“已连接”，不算失败。
+                // 面板已经在运行且窗口可见：复用成功，但“已连接”仍以归属快照
+                // （v2 标记身份核验）为准；旧版标记/无法证明身份的实例不在此断定。
                 app.toolRun.ok = true;
                 if (!result->logDir.empty()) app.lastPanelLog = result->logDir;
-                app.log.Add(L"游戏内面板已在运行，已连接所选客户端。");
-                AppSetStatus(app, L"已连接游戏内面板。");
+                app.panelAnyRunning = true;
+                app.log.Add(L"游戏内面板已在运行，正在确认归属。");
+                AppSetStatus(app, L"游戏内面板已在运行。");
                 return;
             }
             const std::wstring failure = result->ok ? std::wstring() : result->error;
             if (!failure.empty()) {
+                app.panelConnected = false;
                 const std::wstring message = (autoRequest ? L"面板自动拉起未执行：" : L"操作未完成：") + failure;
                 app.toolRun.error = failure;
                 app.log.Add(message);
@@ -2253,9 +2337,25 @@ void AppStartPanel(App& app) {
             }
             app.toolRun.ok = true;
             app.lastPanelLog = result->logDir;
+            // 只有成功写入完整归属标记（v2）才算“已连接”；标记降级为 v1 时
+            // 身份无法证明，等后台归属快照按“无法确认”处理。
+            app.panelConnected = result->warning.empty();
+            app.panelAnyRunning = true;
+            if (!result->terminatedPids.empty()) {
+                std::wstring pids;
+                for (size_t i = 0; i < result->terminatedPids.size(); ++i) {
+                    if (i != 0) pids += L"、";
+                    pids += std::to_wstring(result->terminatedPids[i]);
+                }
+                app.log.Add(L"已结束旧的面板实例（PID " + pids + L"）并重新启动。");
+            }
+            if (!result->warning.empty()) app.log.Add(result->warning);
             if (autoRequest) {
                 app.log.Add(L"检测到游戏运行但面板未启动，已自动拉起。日志：" + result->logDir);
                 AppSetStatus(app, L"已自动拉起游戏内面板。");
+            } else if (forceRestart) {
+                app.log.Add(L"已重新启动游戏内面板。日志：" + result->logDir);
+                AppSetStatus(app, L"已重新启动游戏内面板。");
             } else {
                 app.log.Add(L"已启动游戏内面板。日志：" + result->logDir);
                 AppSetStatus(app, L"已启动游戏内面板。");
@@ -2266,6 +2366,20 @@ void AppStartPanel(App& app) {
         AppSetStatus(app, L"后台任务队列已满，请稍后重试。");
     }
 }
+
+}  // namespace
+
+void AppStartPanel(App& app) {
+    const bool autoRequest = app.panelAutoRequest;
+    app.panelAutoRequest = false;
+    AppStartPanelImpl(app, false, autoRequest);
+}
+
+void AppRestartPanel(App& app) {
+    app.panelAutoRequest = false;
+    AppStartPanelImpl(app, true, false);
+}
+
 void AppOpenPanelLog(App& app) {
     if (app.lastPanelLog.empty()) {
         AppSetStatus(app, L"本次窗口尚未启动面板。");

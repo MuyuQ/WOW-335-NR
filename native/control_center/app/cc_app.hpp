@@ -146,6 +146,18 @@ struct App {
     bool panelAutoLaunchTried = false;
     bool panelAutoRequest = false;  // 自动拉起的请求标记：用于区分日志文案
     ULONGLONG lastPanelCheck = 0;
+    // 当前运行的面板是否属于所选客户端（v2 归属标记 + 可见窗口）。
+    // 与 PanelProcessRunning() 的区别：后者只看映像名，会把其它客户端的
+    // 等待态实例误报为“已连接”。归属检查每秒在后台任务中完成，UI 只读结果。
+    bool panelConnected = false;
+    bool panelAnyRunning = false;
+    bool panelHiddenOwn = false;          // 属于所选客户端但窗口不可见（目标游戏仍在运行）
+    bool panelHiddenOwnExited = false;    // 属于所选客户端、窗口隐藏且目标游戏已确认退出（可安全交接）
+    bool panelHiddenOwnUncertain = false; // 属于所选客户端、窗口隐藏但游戏状态无法判断（保留进程）
+    bool panelBlockedOther = false;       // 其它客户端的游戏仍在运行，面板正在为其服务
+    bool panelUnverified = false;         // 存在无法证明归属的面板进程（旧标记/无标记/PID 复用）
+    bool panelSnapshotInFlight = false;
+    ULONGLONG lastPanelConnectedCheck = 0;
 
     // GPU 统计（系统合计；核心内部 5 秒缓存，主页运行时刷新）。
     control_center::GpuStats gpuStats;
@@ -181,6 +193,12 @@ struct App {
         bool ok = false;
         std::wstring error;
         std::wstring detail;
+        bool noChange = false;
+        size_t preserved = 0;
+        // 安装专用：组件文件就绪但客户端没有安装记录，未接管也未写入。
+        bool recordMissing = false;
+        // 安装专用：磁盘上的记录属于另一个客户端目录，已保留原记录。
+        bool recordForeign = false;
         std::shared_ptr<TaskProgress> progress;
         std::uint64_t token = 0;
         std::uint64_t actionToken = 0;
@@ -271,6 +289,7 @@ void AppRestoreCandidateDefaults(App& app);
 void AppOpenFolder(const std::wstring& path);
 void AppLaunchOrPanel(App& app);
 void AppStartPanel(App& app);
+void AppRestartPanel(App& app);
 void AppOpenPanelLog(App& app);
 void AppOpenCarrierLog(App& app);
 void AppShowLog(App& app, const std::wstring& title, const std::vector<std::wstring>& lines);

@@ -34,18 +34,6 @@ bool SamePath(const std::wstring& a, const std::wstring& b) {
     return CompareStringOrdinal(a.c_str(), -1, b.c_str(), -1, TRUE) == CSTR_EQUAL;
 }
 
-// 面板进程是否在运行：页面绘制在帧循环里，进程表最多每秒查询一次。
-bool PanelRunningCached() {
-    static ULONGLONG lastQuery = 0;
-    static bool running = false;
-    const ULONGLONG now = GetTickCount64();
-    if (lastQuery == 0 || now - lastQuery >= 1000) {
-        lastQuery = now == 0 ? 1 : now;
-        running = control_center::PanelProcessRunning();
-    }
-    return running;
-}
-
 std::wstring ClientErrorText(ClientError error) {
     switch (error) {
         case ClientError::None: return L"客户端已识别";
@@ -616,8 +604,12 @@ void DrawFooter(App& app) {
         const bool installed = app.snapshot.recordState == control_center::CapturedRecordState::Present;
         // R6：页脚状态只反映“所选客户端”的游戏进程，系统级进程快照不再并入。
         const bool game = app.gameRunning;
+        // 只有身份已核验（v2 标记）且窗口可见的本客户端实例才算“已连接”；其余提示待确认。
+        const std::wstring panelWord =
+            app.panelBlockedOther || app.panelUnverified ? L"面板待确认" : L"面板待重开";
         const std::wstring gameState =
-            game ? (PanelRunningCached() ? L"面板已连接" : L"游戏已启动") : L"客户端未运行";
+            game ? (app.panelConnected ? L"面板已连接" : (app.panelAnyRunning ? panelWord : L"游戏已启动"))
+                 : L"客户端未运行";
         const std::wstring stateLine =
             std::wstring(installed ? L"已安装" : L"未安装") + L"  ·  " + gameState;
         g.Text(Rect(16.0f * u, footer.top + 27.0f * u, textRight, footer.top + 45.0f * u), stateLine, smallFmt,
@@ -640,7 +632,7 @@ void DrawHome(App& app) {
     // R6：主按钮/胶囊只跟随“所选客户端”的游戏是否运行（按客户端路径的进程关联），
     // 系统级 CheckBlockingProcesses 结果只用于维护页/安装等破坏性操作的门禁。
     const bool running = app.gameRunning;
-    const bool panelRunning = PanelRunningCached();
+    const bool panelRunning = app.panelAnyRunning;
     const bool telemetry = app.telemetry.available;
     const bool installed = app.snapshot.recordState == control_center::CapturedRecordState::Present;
     const bool busy = app.installRun.running || app.repairRun.running || app.uninstallRun.running;
@@ -662,7 +654,12 @@ void DrawHome(App& app) {
                L"FPS", g.Format(FontUi(), kFontSmall * u, 400, HAlign::Left, VAlign::Middle), Color(kAccent));
 
         const std::wstring pillText =
-            !running ? L"客户端未运行" : (panelRunning ? L"面板已连接" : L"游戏已启动");
+            !running ? L"客户端未运行"
+                     : (app.panelConnected
+                            ? L"面板已连接"
+                            : (panelRunning ? (app.panelBlockedOther || app.panelUnverified ? L"面板待确认"
+                                                                                           : L"面板待重开")
+                                            : L"游戏已启动"));
         const float pillW = PillWidth(c, L"", pillText);
         const Rect pill(c.X(cw - 16) - pillW, c.Y(12), c.X(cw - 16), c.Y(34));
         Pill(c, pill, L"", pillText, running ? kJade : kMuted, running ? kJadeText : kText3, kSurface, kLine);
@@ -686,8 +683,18 @@ void DrawHome(App& app) {
         } else if (running) {
             if (!app.telemetryNote.empty()) {
                 caption = app.telemetryNote;
-            } else if (panelRunning) {
+            } else if (app.panelConnected) {
                 caption = L"游戏内面板已连接 · 实时采样每秒刷新";
+            } else if (app.panelHiddenOwn) {
+                caption = L"所选客户端的面板进程已存在但窗口不可见（游戏仍在运行）；点击「重新打开面板」接管。";
+            } else if (app.panelHiddenOwnExited) {
+                caption = L"旧面板的目标游戏已确认退出，窗口不可见；点击「打开面板」可安全交接。";
+            } else if (app.panelHiddenOwnUncertain) {
+                caption = L"面板进程存在，但有游戏进程的映像路径不可读，无法确认是否已退出；已保留该进程。";
+            } else if (app.panelBlockedOther) {
+                caption = L"面板正在为另一个运行中的客户端服务；关闭那个客户端的游戏后才能切换。";
+            } else if (app.panelUnverified) {
+                caption = L"面板进程在运行，但归属无法证明（旧标记/无标记/PID 复用）；已保留进程，请手动确认。";
             } else {
                 caption = L"实时采样 · 每秒刷新";
             }
@@ -1012,8 +1019,8 @@ void DrawWizard(App& app) {
     switch (app.wizardStep) {
         case WizardStep::Client:
             title = L"安装到客户端";
-            subtitle = L"只向客户端写入发行包内的文件。已有的一致文件会跳过；需要改动的文件先备份，"
-                       L"再合并写入本工具需要的配置项，不覆盖玩家原有设置。";
+            subtitle = L"只向客户端写入发行包内的文件。已有的一致文件会跳过；已登记安装的个性化 "
+                       L"ReShade.ini 会保留原样；其余需要改动的文件先备份再写入，不覆盖玩家原有设置。";
             break;
         case WizardStep::Checks:
             title = L"环境检查";
@@ -1275,18 +1282,20 @@ void DrawWizard(App& app) {
             const bool canInstall = AppCanInstall(app);
             std::wstring summary;
             if (app.install.ready && app.install.ok) {
-                size_t add = 0, modify = 0, skip = 0;
+                size_t add = 0, modify = 0, skip = 0, preserved = 0;
                 for (const auto& item : app.install.preview.items) {
                     switch (item.state) {
                         case PreviewState::Absent: ++add; break;
                         case PreviewState::Present: ++modify; break;
+                        case PreviewState::PreservedConfig: ++preserved; ++skip; break;
                         case PreviewState::Same:
                         case PreviewState::MissingOptional: ++skip; break;
                         default: break;
                     }
                 }
-                summary = Fmt(L"可安装：%s　新增 %zu · 修改 %zu · 跳过 %zu",
-                              canInstall ? L"是" : L"否，请先处理冲突", add, modify, skip);
+                summary = Fmt(L"可安装：%s　新增 %zu · 修改 %zu · 跳过 %zu", canInstall ? L"是" : L"否，请先处理冲突",
+                              add, modify, skip);
+                if (preserved) summary += Fmt(L" · 保留配置 %zu", preserved);
             } else {
                 summary = L"可安装：否　（组件来源未配置，本阶段只核对目标文件状态）";
             }
@@ -1314,7 +1323,7 @@ void DrawWizard(App& app) {
                     std::wstring note;
                     std::vector<const PreviewItem*> rows;
                 };
-                Group groups[3];
+                Group groups[4];
                 groups[0].title = L"新增";
                 groups[0].tag = L"新增";
                 groups[0].color = kJade;
@@ -1324,11 +1333,15 @@ void DrawWizard(App& app) {
                 groups[2].title = L"跳过";
                 groups[2].tag = L"跳过";
                 groups[2].color = kText3;
+                groups[3].title = L"保留配置";
+                groups[3].tag = L"保留";
+                groups[3].color = kJadeText;
                 std::vector<const PreviewItem*> conflicts;
                 for (const auto& item : app.install.preview.items) {
                     switch (item.state) {
                         case PreviewState::Absent: groups[0].rows.push_back(&item); break;
                         case PreviewState::Present: groups[1].rows.push_back(&item); break;
+                        case PreviewState::PreservedConfig: groups[3].rows.push_back(&item); break;
                         case PreviewState::Invalid: conflicts.push_back(&item); break;
                         default: groups[2].rows.push_back(&item); break;
                     }
@@ -1336,6 +1349,7 @@ void DrawWizard(App& app) {
                 groups[0].note = Fmt(L"%zu 项 · 客户端原本没有，卸载时删除", groups[0].rows.size());
                 groups[1].note = Fmt(L"%zu 项 · 备份后写入，卸载时还原", groups[1].rows.size());
                 groups[2].note = Fmt(L"%zu 项 · 内容一致或可选缺失，不动", groups[2].rows.size());
+                groups[3].note = Fmt(L"%zu 项 · 已登记安装的个性化配置，保持原样", groups[3].rows.size());
                 for (const auto& group : groups) {
                     if (group.rows.empty()) continue;
                     Section(c, group.title, group.note);
@@ -1344,7 +1358,8 @@ void DrawWizard(App& app) {
                     float rowY = c.y + 4;
                     for (const auto* item : group.rows) {
                         const std::wstring note =
-                            item->state == PreviewState::MissingOptional ? L"可选组件缺失" : L"";
+                            item->state == PreviewState::MissingOptional ? L"可选组件缺失"
+                            : (item->state == PreviewState::PreservedConfig ? L"保留现有内容" : L"");
                         FileRow(c, c.R(0, rowY, cw, 40), item->member.target, group.tag, group.color, note);
                         rowY += 40;
                     }
@@ -1357,13 +1372,8 @@ void DrawWizard(App& app) {
                     CardRect(c, c.R(0, c.y, cw, static_cast<float>(conflicts.size()) * 40.0f + 8.0f), kWarn);
                     float rowY = c.y + 4;
                     for (const auto* item : conflicts) {
-                        std::wstring issue;
-                        const int needed = MultiByteToWideChar(CP_UTF8, 0, item->issue.c_str(), -1, nullptr, 0);
-                        if (needed > 1) {
-                            issue.resize(static_cast<size_t>(needed - 1));
-                            MultiByteToWideChar(CP_UTF8, 0, item->issue.c_str(), -1, issue.data(), needed);
-                        }
-                        FileRow(c, c.R(0, rowY, cw, 40), item->member.target, L"冲突", kWarn, issue);
+                        FileRow(c, c.R(0, rowY, cw, 40), item->member.target, L"冲突", kWarn,
+                                PreviewIssueReason(item->issue));
                         rowY += 40;
                     }
                     c.Gap(static_cast<float>(conflicts.size()) * 40.0f + 8.0f);
@@ -1412,9 +1422,16 @@ void DrawWizard(App& app) {
                 if (app.installRun.running) {
                     hint = L"安装正在后台执行，界面保持可操作；完成前请勿强制结束程序。";
                 } else if (app.installRun.finished && !app.installRun.ok) {
-                    hint = L"上次安装未完成：" + app.installRun.error + L" 可修正后重试。";
+                    hint = app.installRun.recordForeign
+                               ? (L"记录属于其他客户端：" + app.installRun.error +
+                                  L" 如需由本工具管理，请先备份或移除现有记录与文件，再重新安装。")
+                               : (app.installRun.recordMissing
+                                      ? (L"未接管现有文件：" + app.installRun.error +
+                                         L" 如需由本工具管理，请先备份或移除这些文件，再重新安装。")
+                                      : (L"上次安装未完成：" + app.installRun.error + L" 可修正后重试。"));
                 } else if (app.installRun.finished && app.installRun.ok) {
-                    hint = L"本次安装已提交：" + app.installRun.detail;
+                    hint = app.installRun.noChange ? (L"本次无需写入：" + app.installRun.detail)
+                                                   : (L"本次安装已提交：" + app.installRun.detail);
                 } else if (canInstallNow) {
                     hint = L"预检通过；点「开始安装」会真实写入客户端，修改项先备份。";
                 } else if (app.install.ready && !app.install.ok) {
@@ -1441,7 +1458,10 @@ void DrawWizard(App& app) {
             const bool failedRun = app.installRun.finished && !app.installRun.ok;
             const bool succeeded = app.installRun.finished && app.installRun.ok;
             if (running || failedRun) {
-                DrawOperationProgress(c, app.installRun, false, L"正在安装…", L"安装完成", L"安装失败");
+                DrawOperationProgress(c, app.installRun, false, L"正在安装…", L"安装完成",
+                                      app.installRun.recordForeign
+                                          ? L"记录属于其他客户端"
+                                          : (app.installRun.recordMissing ? L"未接管现有文件" : L"安装失败"));
             }
             if (succeeded && app.wizardStep == WizardStep::Done) {
                 CardRect(c, c.R(0, c.y, cw, 76), kLineSoft);
@@ -1450,21 +1470,30 @@ void DrawWizard(App& app) {
                 g.StrokeRound(badge, 26.0f * uu, Color(kLineJade));
                 g.Text(badge, L"✓", g.Format(FontUi(), kFontStat * uu, 600, HAlign::Center, VAlign::Middle),
                        Color(kJade));
-                g.Text(c.R(84, c.y + 14, cw - 100, 24), L"安装完成",
+                g.Text(c.R(84, c.y + 14, cw - 100, 24),
+                       app.installRun.noChange ? L"无需写入" : L"安装完成",
                        g.Format(FontUi(), kFontBody * uu, 700, HAlign::Left, VAlign::Middle), Color(kText));
                 g.Text(c.R(84, c.y + 42, cw - 100, 20),
-                       app.installRun.detail.empty() ? std::wstring(L"事务已提交。") : app.installRun.detail,
+                       app.installRun.detail.empty()
+                           ? (app.installRun.noChange ? std::wstring(L"所有组件已就绪，安装记录保持原样。")
+                                                      : std::wstring(L"事务已提交。"))
+                           : app.installRun.detail,
                        g.Format(FontUi(), kFontSmall * uu, 400, HAlign::Left, VAlign::Middle), Color(kText2));
                 c.Gap(86);
                 CardRect(c, c.R(0, c.y, cw, 3 * 40.0f + 8.0f));
                 KvRow(c, c.R(0, c.y + 6, cw, 36), L"客户端",
                       app.clientRoot.empty() ? std::wstring(L"—") : app.clientRoot);
-                KvRow(c, c.R(0, c.y + 46, cw, 36), L"事务状态", L"已提交（安装记录已发布）", kJadeText);
+                KvRow(c, c.R(0, c.y + 46, cw, 36), L"事务状态",
+                      app.installRun.noChange ? std::wstring(L"无需变更（安装记录与备份保持原样）")
+                                              : std::wstring(L"已提交（安装记录已发布）"),
+                      kJadeText);
                 KvRow(c, c.R(0, c.y + 86, cw, 36), L"结果",
                       app.installRun.detail.empty() ? std::wstring(L"—") : app.installRun.detail);
                 c.Gap(138);
                 MutedText(c, c.R(0, c.y, cw, 40),
-                          L"下一步可在维护页查看已安装组件、备份位置，或执行修复与卸载。");
+                          app.installRun.noChange
+                              ? std::wstring(L"未写入任何文件；可继续游戏，或在维护页查看现有安装记录。")
+                              : std::wstring(L"下一步可在维护页查看已安装组件、备份位置，或执行修复与卸载。"));
                 c.Gap(46);
             } else if (!running && !failedRun && app.wizardStep == WizardStep::Install) {
                 CardRect(c, c.R(0, c.y, cw, 112), kLineSoft);
@@ -1472,7 +1501,8 @@ void DrawWizard(App& app) {
                        g.Format(FontUi(), kFontBody * uu, 600, HAlign::Left, VAlign::Middle), Color(kAccent));
                 MutedText(c, c.R(16, c.y + 44, cw - 32, 54),
                           L"点页脚「开始安装」后会创建事务目录、逐项备份并写入文件，最后提交安装记录；"
-                          L"失败会按事务日志回滚。进度只显示真实阶段，不伪造百分比。");
+                          L"失败会按事务日志回滚。已登记安装的个性化 ReShade.ini 会保留现有内容，不写入也不备份。"
+                          L"进度只显示真实阶段，不伪造百分比。");
                 c.Gap(122);
             } else if (failedRun && app.wizardStep == WizardStep::Done) {
                 MutedText(c, c.R(0, c.y, cw, 40),
@@ -1721,7 +1751,7 @@ void DrawMaintenance(App& app) {
     {
         Section(c, L"工具", app.toolRun.running ? L"正在执行" : L"诊断与修复助手");
         c.Gap(24);
-        const float toolH = 168;
+        const float toolH = 200;
         CardRect(c, c.R(0, c.y, cw, toolH));
         auto* toolFmt = g.Format(FontUi(), kFontSmall * u, 400, HAlign::Left, VAlign::Middle);
         g.Text(c.R(16, c.y + 12, cw - 32, 16), L"以下操作都在后台线程执行；失败会写入日志，不会吞掉错误。", toolFmt,
@@ -1738,10 +1768,16 @@ void DrawMaintenance(App& app) {
                   app.restoreArmed ? ButtonKind::Danger : ButtonKind::Secondary, canAct && hasClient, kFontSmall);
         app.ui.Button("maint.tools.pipeline", c.R(16 + btnW + 8, c.y + 68, btnW, 28), L"切换 AIO 管线开关",
                   ButtonKind::Secondary, canAct && hasClient, kFontSmall);
-        app.ui.Button("maint.tools.panel", c.R(16, c.y + 100, btnW, 28), L"启动游戏内面板", ButtonKind::Secondary,
+        app.ui.Button("maint.tools.panel", c.R(16, c.y + 100, btnW, 28), L"打开游戏内面板", ButtonKind::Secondary,
                   canAct && hasClient, kFontSmall);
         app.ui.Button("maint.tools.watch", c.R(16 + btnW + 8, c.y + 100, btnW, 28), L"启动鼠标助手",
                   ButtonKind::Secondary, canAct && hasClient, kFontSmall);
+        // 面板窗口卡死/不可见时的恢复入口：只结束可安全接管的实例，正在为
+        // 其它运行中客户端服务的面板会被拒绝。
+        app.ui.Button("maint.tools.panelrestart", c.R(16, c.y + 132, btnW, 28), L"重新打开面板",
+                  ButtonKind::Secondary, canAct && hasClient, kFontSmall);
+        MutedText(c, c.R(16 + btnW + 8, c.y + 136, btnW, 40),
+                  L"面板窗口不可见或显示“面板待重开”时使用；不会抢占其它客户端正在使用的面板。", kFontSmall);
         std::wstring statusText;
         if (app.toolRun.running) {
             statusText = L"正在后台执行工具操作，请稍候…";
@@ -1752,7 +1788,7 @@ void DrawMaintenance(App& app) {
         } else {
             statusText = L"诊断文件不包含运行时 DLL、账号、聊天、截图或原始日志。";
         }
-        g.Text(c.R(16, c.y + 136, cw - 32, 20),
+        g.Text(c.R(16, c.y + 168, cw - 32, 20),
                g.Ellipsize(statusText, toolFmt, std::max(10.0f, c.S(cw - 32))), toolFmt, Color(kText3));
         c.Gap(toolH + 12);
     }
