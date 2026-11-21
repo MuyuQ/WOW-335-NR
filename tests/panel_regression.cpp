@@ -147,6 +147,88 @@ static void TestForcedFlushPanel(const fs::path &dir) {
           "timer save wrote wrong value");
     g_save = nr_files::PendingSave{};
 }
+// zh: F10 胶囊的命中矩形必须与绘制坐标同源（客户区坐标），且按钮只向载具的
+// AIO 主输出窗发送一次明确的“显示处理画面/原画”请求，不注入模拟按键。
+static int g_probe_messages = 0;
+static WPARAM g_probe_wparam = 0;
+static LRESULT CALLBACK ProbeOutputProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    if (msg == WM_APP + 0x5A) {
+        ++g_probe_messages;
+        g_probe_wparam = wparam;
+    }
+    return DefWindowProcW(hwnd, msg, wparam, lparam);
+}
+static void PumpProbeMessages() {
+    MSG msg;
+    while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+static void TestF10HitRectAndCarrierMessage() {
+    // 100% 缩放：中心、边缘在内，外扩 1px 在外。
+    SetF10HitRect(100.0f, 20.0f, 80.0f, 23.0f);
+    Check(PointInF10Chip(140, 31), "f10 hit center");
+    Check(PointInF10Chip(100, 20) && PointInF10Chip(180, 43), "f10 hit top-left/bottom-right edge");
+    Check(!PointInF10Chip(99, 20) && !PointInF10Chip(181, 20) && !PointInF10Chip(140, 19) &&
+              !PointInF10Chip(140, 44),
+          "f10 hit outside must be caption");
+    // 150% 缩放：同一套客户区坐标，不做二次缩放。
+    SetF10HitRect(150.0f, 30.0f, 120.0f, 34.0f);
+    Check(PointInF10Chip(210, 47) && PointInF10Chip(150, 30) && PointInF10Chip(270, 64),
+          "f10 hit at 150% scale");
+    Check(!PointInF10Chip(149, 30) && !PointInF10Chip(271, 64) && !PointInF10Chip(210, 65),
+          "f10 hit outside at 150% scale");
+    ClearF10HitRect();
+    Check(!PointInF10Chip(160, 40), "cleared f10 hit rect still active");
+
+    WNDCLASSW cls{};
+    cls.lpfnWndProc = ProbeOutputProc;
+    cls.hInstance = GetModuleHandleW(nullptr);
+    cls.lpszClassName = L"StandaloneDLSSNRNativeOutput";
+    const ATOM atom = RegisterClassW(&cls);
+    Check(atom != 0 || GetLastError() == ERROR_CLASS_ALREADY_EXISTS, "register probe output class");
+    HWND main_output = CreateWindowExW(0, cls.lpszClassName, L"probe-main-output", WS_POPUP, 0, 0, 64, 64,
+                                       nullptr, nullptr, cls.hInstance, nullptr);
+    HWND preview = CreateWindowExW(WS_EX_NOREDIRECTIONBITMAP, cls.lpszClassName, L"probe-preview",
+                                   WS_POPUP, 0, 0, 64, 64, nullptr, nullptr, cls.hInstance, nullptr);
+    Check(main_output && preview, "create probe output windows");
+    Check(FindAioMainOutput(GetCurrentProcessId()) == main_output,
+          "FindAioMainOutput must skip the NOREDIRECTIONBITMAP preview window");
+
+    const DWORD saved_pid = g_last_host_pid;
+    const Telemetry saved_tele = g_tele;
+    g_last_host_pid = GetCurrentProcessId();
+    g_tele = Telemetry{};
+    g_tele.available = true;
+    g_tele.processed_visible = false;
+    g_probe_messages = 0;
+    g_probe_wparam = 99;
+    ToggleCarrierOverlay();
+    PumpProbeMessages();
+    Check(g_probe_messages == 1 && g_probe_wparam == 1, "toggle must post exactly one processed-view request");
+
+    g_tele.processed_visible = true;
+    g_probe_messages = 0;
+    g_probe_wparam = 99;
+    ToggleCarrierOverlay();
+    PumpProbeMessages();
+    Check(g_probe_messages == 1 && g_probe_wparam == 0, "toggle must post the target raw-view request");
+
+    // 无遥测时不可用：不发消息，也不把失败当成已切换。
+    g_tele.available = false;
+    g_probe_messages = 0;
+    ToggleCarrierOverlay();
+    PumpProbeMessages();
+    Check(g_probe_messages == 0, "no carrier request without telemetry");
+    Check(!PostAioShowProcessed(true), "posting without telemetry must report failure");
+
+    g_last_host_pid = saved_pid;
+    g_tele = saved_tele;
+    DestroyWindow(preview);
+    DestroyWindow(main_output);
+}
 int wmain(int argc, wchar_t **argv) {
     try {
         Check(argc == 2, "test directory required");
@@ -192,7 +274,8 @@ int wmain(int argc, wchar_t **argv) {
         TestFpsBaselineLogic();
         TestForcedFlushPendingLayer(dir);
         TestForcedFlushPanel(dir);
-        puts("PASS panel INI/custom/live multiplier roundtrip, locked-file retry, R8 forced flush and R9 FPS baseline/clamp/SourceFps");
+        TestF10HitRectAndCarrierMessage();
+        puts("PASS panel INI/custom/live multiplier roundtrip, locked-file retry, R8 forced flush, R9 FPS baseline/clamp/SourceFps and F10 hit-test/carrier message");
         return 0;
     } catch (const std::exception &e) { fprintf(stderr, "FAIL %s\n", e.what()); return 1; }
 }

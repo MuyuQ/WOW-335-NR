@@ -88,6 +88,57 @@ namespace Wow335Ui {
 }
 '@ -ReferencedAssemblies @([Windows.Forms.NativeWindow].Assembly.Location, [Windows.Forms.Message].Assembly.Location)
 }
+if (-not ('Wow335Ui.PanelLayerNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+namespace Wow335Ui {
+    // zh: 图层按钮向 AIO 载具发送“设置处理画面状态”的窗口消息（kProxyShowProcessedMessage，
+    // 语义是绝对值而非 toggle）。避免 SendKeys 注入 F10：载具逐帧轮询按键，一次性 down/up
+    // 可能被漏采；且实体 F10 在输出窗隐藏时只恢复可见性、不切换处理画面。
+    public static class PanelLayerNative {
+        const int GWL_EXSTYLE = -20;
+        const long WS_EX_NOREDIRECTIONBITMAP = 0x00200000L;
+        public const int ShowProcessedMessage = 0x805A;   // WM_APP + 0x5A
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern IntPtr FindWindowEx(IntPtr parent, IntPtr after, string className, string windowName);
+        [DllImport("user32.dll")]
+        static extern uint GetWindowThreadProcessId(IntPtr h, out uint pid);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+        static extern IntPtr GetWindowLongPtr(IntPtr h, int index);
+        [DllImport("user32.dll", EntryPoint = "PostMessageW", SetLastError = true)]
+        static extern bool PostMessage(IntPtr h, int msg, IntPtr w, IntPtr l);
+
+        public static IntPtr FindAioOutputWindow(uint hostPid) {
+            if (hostPid == 0) { return IntPtr.Zero; }
+            IntPtr h = IntPtr.Zero;
+            while ((h = FindWindowEx(IntPtr.Zero, h, "StandaloneDLSSNRNativeOutput", null)) != IntPtr.Zero) {
+                uint pid;
+                GetWindowThreadProcessId(h, out pid);
+                if (pid != hostPid) { continue; }
+                long ex = GetWindowLongPtr(h, GWL_EXSTYLE).ToInt64();
+                // 预览窗与主输出窗同类名但带 WS_EX_NOREDIRECTIONBITMAP；消息必须发给主输出窗。
+                if ((ex & WS_EX_NOREDIRECTIONBITMAP) != 0) { continue; }
+                return h;
+            }
+            return IntPtr.Zero;
+        }
+
+        public static bool TrySetShowProcessed(uint hostPid, bool show, out int error) {
+            error = 0;
+            IntPtr h = FindAioOutputWindow(hostPid);
+            if (h == IntPtr.Zero) { error = 2; return false; }   // ERROR_FILE_NOT_FOUND
+            if (!PostMessage(h, ShowProcessedMessage, (IntPtr)(show ? 1 : 0), IntPtr.Zero)) {
+                error = Marshal.GetLastWin32Error();
+                return false;
+            }
+            return true;
+        }
+    }
+}
+'@
+}
 [Wow335Ui.Dpi]::Enable()
 $script:uiScale = [double][Wow335Ui.Dpi]::Scale
 $script:uiDpiAware = [bool][Wow335Ui.Dpi]::Aware
@@ -1029,9 +1080,20 @@ function Start-PanelProcess {
 }
 
 function Get-AioHostId {
+    # zh: 只认“所选客户端”的 host64 宿主（完整映像路径），不能只看全机唯一同名进程——
+    # 否则 A 客户端选中、B 客户端在运行时，图层按钮会把请求发给 B 的载具。
+    if (-not $script:clientPath) { return 0 }
     try {
-        $procs = @(Get-Process -Name 'AIO DLSS5 32-bit Wrapper' -ErrorAction SilentlyContinue)
-        if ($procs.Count -eq 1) { return [int]$procs[0].Id }
+        $expected = [IO.Path]::GetFullPath((Join-Path $script:clientPath 'host64/AIO DLSS5 32-bit Wrapper.exe'))
+        $matches = @()
+        foreach ($process in @(Get-Process -Name 'AIO DLSS5 32-bit Wrapper' -ErrorAction SilentlyContinue)) {
+            try {
+                if ($process.Path -and $process.Path.Equals($expected, [StringComparison]::OrdinalIgnoreCase)) {
+                    $matches += $process
+                }
+            } catch { }
+        }
+        if ($matches.Count -eq 1) { return [int]$matches[0].Id }
     } catch { }
     return 0
 }
@@ -1485,6 +1547,29 @@ function Update-Main {
     $nrChip = New-DotChip '画面增强' $nrText $(if ($running -and $nrOn) { 'ok' } else { 'muted' })
     $fgChip = New-DotChip '补帧' $fgText $(if ($running -and $fgOn) { 'ok' } else { 'muted' })
     $layerChip = New-DotChip '图层' $layerText $(if ($running -and $presentOn) { 'ok' } else { 'muted' })
+    foreach ($surface in @($layerChip.Panel, $layerChip.Value, $layerChip.Text)) {
+        if ($null -eq $surface) { continue }
+        $surface.Cursor = [Windows.Forms.Cursors]::Hand
+        $surface.Add_Click({
+            # zh: 与游戏内面板同款：向 AIO 载具发送“设置处理画面状态”请求（WM_APP+0x5A，
+            # wparam 非 0=显示处理画面），不在按键时序上做文章；按钮状态最终以遥测为准。
+            try {
+                $hostId = Get-AioHostId
+                if ($hostId -le 0) { Add-Log '图层切换失败：未检测到所选客户端的 AIO 载具进程（请先启动该客户端的游戏）。'; return }
+                $tel = Read-TelemetrySample $hostId
+                if ($null -eq $tel -or -not [bool]$tel.Available) { Add-Log '图层切换失败：尚未收到所选客户端的 AIO 遥测（载具可能尚未就绪，请稍后重试）。'; return }
+                $wantShow = -not [bool]$tel.ProcessedOutputSelected
+                $layerError = 0
+                if (-not [Wow335Ui.PanelLayerNative]::TrySetShowProcessed([uint32]$hostId, $wantShow, [ref]$layerError)) {
+                    if ($layerError -eq 5) { Add-Log '图层切换失败：请求被系统拦截（控制中心与载具的权限级别不同）。' }
+                    elseif ($layerError -eq 2) { Add-Log '图层切换失败：未找到 AIO 输出窗（载具可能尚未就绪，请稍后重试）。' }
+                    else { Add-Log ('图层切换失败：无法向 AIO 输出窗发送请求（错误 ' + $layerError + '）。') }
+                    return
+                }
+                Add-Log $(if ($wantShow) { '已请求显示处理画面（等待遥测确认）。' } else { '已请求直接显示原画（等待遥测确认）。' })
+            } catch { Add-Log ('图层覆盖切换失败：' + $_.Exception.Message) }
+        })
+    }
     $tierChip = New-DotChip '档位' $tierInfo.Tier 'ok'
     $chips = [Windows.Forms.FlowLayoutPanel]::new()
     $chips.Width = $ContentWidth

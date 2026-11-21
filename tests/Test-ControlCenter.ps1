@@ -90,6 +90,10 @@ cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /utf-8 "%CC_TEST_REPO%\tests\control
 if errorlevel 1 exit /b 1
 install-job.exe "%CC_TEST_OUTPUT%"
 if errorlevel 1 exit /b 1
+cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /utf-8 "%CC_TEST_REPO%\tests\control_center_preserved_config.cpp" /Fe:preserved-config.exe /link bcrypt.lib ole32.lib
+if errorlevel 1 exit /b 1
+preserved-config.exe "%CC_TEST_OUTPUT%"
+if errorlevel 1 exit /b 1
 cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /utf-8 "%CC_TEST_REPO%\tests\control_center_repair_preview.cpp" /Fe:repair-preview.exe /link bcrypt.lib
 if errorlevel 1 exit /b 1
 repair-preview.exe "%CC_TEST_OUTPUT%"
@@ -158,7 +162,7 @@ cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /utf-8 "%CC_TEST_REPO%\tests\control
 if errorlevel 1 exit /b 1
 diagnostics.exe "%CC_TEST_OUTPUT%"
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /utf-8 "%CC_TEST_REPO%\tests\control_center_panel_process.cpp" /Fe:panel-process.exe /link bcrypt.lib
+cl /nologo /std:c++17 /EHsc /W4 /WX /O2 /MT /utf-8 "%CC_TEST_REPO%\tests\control_center_panel_process.cpp" /Fe:panel-process.exe /link bcrypt.lib user32.lib
 if errorlevel 1 exit /b 1
 panel-process.exe "%CC_TEST_OUTPUT%"
 if errorlevel 1 exit /b 1
@@ -202,6 +206,18 @@ try {
     [Environment]::SetEnvironmentVariable('CC_TEST_REPO', $repo, 'Process')
     & $env:ComSpec /d /c $cmd
     if ($LASTEXITCODE -ne 0) { throw "Control center tests failed: $LASTEXITCODE" }
+
+    # 图层按钮必须把请求发给“所选客户端”的载具：用两个假载具进程验证宿主选择与消息路由。
+    $panelProcess = Join-Path $output 'panel-process.exe'
+    $panelLayerTest = Join-Path $repo 'tests\Test-PanelLayerHost.ps1'
+    if (-not (Test-Path -LiteralPath $panelProcess)) { throw 'panel-process.exe was not built' }
+    if (-not (Test-Path -LiteralPath $panelLayerTest)) { throw 'Test-PanelLayerHost.ps1 not found' }
+    $hostExe = (Get-Process -Id $PID).Path
+    & $hostExe -NoProfile -File $panelLayerTest `
+        -PanelProcessExe $panelProcess `
+        -ControlCenterScript (Join-Path $repo 'Dlss5.ControlCenter.ps1') `
+        -ScratchRoot (Join-Path $output 'panel-layer-host')
+    if ($LASTEXITCODE -ne 0) { throw "Panel layer host tests failed: $LASTEXITCODE" }
 } finally {
     foreach ($name in $names) { [Environment]::SetEnvironmentVariable($name, $old[$name], 'Process') }
 }

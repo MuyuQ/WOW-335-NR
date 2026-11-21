@@ -558,6 +558,28 @@ static HWND FindAioMainOutput(DWORD host_pid)
     return nullptr;
 }
 static HWND g_owned_output = nullptr;
+// F10 胶囊的客户区命中矩形：RenderUi 用与绘制完全相同的布局坐标记录，
+// WM_NCHITTEST 命中它时返回 HTCLIENT；标题栏其余空白处保持 HTCAPTION（可拖动）。
+static bool g_f10_hit_valid = false;
+static float g_f10_hit_left = 0.0f;
+static float g_f10_hit_top = 0.0f;
+static float g_f10_hit_right = 0.0f;
+static float g_f10_hit_bottom = 0.0f;
+static void SetF10HitRect(float x, float y, float width, float height)
+{
+    g_f10_hit_left = x;
+    g_f10_hit_top = y;
+    g_f10_hit_right = x + width;
+    g_f10_hit_bottom = y + height;
+    g_f10_hit_valid = true;
+}
+static void ClearF10HitRect() { g_f10_hit_valid = false; }
+static bool PointInF10Chip(int x, int y)
+{
+    return g_f10_hit_valid && static_cast<float>(x) >= g_f10_hit_left &&
+           static_cast<float>(x) <= g_f10_hit_right && static_cast<float>(y) >= g_f10_hit_top &&
+           static_cast<float>(y) <= g_f10_hit_bottom;
+}
 // zh: 跨进程 owner 保证面板始终压在 AIO 输出窗之上。Windows 在 owner 销毁时
 // 会级联销毁 owned 窗口，因此宿主重启或输出窗重建会连带结束面板；这是已知
 // 取舍，由控制中心的守护定时器重新拉起（10 秒级）兜底，不要改成父子窗口或
@@ -602,6 +624,47 @@ static const char *LayerShortName(LayerState s)
     case LayerState::NoOutput:  return "无输出";
     default:                    return "未确认";
     }
+}
+
+// zh: 图层覆盖/原画切换由 AIO 载具暴露为窗口消息 WM_APP + 0x5A
+// （kProxyShowProcessedMessage），语义是“设置目标显示状态”而不是“切换”：
+// wparam 非 0 = 显示处理画面。面板按钮直接向所选客户端的 AIO 输出窗发送一次
+// 请求，不注入 F10——实体 F10 在载具里逐帧轮询，一次性 down/up 可能被漏采；
+// 且实体 F10 还承担“输出窗被隐藏时先恢复可见性”的职责，按钮不应冒充它。
+static constexpr UINT kAioShowProcessedMessage = WM_APP + 0x5A;
+
+static bool PostAioShowProcessed(bool show)
+{
+    if (!g_tele.available || g_last_host_pid == 0) {
+        OutLine(L"图层切换不可用：尚未检测到 AIO 载具遥测。");
+        return false;
+    }
+    const HWND output = FindAioMainOutput(g_last_host_pid);
+    if (!output) {
+        OutLine(L"图层切换失败：未找到 AIO 输出窗（载具可能尚未就绪，请稍后重试）。");
+        return false;
+    }
+    if (!PostMessageW(output, kAioShowProcessedMessage, show ? 1 : 0, 0)) {
+        const DWORD error = GetLastError();
+        if (error == ERROR_ACCESS_DENIED)
+            OutLine(L"图层切换失败：请求被系统拦截（面板与载具的权限级别不同）。");
+        else
+            OutLine(L"图层切换失败：无法向 AIO 输出窗发送请求。");
+        return false;
+    }
+    DebugLine(show ? L"show-processed request posted (processed view)"
+                   : L"show-processed request posted (raw view)");
+    return true;
+}
+
+// 按钮语义：只切换“处理画面 / 原画”，不恢复被隐藏的输出窗；按钮状态最终以遥测为准。
+static void ToggleCarrierOverlay()
+{
+    if (!g_tele.available) {
+        OutLine(L"图层切换不可用：尚未检测到 AIO 载具遥测。");
+        return;
+    }
+    PostAioShowProcessed(!g_tele.processed_visible);
 }
 
 static void SyncWindowLayout(const RECT &game)
@@ -767,6 +830,28 @@ static void DrawChip(ImDrawList *dl, float x, float y, const char *text, bool on
     dl->AddCircleFilled(ImVec2(x + 9.0f * dpi, y + height * 0.5f), 2.2f * dpi, dot_color);
     PutText(g_font_small, x + 16.0f * dpi, y + (height - FontHeight(g_font_small)) * 0.5f - 1.0f * dpi,
         text_color, text);
+}
+
+// 可点胶囊（F10 图层开关）：造型与 DrawChip 一致，悬停加描边提示可点
+static bool ChipButton(const char *id, float x, float y, const char *text, bool on, bool jade, bool enabled)
+{
+    const float dpi = g_dpi_scale;
+    const float height = 23.0f * dpi;
+    const float width = ChipWidth(text);
+    ImGui::PushID(id);
+    ImGui::SetCursorScreenPos(ImVec2(x, y));
+    ImGui::InvisibleButton("##chip", ImVec2(width, height));
+    const bool hovered = ImGui::IsItemHovered();
+    const bool clicked = ImGui::IsItemClicked() && enabled;
+    if (hovered && enabled) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+    ImDrawList *dl = ImGui::GetWindowDrawList();
+    DrawChip(dl, x, y, text, on, jade);
+    if (hovered && enabled) {
+        dl->AddRect(ImVec2(x, y), ImVec2(x + width, y + height),
+            on ? (jade ? kColJadeLine : kColAccentLine) : kColLine, height * 0.5f, 0, 1.5f * dpi);
+    }
+    ImGui::PopID();
+    return clicked;
 }
 
 // 分段选择条：返回被点击的序号，-1 表示未点击
@@ -1352,7 +1437,8 @@ static void RenderHelpPage(float x, float &y, float width)
         y += 22.0f * dpi;
     };
     SectionTitle(x, y, width, "操作");
-    bullet("F10：原画对比（AIO 自带热键）");
+    bullet("F10：切换图层覆盖（原画对比；AIO 热键；输出窗隐藏时先恢复可见性）");
+    bullet("点标题栏「处理画面」或收起态右侧图层名：向载具发送一次显示状态请求（只切换处理画面/原画）");
     bullet("F11：展开 / 收起本面板");
     bullet("拖动顶部标题行移动面板");
     y += 8.0f * dpi;
@@ -1405,8 +1491,17 @@ static void RenderStrip(float dpi)
     PutText(g_font_num_sm, x, y, kColText, fps_text);
     PutText(g_font_small, x + MeasureWidth(g_font_num_sm, fps_text) + 5.0f * dpi,
         y + FontHeight(g_font_num_sm) - FontHeight(g_font_small) - 3.0f * dpi, kColAccent, "FPS");
-    PutTextRight(g_font_small, origin.x + 238.0f * dpi - 12.0f * dpi,
-        y + 8.0f * dpi, kColText3, LayerShortName(g_layer));
+    {
+        const char *layer_short = LayerShortName(g_layer);
+        const float lw = MeasureWidth(g_font_small, layer_short);
+        const float lx = origin.x + 238.0f * dpi - 12.0f * dpi - lw;
+        ImGui::SetCursorScreenPos(ImVec2(lx - 3.0f * dpi, y + 3.0f * dpi));
+        ImGui::InvisibleButton("##strip-f10", ImVec2(lw + 6.0f * dpi, 20.0f * dpi));
+        const bool hovered = ImGui::IsItemHovered() && g_tele.available;
+        if (hovered) ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+        if (hovered && ImGui::IsItemClicked()) ToggleCarrierOverlay();
+        PutText(g_font_small, lx, y + 8.0f * dpi, hovered ? kColAccent : kColText3, layer_short);
+    }
     y += 30.0f * dpi;
     if (g_tele.available) {
         char sub[96]{};
@@ -1429,6 +1524,7 @@ static void RenderUi()
 {
     const float dpi = g_dpi_scale;
     if (!g_expanded) {
+        ClearF10HitRect();
         RenderStrip(dpi);
         return;
     }
@@ -1467,16 +1563,30 @@ static void RenderUi()
     char nr_text[24]{}, fg_text[24]{};
     std::snprintf(nr_text, sizeof nr_text, "画面增强 %s", nr_on ? "开" : "关");
     std::snprintf(fg_text, sizeof fg_text, "补帧 %s", fg_on ? "开" : "关");
+    // 处理画面/原画：按钮只向载具发送“设置显示状态”请求，不等同于实体 F10
+    //（F10 还会在输出窗隐藏时先恢复可见性）；最终状态以遥测 processed_visible 为准。
+    const bool overlay_on = g_tele.available && g_tele.processed_visible;
+    const char *f10_text = overlay_on ? "处理画面 开" : "处理画面 关";
     const float collapse_w = 36.0f * dpi;
     const float chip_right = wpos.x + wtotal - collapse_w - 8.0f * dpi;
     const float fg_width = ChipWidth(fg_text);
     const float nr_width = ChipWidth(nr_text);
-    DrawChip(dl, chip_right - fg_width, wpos.y + (cap_h - 23.0f * dpi) * 0.5f, fg_text, fg_on, true);
-    DrawChip(dl, chip_right - fg_width - 8.0f * dpi - nr_width, wpos.y + (cap_h - 23.0f * dpi) * 0.5f,
-        nr_text, nr_on, true);
-    if (wtotal >= 520.0f * dpi) {
-        const float meta_x = chip_right - fg_width - 8.0f * dpi - nr_width - 12.0f * dpi
-            - MeasureWidth(g_font_small, "Mcode · v1.2.0");
+    const float f10_width = ChipWidth(f10_text);
+    const float chip_y = wpos.y + (cap_h - 23.0f * dpi) * 0.5f;
+    const float fg_x = chip_right - fg_width;
+    const float nr_x = fg_x - 8.0f * dpi - nr_width;
+    const float f10_x = nr_x - 8.0f * dpi - f10_width;
+    // 命中测试与绘制同源：胶囊矩形记录在客户区坐标，供 WM_NCHITTEST 返回 HTCLIENT。
+    if (g_tele.available)
+        SetF10HitRect(f10_x, chip_y, f10_width, 23.0f * dpi);
+    else
+        ClearF10HitRect();
+    if (ChipButton("f10-overlay", f10_x, chip_y, f10_text, overlay_on, true, g_tele.available))
+        ToggleCarrierOverlay();
+    DrawChip(dl, nr_x, chip_y, nr_text, nr_on, true);
+    DrawChip(dl, fg_x, chip_y, fg_text, fg_on, true);
+    if (wtotal >= 560.0f * dpi) {
+        const float meta_x = f10_x - 12.0f * dpi - MeasureWidth(g_font_small, "Mcode · v1.2.0");
         PutText(g_font_small, meta_x, wpos.y + (cap_h - FontHeight(g_font_small)) * 0.5f,
             kColText3, "Mcode · v1.2.0");
     }
@@ -1648,9 +1758,12 @@ static LRESULT CALLBACK PanelWndProc(HWND window, UINT message, WPARAM wparam, L
             GetClientRect(window, &rc);
             const float cap_h = 48.0f * g_dpi_scale;          // 自绘标题行（与 RenderUi cap_h 一致）
             const float btn_zone = 48.0f * g_dpi_scale;       // 右上 ✕ 按钮豁免区（HTCLIENT 才可点击）
+            // 与绘制同一布局记录的胶囊矩形：命中时返回 HTCLIENT，否则点击会被
+            // HTCAPTION 当成拖动而吞掉（F10 胶囊位于拖动区）。
+            if (PointInF10Chip(static_cast<int>(pt.x), static_cast<int>(pt.y))) return HTCLIENT;
             if (pt.y < cap_h) {
                 if (pt.x >= rc.right - static_cast<LONG>(btn_zone)) return HTCLIENT;
-                return HTCAPTION;   // 标题行拖拽（NOACTIVATE 下系统仍可移动）
+                return HTCAPTION;   // 标题行空白处拖拽（NOACTIVATE 下系统仍可移动）
             }
         }
         break;
